@@ -1,19 +1,19 @@
-playtest-agent contains material derived from Aura Autopilot
+cluewren contains material derived from Aura Autopilot
 (https://github.com/ramenvr/autopilot, commit 48966d1), Copyright its authors, licensed under
 the Apache License 2.0.
 
 Derived:
 
 - the bridge protocol;
-- src/PlaytestAgent.Kit: a port of autopilot/kit (game, control, nav, geom, harness),
+- src/Cluewren.Kit: a port of autopilot/kit (game, control, nav, geom, harness),
   autopilot/runtime.py, the Unity adapter in autopilot/engines (base.py, unity.py) and the live-game
   helpers of autopilot/research.py, with their tuned constants, the Jev decision rules, the default
   instructions and the text of summaries and check reports;
-- src/PlaytestAgent/Sandbox: a port of the split in autopilot/sandbox.py and of the tool bodies
+- src/Cluewren/Sandbox: a port of the split in autopilot/sandbox.py and of the tool bodies
   in autopilot/agents/session.py (probe, run_harness, snapshot, restart_level);
 - docs/KIT.md, KIT-UNITY.md, KIT-GODOT.md and KIT-UNREAL.md: a port of autopilot/KIT.md and of
   autopilot/engines/unity.md and godot.md;
-- tests/PlaytestAgent.Tests: ports of upstream's kit and runtime tests and of its simulated game
+- tests/Cluewren.Tests: ports of upstream's kit and runtime tests and of its simulated game
   (tests/conftest.py, tests/navsim.py and others);
 - the plugins under plugin/unity, plugin/godot and plugin/unreal, each with its own NOTICE.
 

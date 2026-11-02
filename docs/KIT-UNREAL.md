@@ -32,7 +32,7 @@ its gameplay level (from the export's maps.txt), or click through the menu in Se
 
 UI. `game.Screen()` keys texts `<UserWidget>.<TextBlock>` (UMG). `game.Ui()` lists its buttons, sliders and the like.
 
-The export. `Saved/PlaytestAgentCodex` holds the project as text: `summary.txt`, `blueprints/` as pseudo-code (variables,
+The export. `Saved/CluewrenCodex` holds the project as text: `summary.txt`, `blueprints/` as pseudo-code (variables,
 components, defaults, graphs), `input/`, `data/` (data tables, data assets, enums, structs), `assets.txt` and `maps.txt`.
 C++ is under `Source/`, settings under `Config/`. It is made in the background when a session starts, so it can arrive
 after the run does.

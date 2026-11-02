@@ -1,0 +1,76 @@
+{
+    "name": "Cluewren",
+    "rootNamespace": "Cluewren",
+    "references": [
+        "Unity.InputSystem",
+        "UnityEngine.UI",
+        "Unity.TextMeshPro"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_EDITOR || DEVELOPMENT_BUILD || CLUEWREN_PLAYTEST"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_INPUT_SYSTEM"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_UGUI"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "CLUEWREN_TMP"
+        },
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "3.0.0",
+            "define": "CLUEWREN_TMP"
+        },
+        {
+            "name": "com.unity.modules.uielements",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_UITK"
+        },
+        {
+            "name": "com.unity.modules.physics",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_PHYSICS"
+        },
+        {
+            "name": "com.unity.modules.physics2d",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_PHYSICS2D"
+        },
+        {
+            "name": "com.unity.modules.particlesystem",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_PARTICLES"
+        },
+        {
+            "name": "com.unity.modules.screencapture",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_SCREENCAPTURE"
+        },
+        {
+            "name": "com.unity.modules.imageconversion",
+            "expression": "1.0.0",
+            "define": "CLUEWREN_IMAGECONVERSION"
+        },
+        {
+            "name": "Unity",
+            "expression": "6000.6.0a1",
+            "define": "CLUEWREN_CURRENT_ASSEMBLIES"
+        }
+    ],
+    "noEngineReferences": false
+}

@@ -1,7 +1,7 @@
-# The harness kit (PlaytestAgent.Kit)
+# The harness kit (Cluewren.Kit)
 
 harness.cs is compiled with these in scope, with no `using` needed: `System`, `System.Collections.Generic`, `System.IO`,
-`System.Linq`, `System.Threading`, `System.Threading.Tasks`, `PlaytestAgent.Kit`, and the static members of `Control`,
+`System.Linq`, `System.Threading`, `System.Threading.Tasks`, `Cluewren.Kit`, and the static members of `Control`,
 `Geom` and `Research`, so `WalkTo(...)` and `Where(...)` are called by their bare names.
 Units: centimetres (Unreal units), degrees, seconds of game time.
 What is particular to the game's engine (how its objects, classes, input actions and maps are named) is in the

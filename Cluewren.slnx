@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Cluewren.Kit/Cluewren.Kit.csproj" />
+    <Project Path="src/Cluewren/Cluewren.csproj" />
+    <Project Path="src/Cluewren/Sandbox/Child/Cluewren.Child.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Cluewren.Tests/Cluewren.Tests.csproj" />
+    <Project Path="tests/Cluewren.Tools/Cluewren.Tools.csproj" />
+    <Project Path="tests/Cluewren.Bench/Cluewren.Bench.csproj" />
+  </Folder>
+</Solution>
