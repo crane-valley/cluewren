@@ -135,7 +135,7 @@ static class Bench
 
     static async Task Contained(double seconds)
     {
-        var folder = Path.Combine(Path.GetTempPath(), "playtest-bench-" + Guid.NewGuid().ToString("N"));
+        var folder = Path.Combine(Path.GetTempPath(), "cluewren-bench-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(folder);
         await File.WriteAllTextAsync(Path.Combine(folder, "harness.cs"), Walker);
         await using var host = new HarnessHost(new HostOptions(new Quick(), folder) { Mode = SandboxMode.Contained, Say = _ => { } });
