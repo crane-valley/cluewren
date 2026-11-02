@@ -1,0 +1,76 @@
+{
+    "name": "Autopilot.Playtest",
+    "rootNamespace": "Autopilot.Playtest",
+    "references": [
+        "Unity.InputSystem",
+        "UnityEngine.UI",
+        "Unity.TextMeshPro"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_EDITOR || DEVELOPMENT_BUILD || AUTOPILOT_PLAYTEST"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_INPUT_SYSTEM"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_UGUI"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "AUTOPILOT_TMP"
+        },
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "3.0.0",
+            "define": "AUTOPILOT_TMP"
+        },
+        {
+            "name": "com.unity.modules.uielements",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_UITK"
+        },
+        {
+            "name": "com.unity.modules.physics",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_PHYSICS"
+        },
+        {
+            "name": "com.unity.modules.physics2d",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_PHYSICS2D"
+        },
+        {
+            "name": "com.unity.modules.particlesystem",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_PARTICLES"
+        },
+        {
+            "name": "com.unity.modules.screencapture",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_SCREENCAPTURE"
+        },
+        {
+            "name": "com.unity.modules.imageconversion",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_IMAGECONVERSION"
+        },
+        {
+            "name": "Unity",
+            "expression": "6000.6.0a1",
+            "define": "AUTOPILOT_CURRENT_ASSEMBLIES"
+        }
+    ],
+    "noEngineReferences": false
+}

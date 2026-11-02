@@ -1,0 +1,8 @@
+Playtest Agent Godot addon
+Copyright Crane Valley
+
+This addon is derived from Autopilot (https://github.com/ramenvr/autopilot), Godot addon addons/autopilot, at commit
+48966d1, licensed under the Apache License, Version 2.0. See the LICENSE file in this directory.
+
+Modified GDScript files state so on their first line. The file plugin.cfg was also modified; this notice states it for
+that file, which keeps to the form Godot writes. lib/discovery.gd and lib/handshake.gd are new.

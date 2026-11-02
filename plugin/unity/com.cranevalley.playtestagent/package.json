@@ -1,0 +1,20 @@
+{
+  "name": "com.cranevalley.playtestagent",
+  "version": "0.1.0",
+  "displayName": "Playtest Agent",
+  "description": "AI playtesting for Unity games. Connects out over a loopback WebSocket to a brain on this machine, which plays the game through this package.",
+  "unity": "6000.0",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Crane Valley"
+  },
+  "keywords": [
+    "playtest",
+    "testing",
+    "qa",
+    "ai"
+  ],
+  "dependencies": {
+    "com.unity.nuget.mono-cecil": "1.11.6"
+  }
+}

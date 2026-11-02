@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PlaytestAgent.Bench</RootNamespace>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../PlaytestAgent.Tests/Sim/*.cs" Link="Sim/%(Filename).cs" />
+    <ProjectReference Include="../../src/PlaytestAgent/PlaytestAgent.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,43 @@
+{
+    "name": "Autopilot.Playtest.Tests",
+    "rootNamespace": "Autopilot.Playtest.Tests",
+    "references": [
+        "Autopilot.Playtest",
+        "Autopilot.Playtest.Editor",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner",
+        "Unity.InputSystem",
+        "Unity.InputSystem.TestFramework"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_INPUT_SYSTEM"
+        },
+        {
+            "name": "com.unity.modules.screencapture",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_SCREENCAPTURE"
+        },
+        {
+            "name": "com.unity.modules.imageconversion",
+            "expression": "1.0.0",
+            "define": "AUTOPILOT_IMAGECONVERSION"
+        }
+    ],
+    "noEngineReferences": false
+}

@@ -1,0 +1,11 @@
+Playtest Agent Unreal plugin
+Copyright Crane Valley
+
+This plugin is derived from Autopilot (https://github.com/ramenvr/autopilot), Unreal plugin
+plugin/unreal/Autopilot, at commit 48966d1, licensed under the Apache License, Version 2.0.
+See the LICENSE file in this directory.
+
+Modified source and config files state so on their first line. PlaytestAgent.uplugin was also
+modified; JSON has no comments, so this notice states it for it. Modules, classes and files were
+renamed from Autopilot's: AutopilotPlaytest to PlaytestAgent, AutopilotPlaytestEditor to
+PlaytestAgentEditor, and AutopilotCodex to PlaytestAgentCodex.
