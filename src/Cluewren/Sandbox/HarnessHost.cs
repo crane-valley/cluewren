@@ -48,6 +48,7 @@ public sealed class HarnessHost : IAsyncDisposable
     readonly Action<string> _say;
     readonly SemaphoreSlim _one = new(1, 1);
     SandboxSession? _running;
+    FileStream? _claim;
     string? _downgrade;
     string? _progress;
     int _episodes, _played, _mostDecisions, _decisions, _writesAfterPlay;
@@ -100,6 +101,8 @@ public sealed class HarnessHost : IAsyncDisposable
     {
         var spec = Spec();
         var mode = _downgrade is not null ? SandboxMode.Process : _options.Mode;
+        if (OperatingSystem.IsWindows() && mode != SandboxMode.Process)
+            _claim ??= WindowsContainer.Claim(_runFolder);
         var (process, note) = SandboxStarter.Start(spec, mode);
         _downgrade ??= note;
         var session = Attach(process);
@@ -464,8 +467,8 @@ public sealed class HarnessHost : IAsyncDisposable
     {
         _running?.Dispose();
         _one.Dispose();
-        if (OperatingSystem.IsWindows() && Sandbox == "appcontainer")
-            WindowsContainer.Retire(Spec());
+        if (OperatingSystem.IsWindows() && _claim is not null)
+            WindowsContainer.Release(_claim, _runFolder);
         return default;
     }
 }
