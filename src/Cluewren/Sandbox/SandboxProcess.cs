@@ -35,7 +35,8 @@ public sealed record ChildSpec(string Dotnet, string ChildDll, string RunFolder,
 
     public static string ContainerNameOf(string runFolder)
     {
-        var hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(runFolder.ToLowerInvariant()));
+        var folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(runFolder));
+        var hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(folder.ToLowerInvariant()));
         return "cluewren-" + Convert.ToHexStringLower(hash)[..16];
     }
 
