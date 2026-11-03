@@ -14,7 +14,9 @@ map, measured look scale and measured slide carry from one episode to the next, 
 - Before a child's reply, it writes what it learned to carry.json in the run folder: nav maps, look scale, slide, keys and
   level. The next child loads it. The file is the child's own, and the parent never reads it.
 - Each run folder has its own AppContainer profile, named from a hash of the folder, and only that SID is granted the
-  folder. The profile and the grant are removed when the host is disposed.
+  folder. The profile and the grant are removed when the host is disposed. The host holds a .container file in the run
+  folder open while they may exist, so after a killed brain the next run in the project finds that claim unheld and
+  removes them.
 - The child's dll, its config and the kit are copied into a folder of their own under LocalAppData, named by their hash,
   and that folder is granted read and execute for all application packages (S-1-15-2-1). It holds no secret, and one
   grant is simpler than an entry per run on shared files. Nothing in the repository or the publish folder is granted.

@@ -103,6 +103,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         var id = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
         var runFolder = Path.Combine(memory, "runs", id);
         Directory.CreateDirectory(runFolder);
+        if (OperatingSystem.IsWindows())
+            WindowsContainer.RetireLeftovers(Path.Combine(memory, "runs"), runFolder);
         var recorder = new FrameRecorder(link);
         var host = new HarnessHost(new HostOptions(link, runFolder) { Jev = jev, ProjectFolder = memory, Recorder = recorder });
         var run = new PlaytestRun(link, request, host, recorder, project, memory, runFolder, id, client);

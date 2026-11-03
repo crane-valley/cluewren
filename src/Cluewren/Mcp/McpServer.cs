@@ -83,7 +83,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     PlaytestRun? _run;
     Task? _watch;
 
-    public string? JevKey { get; init; } = ApiKeys.Find(ApiKeys.TypeSafeKey);
+    public string? JevKey { get; init; }
 
     public async Task ServeAsync(TextReader input)
     {
@@ -256,9 +256,11 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         if (_run is { Ended: null })
             return ToolResult.Say($"Run {_run.RunId} is going: finish it with report first.", true);
         await CloseRunAsync().ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(JevKey))
-            return ToolResult.Say($"The decision model's key is missing. Tell the user to set {ApiKeys.TypeSafeKey} in the environment, "
-                + $"or in {ApiKeys.KeysFile} as {ApiKeys.TypeSafeKey}=<key>, and never to paste it here. Then call start_run again.", true);
+        var key = JevKey ?? ApiKeys.Find(ApiKeys.TypeSafeKey);
+        if (string.IsNullOrWhiteSpace(key))
+            return ToolResult.Say($"The decision model's key is missing. Tell the user to put it in {ApiKeys.KeysFile} as "
+                + $"{ApiKeys.TypeSafeKey}=<key>, and never to paste it here, then call start_run again. (Set in the environment "
+                + "instead, it takes effect only once the agent session is restarted.)", true);
         var request = args["request"]?.GetValue<string>();
         var kind = args["kind"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(request) || kind is not ("verify" or "goal" or "explore"))
@@ -273,7 +275,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         try
         {
             var link = await _bridge.NextLinkAsync(deadline.Token).ConfigureAwait(false);
-            _jev = new JevClient(new JevOptions(JevKey));
+            _jev = new JevClient(new JevOptions(key));
             _run = await PlaytestRun.OpenAsync(link, new RunRequest(request, kind, args["minutes"]?.GetValue<double>(),
                 args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, _stopping.Token).ConfigureAwait(false);
             _watch = _run.WatchAsync(_stopping.Token);

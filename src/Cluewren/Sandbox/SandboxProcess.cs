@@ -31,13 +31,13 @@ public sealed class SandboxException(string message) : Exception(message);
 
 public sealed record ChildSpec(string Dotnet, string ChildDll, string RunFolder, long MemoryLimitBytes)
 {
-    public string ContainerName
+    public string ContainerName => ContainerNameOf(RunFolder);
+
+    public static string ContainerNameOf(string runFolder)
     {
-        get
-        {
-            var hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(RunFolder.ToLowerInvariant()));
-            return "cluewren-" + Convert.ToHexStringLower(hash)[..16];
-        }
+        var folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(runFolder));
+        var hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(folder.ToLowerInvariant()));
+        return "cluewren-" + Convert.ToHexStringLower(hash)[..16];
     }
 
     public string CommandLine => $"\"{Dotnet}\" \"{ChildDll}\"";

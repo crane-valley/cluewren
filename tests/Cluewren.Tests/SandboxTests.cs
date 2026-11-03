@@ -511,5 +511,12 @@ public sealed class SandboxTests : IDisposable
         parent.Kill();
         await parent.WaitForExitAsync();
         Assert.True(child.WaitForExit(5000), "the child outlived its parent");
+        if (OperatingSystem.IsWindows())
+        {
+            var claim = Path.Combine(folder, ".container");
+            Assert.True(File.Exists(claim));
+            WindowsContainer.RetireLeftovers(_root, Path.Combine(_root, "run"));
+            Assert.False(File.Exists(claim), "the dead parent's container was not retired");
+        }
     }
 }

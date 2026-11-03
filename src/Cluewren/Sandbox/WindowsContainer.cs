@@ -25,6 +25,7 @@ public sealed class WindowsContainer : ISandboxProcess
     const uint LimitKillOnJobClose = 0x2000;
     const uint LimitActiveProcess = 0x8;
     const uint LimitJobMemory = 0x200;
+    const string ClaimFile = ".container";
 
     readonly IntPtr _job;
     readonly IntPtr _process;
@@ -112,25 +113,73 @@ public sealed class WindowsContainer : ISandboxProcess
         info.SetAccessControl(security);
     }
 
-    public static void Retire(ChildSpec spec)
+    // Held open by the brain from before the profile exists until it is deleted: a brain killed in between leaves the
+    // marker unlocked, and the next run in the project retires that container (RetireLeftovers).
+    public static FileStream Claim(string runFolder) =>
+        new(Path.Combine(runFolder, ClaimFile), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+    public static void Release(FileStream claim, string runFolder)
     {
+        var retired = Retire(runFolder);
+        claim.Dispose();
+        if (!retired)
+            return;
         try
         {
-            var sid = Profile(spec.ContainerName);
+            File.Delete(Path.Combine(runFolder, ClaimFile));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    public static void RetireLeftovers(string runs, string current)
+    {
+        if (!Directory.Exists(runs))
+            return;
+        foreach (var folder in Directory.EnumerateDirectories(runs).Select(Path.GetFullPath))
+        {
+            if (string.Equals(folder, Path.GetFullPath(current), StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(Path.Combine(folder, ClaimFile)))
+                continue;
+            FileStream claim;
+            try
+            {
+                claim = Claim(folder);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+            Release(claim, folder);
+        }
+    }
+
+    static bool Retire(string runFolder)
+    {
+        var name = ChildSpec.ContainerNameOf(runFolder);
+        var purged = false;
+        try
+        {
+            var result = DeriveAppContainerSidFromAppContainerName(name, out var sid);
+            if (result != 0)
+                throw new Win32Exception(result);
             var identity = new SecurityIdentifier(SidOf(sid));
             FreeSid(sid);
-            var info = new DirectoryInfo(spec.RunFolder);
-            if (info.Exists)
-            {
-                var security = info.GetAccessControl();
-                security.PurgeAccessRules(identity);
-                info.SetAccessControl(security);
-            }
+            var info = new DirectoryInfo(runFolder);
+            var security = info.GetAccessControl();
+            security.PurgeAccessRules(identity);
+            info.SetAccessControl(security);
+            purged = true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            purged = true;
         }
         catch (Exception e) when (e is Win32Exception or UnauthorizedAccessException or IOException)
         {
         }
-        DeleteAppContainerProfile(spec.ContainerName);
+        return DeleteAppContainerProfile(name) == 0 && purged;
     }
 
     static (IntPtr Parent, IntPtr Child) Pipe(ref SECURITY_ATTRIBUTES attributes, bool parentWrites)
