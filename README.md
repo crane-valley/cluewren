@@ -80,7 +80,7 @@ What leaves the machine:
 Nothing else leaves the machine. There is no upload, telemetry, accounts, sign-in or billing in Cluewren.
 
 What stays local:
-- Recordings, screenshots, traces and run memory stay on disk in the project (`UserSettings/Cluewren` for Unity, `.godot/cluewren` for Godot, `Saved/Cluewren` for Unreal).
+- Frames (pictures of the game) are kept only in the brain's memory (the last 160 MB) and are never written to disk. Traces, reports and run memory stay on disk in the project (`UserSettings/Cluewren` for Unity, `.godot/cluewren` for Godot, `Saved/Cluewren` for Unreal).
 - API keys are never sent to the plugin, logs or run records.
 - The harness the agent writes runs in a Windows AppContainer (or under bubblewrap on Linux when available); elsewhere it is not sandboxed.
 

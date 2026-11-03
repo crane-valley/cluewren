@@ -1,6 +1,6 @@
 # 0003 Local only, with no upload path
 
-Status: accepted
+Status: accepted, where recordings are kept superseded by 0008
 Date: 2026-10-31
 
 ## Context
@@ -17,10 +17,11 @@ billing or remote memory code, and no installer.
 The only outbound connection the brain makes is to Jev.
 
 Pictures of the game are kept, because a request about how something looks cannot be judged from state and dropping
-them would lower accuracy. Runtime/Media.cs and its `record` and `capture` ops stay. Recordings remain on this machine
-in the run's folder. Frames reach only the language model the user configured, through a frame-describer subagent that
-sees the frames and not the claim, as upstream's does, for visual requests and to diagnose a stalled run. A per-project
-setting turns frames off at the cost of that accuracy. No other party ever receives them.
+them would lower accuracy. Runtime/Media.cs and its `record` and `capture` ops stay. Recordings remain on this machine,
+in the brain's memory only (ADR 0008; this first said the run's folder). Frames reach only the language model the user
+configured, through a frame-describer subagent that sees the frames and not the claim, as upstream's does, for visual
+requests and to diagnose a stalled run. A per-project setting turns frames off at the cost of that accuracy. No other
+party ever receives them.
 
 Removed from the plugin fork: Runtime/Aura.cs, the Aura parts of Runtime/Account.cs, Editor/HostLink.cs, the installer
 paths of Editor/AgentService.cs, the Account and sharing setup steps, usage billing, the uninstall of remote copies, and
