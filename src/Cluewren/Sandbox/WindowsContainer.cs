@@ -122,8 +122,15 @@ public sealed class WindowsContainer : ISandboxProcess
     {
         var retired = Retire(runFolder);
         claim.Dispose();
-        if (retired)
+        if (!retired)
+            return;
+        try
+        {
             File.Delete(Path.Combine(runFolder, ClaimFile));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
     }
 
     public static void RetireLeftovers(string runs, string current)
@@ -140,7 +147,7 @@ public sealed class WindowsContainer : ISandboxProcess
             {
                 claim = Claim(folder);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 continue;
             }
@@ -151,22 +158,28 @@ public sealed class WindowsContainer : ISandboxProcess
     static bool Retire(string runFolder)
     {
         var name = ChildSpec.ContainerNameOf(runFolder);
+        var purged = false;
         try
         {
-            if (DeriveAppContainerSidFromAppContainerName(name, out var sid) == 0)
-            {
-                var identity = new SecurityIdentifier(SidOf(sid));
-                FreeSid(sid);
-                var info = new DirectoryInfo(runFolder);
-                var security = info.GetAccessControl();
-                security.PurgeAccessRules(identity);
-                info.SetAccessControl(security);
-            }
+            var result = DeriveAppContainerSidFromAppContainerName(name, out var sid);
+            if (result != 0)
+                throw new Win32Exception(result);
+            var identity = new SecurityIdentifier(SidOf(sid));
+            FreeSid(sid);
+            var info = new DirectoryInfo(runFolder);
+            var security = info.GetAccessControl();
+            security.PurgeAccessRules(identity);
+            info.SetAccessControl(security);
+            purged = true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            purged = true;
         }
         catch (Exception e) when (e is Win32Exception or UnauthorizedAccessException or IOException)
         {
         }
-        return DeleteAppContainerProfile(name) == 0;
+        return DeleteAppContainerProfile(name) == 0 && purged;
     }
 
     static (IntPtr Parent, IntPtr Child) Pipe(ref SECURITY_ATTRIBUTES attributes, bool parentWrites)
