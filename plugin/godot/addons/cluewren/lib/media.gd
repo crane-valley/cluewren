@@ -7,7 +7,7 @@
 ## The game thread never waits on the GPU or on encoding:
 ##  - the picture is read back with RenderingDevice.texture_get_data_async (Forward+ and Mobile; queued on the render
 ##    thread), its callback only keeping the bytes; the Compatibility renderer has no asynchronous readback, so there
-##    the viewport's get_image() is taken, at the frame rate asked and no more often;
+##    get_image() is taken, at the frame rate asked and no more often, of a copy the GPU draws at the size asked;
 ##  - scaling, the JPEG and, when the game holds the connection itself, the base64 and the JSON text are made on the
 ##    WorkerThreadPool; the game thread only hands over the finished text (or, through the editor, the JPEG's bytes);
 ##  - a frame whose time comes while the one before is still being read or encoded is skipped (a gap in `n`).
@@ -16,6 +16,62 @@ extends RefCounted
 
 const DEBUGGER_MAX_BYTES := 7 * 1024 * 1024  # a debugger message is at most 8 MiB (RemoteDebuggerPeerTCP)
 const STALE_SECONDS := 3.0  # a readback or encode not done by then is dropped (a resize may lose a readback)
+# Bilinear by texelFetch, as Image.resize does it: a filtered texture() read of the viewport matched it on the first
+# copy only (Godot 4.7 Compatibility). blend_disabled: the alpha is copied, never blended.
+const BLIT_SHADER := """shader_type canvas_item;
+render_mode blend_disabled, unshaded;
+void fragment() {
+	ivec2 size = textureSize(TEXTURE, 0);
+	vec2 p = UV * vec2(size) - 0.5;
+	vec2 f = p - floor(p);
+	ivec2 i = ivec2(floor(p));
+	ivec2 hi = size - 1;
+	vec4 a = texelFetch(TEXTURE, clamp(i, ivec2(0), hi), 0);
+	vec4 b = texelFetch(TEXTURE, clamp(i + ivec2(1, 0), ivec2(0), hi), 0);
+	vec4 c = texelFetch(TEXTURE, clamp(i + ivec2(0, 1), ivec2(0), hi), 0);
+	vec4 d = texelFetch(TEXTURE, clamp(i + ivec2(1, 1), ivec2(0), hi), 0);
+	COLOR = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+"""
+
+## The game's picture drawn once on the GPU at a smaller size, for get_image() to read: on Compatibility that call
+## stalls the game thread in proportion to the pixels it reads.
+class Snap:
+	extends RefCounted
+	var vp := RenderingServer.viewport_create()
+	var canvas := RenderingServer.canvas_create()
+	var item := RenderingServer.canvas_item_create()
+	var size := Vector2i.ZERO
+	var source := RID()
+	var drawn := 0  # Engine.get_frames_drawn() once it is drawn
+	var frame := 0  # Engine.get_process_frames() when asked
+
+	func _init(material: RID) -> void:
+		RenderingServer.viewport_attach_canvas(vp, canvas)
+		RenderingServer.canvas_item_set_parent(item, canvas)
+		RenderingServer.canvas_item_set_material(item, material)
+		RenderingServer.viewport_set_active(vp, true)
+
+	func draw(texture: RID, to: Vector2i) -> void:
+		if to != size or texture != source:
+			size = to
+			source = texture
+			RenderingServer.viewport_set_size(vp, to.x, to.y)
+			RenderingServer.canvas_item_clear(item)
+			RenderingServer.canvas_item_add_texture_rect(item, Rect2(Vector2.ZERO, to), texture)
+		RenderingServer.viewport_set_update_mode(vp, RenderingServer.VIEWPORT_UPDATE_ONCE)
+		drawn = Engine.get_frames_drawn() + 1
+		frame = Engine.get_process_frames()
+
+	func image() -> Image:
+		return RenderingServer.texture_2d_get(RenderingServer.viewport_get_texture(vp))
+
+	func _notification(what: int) -> void:
+		if what == NOTIFICATION_PREDELETE:
+			RenderingServer.free_rid(item)
+			RenderingServer.free_rid(canvas)
+			RenderingServer.free_rid(vp)
+
 
 ## One picture on its way: read back, then scaled and encoded on a worker. Fields written off the game thread are
 ## guarded by `lock`.
@@ -36,6 +92,7 @@ class Job:
 	var read := false  # the bytes (or image) are here
 	var failed := ""  # why there is no picture
 	var fallback := false  # no asynchronous readback for this texture: take get_image() on the game thread
+	var snap: Snap = null
 	var image: Image = null
 	var data := PackedByteArray()
 	var w := 0
@@ -77,6 +134,8 @@ var _gen := 0
 var _next_at := 0.0
 var _frame: Job = null  # the recording's frame in flight
 var _stills := []  # captures in flight
+var _spare := []  # Snaps read back, kept to draw the next
+var _blit: ShaderMaterial = null
 
 
 func _init(owner_) -> void:
@@ -202,10 +261,42 @@ func _begin(job: Job) -> void:
 		return
 	var rd := RenderingServer.get_rendering_device()
 	if rd == null:
+		_draw_snap(job, tex)
 		job.set_failed("", true)  # (Compatibility renderer: get_image() when collected)
 		return
 	var rid: RID = tex.get_rid()
 	RenderingServer.call_on_render_thread(_read_on_render_thread.bind(rd, rid, job))
+
+
+func _draw_snap(job: Job, tex: Texture2D) -> void:
+	var size := Vector2i(tex.get_size())
+	var to := fit(size, job.max_dim)
+	if to == size or host.get_viewport().use_hdr_2d:
+		return  # (HDR 2D is read as it is: the copy is checked against 8-bit pictures only)
+	if _blit == null:
+		_blit = ShaderMaterial.new()
+		_blit.shader = Shader.new()
+		_blit.shader.code = BLIT_SHADER
+	var snap: Snap = _spare.pop_back() if not _spare.is_empty() else Snap.new(_blit.get_rid())
+	snap.draw(tex.get_rid(), to)
+	job.snap = snap
+
+
+## The picture get_image() gives: the Snap once it is drawn, null while it waits; else the viewport itself.
+func _take_image(job: Job) -> Image:
+	var snap := job.snap
+	if snap != null:
+		if Engine.get_frames_drawn() < snap.drawn and Engine.get_process_frames() <= snap.frame + 1:
+			return null
+		job.snap = null
+		# (not drawn a frame later: nothing is being drawn, as when minimized; the viewport is read as it is)
+		var img := snap.image() if Engine.get_frames_drawn() >= snap.drawn else null
+		if _spare.size() < 2:
+			_spare.append(snap)
+		if img != null and not img.is_empty():
+			return img
+	var tex = host.get_viewport().get_texture()
+	return tex.get_image() if tex else null
 
 
 ## On the render thread: ask the GPU for the texture's bytes; the callback only keeps them.
@@ -287,8 +378,9 @@ func _advance(job: Job, now: float) -> bool:
 	if job.failed != "":
 		return true
 	if fallback and job.image == null:
-		var tex = host.get_viewport().get_texture()
-		job.image = tex.get_image() if tex else null
+		job.image = _take_image(job)
+		if job.snap != null:
+			return false
 		if job.image == null or job.image.is_empty():
 			job.failed = "the game's viewport gave no picture"
 			return true
