@@ -4,6 +4,7 @@
     "references": [
         "Cluewren",
         "Cluewren.Editor",
+        "Cluewren.Tests.Runtime",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner",
         "Unity.InputSystem",

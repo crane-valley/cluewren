@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using Cluewren.Jev;
 using Cluewren.Kit;
@@ -486,6 +489,76 @@ public sealed class SandboxTests : IDisposable
         Assert.Contains("still here", await Probe(host, "\"still here\""));
     }
 
+    [Theory]
+    [InlineData("[]", true)]
+    [InlineData("not json", false)]
+    [InlineData("""{"kind":"reply"}""", true)]
+    [InlineData("""{"type":"reply","id":"x"}""", true)]
+    [InlineData("""{"type":"post"}""", true)]
+    [InlineData("""{"type":"status","text":5}""", true)]
+    [InlineData("""{"type":"req","op":"pose"}""", true)]
+    [InlineData("""{"type":"jev","rid":"x","body":{}}""", true)]
+    [InlineData("""{"type":"episode","rid":1,"n":1}""", true)]
+    public async Task A_line_off_the_protocol_ends_the_session_and_the_brain_goes_on(string line, bool ends)
+    {
+        await using var host = Host();
+        var result = await host.ProbeAsync($$"""
+            var raw = Console.OpenStandardOutput();
+            raw.Write(System.Text.Encoding.UTF8.GetBytes({{Literal(line)}} + "\n"));
+            raw.Flush();
+            "after"
+            """, seconds: 30);
+        if (ends)
+            Assert.Contains("broke the protocol", result.Text);
+        else
+            Assert.Contains("after", result.Text);
+        Assert.Contains("still here", await Probe(host, "\"still here\""));
+    }
+
+    [Fact]
+    public async Task Required_runs_no_harness_code_when_the_container_cannot_be_made()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var run = Directory.CreateDirectory(Path.Combine(_root, "run")).FullName;
+        // Owner Rights takes away the owner's implicit right to change the folder's ACL, which the container's grant needs.
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(true, false);
+        foreach (var who in new[] { WindowsIdentity.GetCurrent().User!, new SecurityIdentifier("S-1-3-4") })
+            security.AddAccessRule(new FileSystemAccessRule(who, FileSystemRights.Modify | FileSystemRights.Synchronize,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        new DirectoryInfo(run).SetAccessControl(security);
+        await using var host = new HarnessHost(new HostOptions(_game, run)
+        {
+            Mode = SandboxStarter.ModeFrom("required")!.Value, Say = _ => { },
+        });
+        var refused = await Assert.ThrowsAsync<SandboxException>(() => host.ProbeAsync("Console.WriteLine(\"RAN\");"));
+        Assert.Contains("container couldn't be created", refused.Message);
+        Assert.False(File.Exists(Path.Combine(run, "sandbox.log")));
+    }
+
+    [Theory]
+    [InlineData(SandboxMode.Contained)]
+    [InlineData(SandboxMode.Process)]
+    public async Task A_child_whose_first_call_is_cancelled_does_not_outlive_it(SandboxMode mode)
+    {
+        var before = Children.Of(Environment.ProcessId);
+        using var cancel = new CancellationTokenSource();
+        await using var host = new HarnessHost(new HostOptions(new CancelOnAttach(_game, cancel), Path.Combine(_root, "run"))
+        {
+            Mode = mode, Say = _ => { },
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => host.ProbeAsync("1", cancel.Token));
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        var left = Children.Of(Environment.ProcessId).Except(before).ToList();
+        while (left.Count > 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+            left = Children.Of(Environment.ProcessId).Except(before).ToList();
+        }
+        Assert.Empty(left);
+    }
+
     [Fact]
     public async Task Closing_the_parent_kills_the_child()
     {
@@ -518,5 +591,69 @@ public sealed class SandboxTests : IDisposable
             WindowsContainer.RetireLeftovers(_root, Path.Combine(_root, "run"));
             Assert.False(File.Exists(claim), "the dead parent's container was not retired");
         }
+    }
+}
+
+// The moment the brain attaches to a new child is when it subscribes to the game's events.
+sealed class CancelOnAttach(IGameLink game, CancellationTokenSource cancel) : IGameLink
+{
+    public ValueTask<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args = null, TimeSpan? timeout = null,
+        CancellationToken ct = default) => game.RequestAsync(op, args, timeout, ct);
+
+    public void Post(string op, Action<Utf8JsonWriter>? args = null) => game.Post(op, args);
+
+    public event Action<JsonElement>? Event
+    {
+        add => cancel.Cancel();
+        remove { }
+    }
+}
+
+static class Children
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct ProcessEntry
+    {
+        public int Size;
+        public int Usage;
+        public int ProcessId;
+        public IntPtr HeapId;
+        public int ModuleId;
+        public int Threads;
+        public int ParentProcessId;
+        public int PriorityBase;
+        public int Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")]
+    static extern bool First(IntPtr snapshot, ref ProcessEntry entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")]
+    static extern bool Next(IntPtr snapshot, ref ProcessEntry entry);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    public static HashSet<int> Of(int parent)
+    {
+        var found = new HashSet<int>();
+        var snapshot = CreateToolhelp32Snapshot(2, 0);
+        try
+        {
+            var entry = new ProcessEntry { Size = Marshal.SizeOf<ProcessEntry>() };
+            for (var more = First(snapshot, ref entry); more; more = Next(snapshot, ref entry))
+                if (entry.ParentProcessId == parent)
+                    found.Add(entry.ProcessId);
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+        return found;
     }
 }

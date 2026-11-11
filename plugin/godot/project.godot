@@ -1,0 +1,6 @@
+; The addon's test project: godot --headless --path plugin/godot -s res://tests/rc_test.gd
+config_version=5
+
+[application]
+
+config/name="Cluewren addon tests"

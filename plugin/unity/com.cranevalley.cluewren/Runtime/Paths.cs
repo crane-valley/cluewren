@@ -1,4 +1,4 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; DataPath names UserSettings/Cluewren.
 // Object paths for the bridge (rc, find, transforms, watch, view...). Readable, stable for the life of the object,
 // unambiguous with duplicate names and with '/', '|', '@', ':' in names:
 //
@@ -16,7 +16,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using Object = UnityEngine.Object;
@@ -255,6 +258,37 @@ namespace Cluewren
         }
 
         // -- reading paths ---------------------------------------------------------------------------------
+
+        static readonly Regex ShortName = new Regex("^[^~]{1,6}~[0-9]+");
+
+        // UserSettings/Cluewren holds what harness code may write: rc and a restart never open a path into it. An 8.3 short
+        // name (USERSE~1) is the same folder under another spelling.
+        public static bool DataPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            // An object path (Main:/Player) has its colon past a drive letter's: no file path does, and it is on every tick.
+            var colon = path.IndexOf(':');
+            if (colon >= 0 && colon != 1) return false;
+            string root, full;
+            try
+            {
+                root = Path.GetFullPath(Path.GetDirectoryName(Application.dataPath) ?? "").TrimEnd('\\', '/');
+                full = Path.GetFullPath(Path.Combine(root, path.Trim()));
+            }
+            catch (PathTooLongException)
+            {
+                return true;
+            }
+            catch (Exception e) when (e is ArgumentException || e is NotSupportedException)
+            {
+                return false;
+            }
+            if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return false;
+            var parts = full.Substring(root.Length + 1).Split('\\', '/');
+            return parts.Any(part => ShortName.IsMatch(part))
+                   || parts.Length >= 2 && string.Equals(parts[0], "UserSettings", StringComparison.OrdinalIgnoreCase)
+                                       && string.Equals(parts[1], "Cluewren", StringComparison.OrdinalIgnoreCase);
+        }
 
         /// <summary>What a path names: a GameObject, a Component, a Type (static), another Unity object, or null.</summary>
         public static object Resolve(string path)

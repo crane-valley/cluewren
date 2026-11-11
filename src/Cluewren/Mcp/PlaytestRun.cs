@@ -93,7 +93,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     static bool IsUnreal(string project) => Directory.Exists(project) && Directory.EnumerateFiles(project, "*.uproject").Any();
 
     public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IJevRelay jev, string client,
-        CancellationToken ct = default)
+        SandboxMode sandbox, CancellationToken ct = default)
     {
         var probe = new Game(link);
         var project = (await probe.Context(fresh: true, ct).ConfigureAwait(false))["project_dir"].Text;
@@ -106,7 +106,10 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (OperatingSystem.IsWindows())
             WindowsContainer.RetireLeftovers(Path.Combine(memory, "runs"), runFolder);
         var recorder = new FrameRecorder(link);
-        var host = new HarnessHost(new HostOptions(link, runFolder) { Jev = jev, ProjectFolder = memory, Recorder = recorder });
+        var host = new HarnessHost(new HostOptions(link, runFolder)
+        {
+            Jev = jev, ProjectFolder = memory, Recorder = recorder, Mode = sandbox,
+        });
         var run = new PlaytestRun(link, request, host, recorder, project, memory, runFolder, id, client);
         try
         {
@@ -489,6 +492,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         }
         catch (Exception e) when (e is GameException or GameDisconnectedException or SandboxException or IOException)
         {
+            if (e is SandboxException)
+                Console.Error.WriteLine($"cluewren: {tool}: the sandbox failed: {e.Message}");
             return ToolResult.Say($"{tool} failed: {e.GetType().Name}: {e.Message}\n{Clock()}", true);
         }
         finally

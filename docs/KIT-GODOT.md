@@ -14,7 +14,12 @@ Reading and calling (`game.Get`, `game.Props`, `game.Call`, `game.Describe`). Th
 constants (read only), built-in properties and methods. A part of a property takes Godot's `a:b` path:
 `game.Get(path, "position:y")`. `game.Call` takes arguments by name; leave out those with defaults. `game.Describe(path)`
 lists the script's own variables, constants and functions first. Engine singletons and autoloads go by name:
-`game.Call("Input", "is_action_pressed", new { action = "jump" })`, `game.Get("/root/<Autoload>", "score")`. Values are
+`game.Call("Input", "is_action_pressed", new { action = "jump" })`, `game.Get("/root/<Autoload>", "score")`. The singletons
+are Input, InputMap, Engine, Time, Performance, Geometry2D/3D and the physics, navigation, audio, translation and rendering
+servers, with getters alone of OS, ProjectSettings and DisplayServer (`OS.get_name`, `ProjectSettings.get_setting`,
+`DisplayServer.window_get_size`...). Files, the network, processes, threads, code (a script's source, `call`/`set` by name),
+the clipboard, the environment, the editor and anything under `res://.godot/` answer 403 "... is refused": read the
+project's files with your own tools. Values are
 Godot's own: metres, x right, y up, -z forward, vectors `{"x","y","z"}`, a node as its path, a resource as its `res://`
 path, an enum as its name, a `rotation` in radians. Turn a position or velocity into the kit's frame with
 `game.ToKit(value)` (and back with `game.ToNative(vec)`) before mixing it with `game.Loc`, `game.Pose` or `game.View`,

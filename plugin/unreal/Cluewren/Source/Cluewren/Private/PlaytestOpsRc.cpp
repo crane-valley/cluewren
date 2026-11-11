@@ -1,10 +1,12 @@
-// Modified by Crane Valley: renamed for Cluewren; the settings class is compared as an FName.
+// Modified by Crane Valley: renamed for Cluewren; the settings class is compared as an FName; every receiver, argument
+// and written value passes PlaytestRefusal (docs/adr/0014).
 // `rc`: Remote Control compatible calls on the running game. Call a function, read or write
 // a property, or describe an object, with the same bodies and results as Unreal's Remote Control HTTP API.
 
 #include "PlaytestOps.h"
 
 #include "PlaytestJson.h"
+#include "PlaytestRefusal.h"
 #include "UObject/StructOnScope.h"
 #include "UObject/UnrealType.h"
 
@@ -12,38 +14,41 @@ namespace PlaytestOps
 {
 namespace
 {
-	/** Why a change to this object is refused, "" when it isn't: the editor's Play settings (the net mode, the number
-	 *  of clients...) are the user's own. A changed net mode outlives the run, and a game made for one may not start in
-	 *  another (Play In Editor never begins, and every later run finds no game). */
-	FString Refused(const UObject* Object)
+	using PlaytestRefusal::EOp;
+
+	constexpr int32 Refusal = 403;
+
+	using PlaytestRefusal::RefusedJson;
+
+	UObject* Target(UPlaytestSubsystem& Bridge, int64 Id, const FString& Path, FName Member, EOp Op)
 	{
-		static const FName PlaySettings(TEXT("LevelEditorPlaySettings"));
-		for (const UClass* Class = Object ? Object->GetClass() : nullptr; Class; Class = Class->GetSuperClass())
+		if (PlaytestRefusal::DataPath(Path))
 		{
-			if (Class->GetFName() == PlaySettings)
-			{
-				return TEXT("The editor's Play settings (LevelEditorPlaySettings: net mode, clients...) are the user's and "
-					"aren't changed by a run: the game is played as it is set up. If a setting stands in the way, say so in "
-					"the report");
-			}
+			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under Saved/Cluewren is opened for rc"), *Path), Refusal);
+			return nullptr;
 		}
-		return FString();
+		UObject* Object = PlaytestJson::ResolveObject(Path);
+		if (!Object)
+		{
+			Bridge.RespondError(Id, Missing(Path));
+			return nullptr;
+		}
+		const FString Why = PlaytestRefusal::Refused(Object, Member, Op);
+		if (!Why.IsEmpty())
+		{
+			Bridge.RespondError(Id, Why, Refusal);
+			return nullptr;
+		}
+		return Object;
 	}
 
 	void Call(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Body)
 	{
 		const FString Path = StringField(Body, TEXT("objectPath"));
-		UObject* Object = PlaytestJson::ResolveObject(Path);
+		const FString Name = StringField(Body, TEXT("functionName"));
+		UObject* Object = Target(Bridge, Id, Path, FName(*Name), EOp::Call);
 		if (!Object)
 		{
-			Bridge.RespondError(Id, Missing(Path));
-			return;
-		}
-		const FString Name = StringField(Body, TEXT("functionName"));
-		const FString Why = Refused(Object);
-		if (!Why.IsEmpty())
-		{
-			Bridge.RespondError(Id, Why);
 			return;
 		}
 		UFunction* Function = Object->FindFunction(FName(*Name));
@@ -53,6 +58,12 @@ namespace
 			return;
 		}
 		const TSharedPtr<FJsonObject> Params = ObjectField(Body, TEXT("parameters"));
+		const FString Paths = Params.IsValid() ? RefusedJson(MakeShared<FJsonValueObject>(Params)) : FString();
+		if (!Paths.IsEmpty())
+		{
+			Bridge.RespondError(Id, Paths, Refusal);
+			return;
+		}
 		FStructOnScope Scope(Function);
 		uint8* Parms = Scope.GetStructMemory();
 #if WITH_METADATA
@@ -94,6 +105,20 @@ namespace
 			}
 #endif
 		}
+		// After conversion: a struct's text and a default argument are imported, and can name objects themselves.
+		for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			if (It->HasAnyPropertyFlags(CPF_ReturnParm))
+			{
+				continue;
+			}
+			const FString Why = PlaytestRefusal::RefusedValue(*It, It->ContainerPtrToValuePtr<void>(Parms));
+			if (!Why.IsEmpty())
+			{
+				Bridge.RespondError(Id, FString::Printf(TEXT("%s on %s: %s"), *Name, *Path, *Why), Refusal);
+				return;
+			}
+		}
 		Object->ProcessEvent(Function, Parms);
 		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 		for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
@@ -114,18 +139,44 @@ namespace
 		Bridge.Respond(Id, Obj(Result));
 	}
 
+	// Into a copy first: a refused value never reaches the object.
+	bool Write(UPlaytestSubsystem& Bridge, int64 Id, UObject* Object, FProperty* Prop, const TSharedPtr<FJsonValue>& Value)
+	{
+		void* Dest = Prop->ContainerPtrToValuePtr<void>(Object);
+		void* Copy = FMemory::Malloc(Prop->GetSize(), Prop->GetMinAlignment());
+		Prop->InitializeValue(Copy);
+		Prop->CopyCompleteValue(Copy, Dest);
+		FString Error;
+		bool bWritten = false;
+		if (!PlaytestJson::JsonToProperty(Prop, Copy, Value, Error))
+		{
+			Bridge.RespondError(Id, Error);
+		}
+		else if (const FString Why = PlaytestRefusal::RefusedValue(Prop, Copy); !Why.IsEmpty())
+		{
+			Bridge.RespondError(Id, Why, Refusal);
+		}
+		else
+		{
+			Prop->CopyCompleteValue(Dest, Copy);
+			bWritten = true;
+		}
+		Prop->DestroyValue(Copy);
+		FMemory::Free(Copy);
+		return bWritten;
+	}
+
 	void Property(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Body)
 	{
 		const FString Path = StringField(Body, TEXT("objectPath"));
-		UObject* Object = PlaytestJson::ResolveObject(Path);
-		if (!Object)
-		{
-			Bridge.RespondError(Id, Missing(Path));
-			return;
-		}
 		const FString Name = StringField(Body, TEXT("propertyName"));
 		const TSharedPtr<FJsonObject> NewValue = ObjectField(Body, TEXT("propertyValue"));
 		const bool bWrite = NewValue.IsValid() || StringField(Body, TEXT("access")).StartsWith(TEXT("WRITE"));
+		UObject* Object = Target(Bridge, Id, Path, FName(*Name), bWrite ? EOp::Write : EOp::Read);
+		if (!Object)
+		{
+			return;
+		}
 		if (Name.IsEmpty())
 		{
 			if (bWrite)
@@ -144,18 +195,11 @@ namespace
 		}
 		if (bWrite)
 		{
-			const FString Why = Refused(Object);
-			if (!Why.IsEmpty())
-			{
-				Bridge.RespondError(Id, Why);
-				return;
-			}
 			TSharedPtr<FJsonValue> Value = FindField(NewValue, Name);
 			if (!Value.IsValid() && NewValue.IsValid() && NewValue->Values.Num() == 1)
 			{
 				Value = NewValue->Values.CreateConstIterator().Value();
 			}
-			FString Error;
 			if (!Value.IsValid())
 			{
 				Bridge.RespondError(Id, FString::Printf(TEXT("No value given for %s"), *Name));
@@ -166,12 +210,16 @@ namespace
 				Bridge.RespondError(Id, FString::Printf(TEXT("%s is a fixed-size array and can't be written"), *Name));
 				return;
 			}
-			if (!PlaytestJson::JsonToProperty(Prop, Prop->ContainerPtrToValuePtr<void>(Object), Value, Error))
+			const FString Paths = RefusedJson(Value);
+			if (!Paths.IsEmpty())
 			{
-				Bridge.RespondError(Id, Error);
+				Bridge.RespondError(Id, Paths, Refusal);
 				return;
 			}
-			Bridge.Respond(Id, Obj(MakeShared<FJsonObject>()));
+			if (Write(Bridge, Id, Object, Prop, Value))
+			{
+				Bridge.Respond(Id, Obj(MakeShared<FJsonObject>()));
+			}
 			return;
 		}
 		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -192,10 +240,9 @@ namespace
 	void Describe(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Body)
 	{
 		const FString Path = StringField(Body, TEXT("objectPath"));
-		UObject* Object = PlaytestJson::ResolveObject(Path);
+		UObject* Object = Target(Bridge, Id, Path, NAME_None, EOp::Read);
 		if (!Object)
 		{
-			Bridge.RespondError(Id, Missing(Path));
 			return;
 		}
 		UClass* Class = Object->GetClass();
@@ -220,7 +267,8 @@ namespace
 		for (TFieldIterator<UFunction> It(Class, EFieldIteratorFlags::IncludeSuper); It; ++It)
 		{
 			UFunction* Function = *It;
-			if (!Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintPure))
+			if (!Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintPure)
+				|| !PlaytestRefusal::Refused(Object, Function->GetFName(), EOp::Call).IsEmpty())
 			{
 				continue;
 			}
