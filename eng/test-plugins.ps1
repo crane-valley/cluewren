@@ -132,6 +132,10 @@ function Test-Unity([string] $folder) {
     $version, $revision = (Get-Item -LiteralPath $editor).VersionInfo.ProductVersion.Split('_')
     Write-Text (Join-Path $project 'ProjectSettings/ProjectVersion.txt') (
         "m_EditorVersion: $version`nm_EditorVersionWithRevision: $version ($revision)`n")
+    # A new project has the Input Manager alone, which leaves ENABLE_INPUT_SYSTEM undefined and the package's Input
+    # System code compiled out; 2 is both. Unity fills in the rest of the file on the first open.
+    $settings = Join-Path $project 'ProjectSettings/ProjectSettings.asset'
+    Write-Text $settings "%YAML 1.1`n%TAG !u! tag:unity3d.com,2011:`n--- !u!129 &1`nPlayerSettings:`n  activeInputHandler: 2`n"
     $manifest = [ordered] @{ dependencies = $dependencies; testables = @('com.cranevalley.cluewren') }
     Write-Text (Join-Path $project 'Packages/manifest.json') ($manifest | ConvertTo-Json -Depth 4)
     $results = Join-Path $folder 'results.xml'
@@ -141,6 +145,9 @@ function Test-Unity([string] $folder) {
     $problems = [System.Collections.Generic.List[string]]::new()
     if ($code -ne 0) {
         $problems.Add("exit code $code")
+    }
+    if (-not (Select-String -LiteralPath $settings -Pattern '^\s*activeInputHandler: 2\s*$' -Quiet)) {
+        $problems.Add("$settings no longer has activeInputHandler: 2")
     }
     $passed = 0
     $failed = 0
