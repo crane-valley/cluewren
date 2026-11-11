@@ -1,5 +1,6 @@
 // Modified by Crane Valley: the editor connects when asked (the window, the command line), never by itself; the agent
-// service, sign-in, uninstall and preferences paths are removed, and a command line asks for a connection, never a run.
+// service, sign-in, uninstall and preferences paths are removed, and a command line asks for a connection, never a run;
+// rc is told which assemblies the editor alone compiles.
 // The bridge in the editor: one client for the editor's life, in edit mode and play mode alike (play mode is the
 // session: the brain's `session start` enters it, as Unreal's Play In Editor). Ticked by the editor's update while
 // the game isn't playing (or is paused), by the player loop while it plays.
@@ -13,6 +14,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -57,6 +59,16 @@ namespace Cluewren.Editor
             Bootstrap.InstallTick();
             Ops.EditorLevels = Levels;
             Ops.EditorLoad = LoadInPlayMode;
+            var editorOnly = new HashSet<string>(CompilationPipeline.GetAssemblies(AssembliesType.Editor)
+                .Where(a => (a.flags & AssemblyFlags.EditorAssembly) != 0).Select(a => a.name));
+            var player = new HashSet<string>(CompilationPipeline.GetAssemblies(AssembliesType.PlayerWithoutTestAssemblies).Select(a => a.name));
+            Reflect.EditorOnly = a =>
+            {
+                var name = a.GetName().Name;
+                // A Unity.* assembly that no player is built with is the editor's own tooling (Gradle, build service, compiler).
+                return editorOnly.Contains(name) || name.StartsWith("UnityEditor", StringComparison.Ordinal)
+                       || name.StartsWith("Unity.", StringComparison.Ordinal) && !player.Contains(name);
+            };
         }
 
         // -- the client --------------------------------------------------------------------------------------

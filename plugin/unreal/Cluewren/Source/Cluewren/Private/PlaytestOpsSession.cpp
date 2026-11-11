@@ -1,8 +1,9 @@
-// Modified by Crane Valley: context says the engine and the project's folder.
+// Modified by Crane Valley: context says the engine and the project's folder; a restart never opens Saved/Cluewren.
 // `context`, `session`, `pause`, `timestep` and `ping`: what is running and the game's controls,
 // starting, stopping and restarting play, pausing, a fixed time step, and the clocks.
 
 #include "PlaytestOps.h"
+#include "PlaytestRefusal.h"
 #include "Misc/EngineVersionComparison.h"
 
 #include "Camera/PlayerCameraManager.h"
@@ -276,6 +277,12 @@ namespace
 			Status->SetBoolField(TEXT("loading"), (World && !World->HasBegunPlay())
 				|| (Bridge.SessionRequested && Bridge.SessionRequested()));
 			Bridge.Respond(Id, Obj(Status));
+			return;
+		}
+		if (PlaytestRefusal::DataPath(StringField(Args, TEXT("map"))))
+		{
+			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under Saved/Cluewren is opened as a level"),
+				*StringField(Args, TEXT("map"))), 403);
 			return;
 		}
 		if (Bridge.SessionHandler)

@@ -187,6 +187,15 @@ public sealed class PlainChild : ISandboxProcess
 
 public static class SandboxStarter
 {
+    public const string Setting = "CLUEWREN_SANDBOX";
+
+    public static SandboxMode? ModeFrom(string? setting) => setting?.Trim().ToLowerInvariant() switch
+    {
+        null or "auto" => SandboxMode.Auto,
+        "required" => SandboxMode.Contained,
+        _ => null,
+    };
+
     static string[]? Bubblewrap(ChildSpec spec)
     {
         if (Environment.GetEnvironmentVariable("PATH") is not { } path)
@@ -231,7 +240,10 @@ public static class SandboxStarter
                 throw new SandboxException("bubblewrap isn't available");
             return (PlainChild.Start(spec), Downgraded("bubblewrap isn't available"));
         }
-        return (PlainChild.Start(spec), null);
+        const string none = "this platform has no container for harness code";
+        if (mode == SandboxMode.Contained)
+            throw new SandboxException(none);
+        return (PlainChild.Start(spec), Downgraded(none));
     }
 
     public static string Downgraded(string why) =>

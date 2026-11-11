@@ -1,6 +1,7 @@
 # Modified by Crane Valley: the game connects only with --playtest-connect, through brain.json and the mutual handshake;
 # the run requested on the command line, report files, token, sharing, preferences and codex ops are removed; the addon
-# stays idle until a brain is there, does nothing in a release build, and keeps its per-frame path free of allocation.
+# stays idle until a brain is there, does nothing in a release build, and keeps its per-frame path free of allocation;
+# a restart never opens a scene under res://.godot/.
 ## Cluewren: the game-side bridge (an autoload, /root/Cluewren). Runs inside the game process, in the editor's
 ## play sessions and in debug builds alike, and keeps working while the game is paused (process_mode ALWAYS).
 ##
@@ -491,6 +492,8 @@ func session(id, args: Dictionary):
 		target = _launch_scene if _launch_scene != "" else _scene_path()
 	if target == "":
 		return [false, "No scene to restart"]
+	if Codex.data_path(target):
+		return [false, "%s is refused: nothing under res://.godot/ is opened as a scene" % target, 403]
 	_release_all()
 	if args.get("fresh", false):
 		_reset_autoloads()

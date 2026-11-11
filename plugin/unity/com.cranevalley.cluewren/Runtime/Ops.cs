@@ -1,4 +1,4 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; a restart never opens a scene in UserSettings/Cluewren.
 // The brain's requests (docs/protocol.md), handled on the main thread.
 
 using System;
@@ -228,6 +228,11 @@ namespace Cluewren
         {
             var target = string.IsNullOrEmpty(map) ? LaunchScene : map;
             if (string.IsNullOrEmpty(target)) target = SceneManager.GetActiveScene().path;
+            if (Paths.DataPath(target))
+            {
+                client.RespondError(id, $"{target} is refused: nothing in UserSettings/Cluewren is opened as a scene", 403);
+                return;
+            }
             Hands.ReleaseAll();
             if (paused) SetPaused(false);
             var old = SceneManager.GetActiveScene().handle;

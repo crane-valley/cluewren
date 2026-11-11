@@ -36,18 +36,31 @@ switch (args.FirstOrDefault())
         return 2;
 }
 
+static SandboxMode? SandboxSetting()
+{
+    var setting = Environment.GetEnvironmentVariable(SandboxStarter.Setting);
+    var mode = SandboxStarter.ModeFrom(setting);
+    if (mode is null)
+        Console.Error.WriteLine($"{SandboxStarter.Setting}={setting} isn't a setting: leave it unset, or set it to auto or required.");
+    return mode;
+}
+
 static async Task<int> ServeMcp()
 {
+    if (SandboxSetting() is not { } sandbox)
+        return 2;
     var utf8 = new UTF8Encoding(false);
     var output = new StreamWriter(Console.OpenStandardOutput(), utf8) { AutoFlush = true };
     Console.SetOut(Console.Error);
-    await using var server = new McpServer(output);
+    await using var server = new McpServer(output) { Sandbox = sandbox };
     await server.ServeAsync(new StreamReader(Console.OpenStandardInput(), utf8)).ConfigureAwait(false);
     return 0;
 }
 
 async Task<int> RunHarness()
 {
+    if (SandboxSetting() is not { } sandbox)
+        return 2;
     var seconds = args.Length > 2 && double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : 30;
     using var cancel = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) =>
@@ -68,7 +81,7 @@ async Task<int> RunHarness()
         link.Send(json => json.WriteString("type", "run_started"));
         var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
         await using var jev = key is null ? null : new JevClient(new JevOptions(key));
-        await using var host = new HarnessHost(new HostOptions(link, args[1]) { Jev = jev, Say = Console.WriteLine });
+        await using var host = new HarnessHost(new HostOptions(link, args[1]) { Jev = jev, Say = Console.WriteLine, Mode = sandbox });
         var result = await host.RunHarnessAsync(seconds, ct: cancel.Token);
         Console.WriteLine($"sandbox: {result.Sandbox}");
         Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");
@@ -79,6 +92,11 @@ async Task<int> RunHarness()
     catch (OperationCanceledException)
     {
         return 130;
+    }
+    catch (SandboxException e)
+    {
+        Console.Error.WriteLine($"The sandbox failed: {e.Message}");
+        return 1;
     }
     finally
     {

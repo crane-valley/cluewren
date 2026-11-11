@@ -27,8 +27,10 @@ public sealed class SandboxSession : IDisposable
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonDocument?>> _calls = new();
     readonly CancellationTokenSource _closing = new();
     readonly Action<JsonElement> _forward;
+    readonly Lock _ending = new();
     long _ids;
     int _disposed;
+    string? _failure;
 
     public SandboxSession(ISandboxProcess process, IGameLink link, IJevRelay? jev, Func<bool> spendDecision,
         IEpisodeRecorder? recorder, Action<string> say, string logPath)
@@ -116,36 +118,67 @@ public sealed class SandboxSession : IDisposable
                     ArrayPool<byte>.Shared.Return(line.Rented);
                     continue;
                 }
-                Dispatch(document, line.Rented);
+                try
+                {
+                    Dispatch(document, line.Rented);
+                }
+                // Harness code can write JSON of any shape to the child's stdout: it ends the session, never this process.
+                catch (Exception e) when (e is KeyNotFoundException or FormatException
+                                              or InvalidOperationException and not ObjectDisposedException)
+                {
+                    document.Dispose();
+                    ArrayPool<byte>.Shared.Return(line.Rented);
+                    Fail($"the child broke the protocol ({e.GetType().Name}: {e.Message})");
+                    return;
+                }
             }
         }
-        catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidDataException)
+        catch (InvalidDataException e)
+        {
+            Fail($"the child broke the protocol ({e.Message})");
+            return;
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException)
         {
         }
         foreach (var call in _calls.Values)
             call.TrySetResult(null);
     }
 
+    void Fail(string why)
+    {
+        Interlocked.CompareExchange(ref _failure, why, null);
+        // Under the lock Dispose takes: a job handle closed and reused by the next child must never be killed from here.
+        lock (_ending)
+            if (_disposed == 0)
+                _process.Kill();
+        foreach (var call in _calls.Values)
+            call.TrySetResult(null);
+    }
+
+    static string Text(JsonElement root, string name) =>
+        root.GetProperty(name).GetString() ?? throw new FormatException($"{name} is null");
+
+    // Every field is read before anything is handed on, so a line that throws here has handed nothing on.
     void Dispatch(JsonDocument document, byte[] rented)
     {
         var root = document.RootElement;
-        var keep = false;
-        switch (root.TryGetProperty("type", out var type) ? type.GetString() : null)
+        switch (Text(root, "type"))
         {
             case "reply":
-                if (root.TryGetProperty("id", out var id) && _calls.TryRemove(id.GetInt64(), out var call))
+                if (_calls.TryRemove(root.GetProperty("id").GetInt64(), out var call))
                 {
                     call.TrySetResult(document);
-                    keep = true;
+                    return;
                 }
                 break;
             case "req":
-                _ = ServeRequest(document, rented);
-                keep = true;
-                break;
+                _ = Serve(ServeRequest(root.GetProperty("rid").GetInt64(), Text(root, "op"), root), document, rented);
+                return;
             case "post":
+                var op = Text(root, "op");
                 var args = root.TryGetProperty("args", out var posted) ? posted : default;
-                _link.Post(root.GetProperty("op").GetString()!, json => WriteFields(json, args));
+                _link.Post(op, json => WriteFields(json, args));
                 break;
             case "send":
                 var frame = root.GetProperty("frame");
@@ -155,14 +188,27 @@ public sealed class SandboxSession : IDisposable
                 _say(root.GetProperty("text").GetString() ?? "");
                 break;
             case "jev":
-                _ = ServeJev(document, rented);
-                keep = true;
-                break;
+                _ = Serve(ServeJev(root.GetProperty("rid").GetInt64(), root), document, rented);
+                return;
             case "episode":
-                ServeEpisode(root);
+                ServeEpisode(root.GetProperty("rid").GetInt64(), Text(root, "mark"), root.GetProperty("n").GetInt32());
                 break;
         }
-        if (!keep)
+        document.Dispose();
+        ArrayPool<byte>.Shared.Return(rented);
+    }
+
+    async Task Serve(Task handler, JsonDocument document, byte[] rented)
+    {
+        try
+        {
+            await handler.ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            Fail($"the brain couldn't answer the child ({e.GetType().Name}: {e.Message})");
+        }
+        finally
         {
             document.Dispose();
             ArrayPool<byte>.Shared.Return(rented);
@@ -177,13 +223,10 @@ public sealed class SandboxSession : IDisposable
             field.WriteTo(json);
     }
 
-    async Task ServeRequest(JsonDocument document, byte[] rented)
+    async Task ServeRequest(long rid, string op, JsonElement root)
     {
-        var root = document.RootElement;
-        var rid = root.GetProperty("rid").GetInt64();
         try
         {
-            var op = root.GetProperty("op").GetString()!;
             var args = root.TryGetProperty("args", out var given) ? given : default;
             TimeSpan? timeout = root.TryGetProperty("timeout", out var limit) ? TimeSpan.FromSeconds(limit.GetDouble()) : null;
             using var answer = await _link.RequestAsync(op, json => WriteFields(json, args), timeout, _closing.Token).ConfigureAwait(false);
@@ -229,17 +272,10 @@ public sealed class SandboxSession : IDisposable
                     json.WriteString("closed", closed);
             });
         }
-        finally
-        {
-            document.Dispose();
-            ArrayPool<byte>.Shared.Return(rented);
-        }
     }
 
-    async Task ServeJev(JsonDocument document, byte[] rented)
+    async Task ServeJev(long rid, JsonElement root)
     {
-        var root = document.RootElement;
-        var rid = root.GetProperty("rid").GetInt64();
         try
         {
             if (_jev is null)
@@ -267,19 +303,12 @@ public sealed class SandboxSession : IDisposable
                 json.WriteString("error", s.Text);
             });
         }
-        finally
-        {
-            document.Dispose();
-            ArrayPool<byte>.Shared.Return(rented);
-        }
     }
 
-    void ServeEpisode(JsonElement root)
+    void ServeEpisode(long rid, string mark, int n)
     {
-        var rid = root.GetProperty("rid").GetInt64();
         try
         {
-            var (mark, n) = (root.GetProperty("mark").GetString(), root.GetProperty("n").GetInt32());
             if (mark == "begin")
                 _recorder?.Begin(n);
             else if (mark == "end")
@@ -313,7 +342,7 @@ public sealed class SandboxSession : IDisposable
         try
         {
             using var document = await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds), ct).ConfigureAwait(false)
-                                 ?? throw new SandboxException("the child ended before it answered");
+                                 ?? throw new SandboxException(Volatile.Read(ref _failure) ?? "the child ended before it answered");
             var root = document.RootElement;
             if (root.TryGetProperty("error", out var error))
                 throw new SandboxException(error.GetString() ?? "the child failed");
@@ -333,8 +362,12 @@ public sealed class SandboxSession : IDisposable
 
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            return;
+        lock (_ending)
+        {
+            if (_disposed != 0)
+                return;
+            _disposed = 1;
+        }
         _link.Event -= _forward;
         _closing.Cancel();
         _process.Dispose();

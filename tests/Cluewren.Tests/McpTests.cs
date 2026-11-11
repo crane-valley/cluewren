@@ -76,6 +76,43 @@ public class McpServerTests
         Assert.Equal(-32601, answers[0]["error"]!["code"]!.GetValue<int>());
     }
 
+    [Theory]
+    [InlineData("requird", false)]
+    [InlineData("off", false)]
+    [InlineData("required", true)]
+    [InlineData("Auto", true)]
+    public async Task The_brain_starts_only_with_a_sandbox_setting_it_knows(string setting, bool starts)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "Cluewren.exe"))
+        {
+            ArgumentList = { "mcp" }, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        start.Environment["CLUEWREN_SANDBOX"] = setting;
+        using var brain = System.Diagnostics.Process.Start(start)!;
+        var error = brain.StandardError.ReadToEndAsync();
+        _ = brain.StandardOutput.ReadToEndAsync();
+        try
+        {
+            if (starts)
+            {
+                await Task.Delay(2000);
+                Assert.False(brain.HasExited, brain.HasExited ? await error : "");
+                brain.StandardInput.Close();
+            }
+            using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await brain.WaitForExitAsync(limit.Token);
+            Assert.Equal(starts ? 0 : 2, brain.ExitCode);
+            if (!starts)
+                Assert.Contains("CLUEWREN_SANDBOX", await error);
+        }
+        finally
+        {
+            if (!brain.HasExited)
+                brain.Kill();
+        }
+    }
+
     [Fact]
     public async Task Start_run_with_no_key_asks_for_it_without_opening_a_port()
     {

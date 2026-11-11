@@ -91,6 +91,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
 
     public string? JevKey { get; init; }
 
+    public SandboxMode Sandbox { get; init; }
+
     public async Task ServeAsync(TextReader input)
     {
         var calls = new List<Task>();
@@ -326,7 +328,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             var link = await _bridge.NextLinkAsync(deadline.Token).ConfigureAwait(false);
             _jev = new JevClient(new JevOptions(key));
             _run = await PlaytestRun.OpenAsync(link, new RunRequest(request, kind, args["minutes"]?.GetValue<double>(),
-                args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, _stopping.Token).ConfigureAwait(false);
+                args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, Sandbox, _stopping.Token).ConfigureAwait(false);
             _watch = CloseWhenEndedAsync(_run);
             return ToolResult.Say(_run.Opening);
         }

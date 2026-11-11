@@ -1,5 +1,8 @@
-// Modified by Crane Valley: renamed for Cluewren; a name compared per property is an FName.
+// Modified by Crane Valley: renamed for Cluewren; a name compared per property is an FName; nothing under Saved/Cluewren
+// is resolved.
 #include "PlaytestJson.h"
+
+#include "PlaytestRefusal.h"
 
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -406,7 +409,7 @@ TSharedRef<FJsonObject> StructToJson(const UStruct* Struct, const void* Containe
 
 UObject* ResolveObject(const FString& Path)
 {
-	if (Path.IsEmpty() || Path == TEXT("None"))
+	if (Path.IsEmpty() || Path == TEXT("None") || PlaytestRefusal::DataPath(Path))
 	{
 		return nullptr;
 	}

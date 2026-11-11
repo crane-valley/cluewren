@@ -1,6 +1,6 @@
 # 0004 Model-written C# harness in an AppContainer
 
-Status: accepted
+Status: accepted, rc's refusals and a required container amended by 0014
 Date: 2026-10-31
 Supersedes: 0002
 

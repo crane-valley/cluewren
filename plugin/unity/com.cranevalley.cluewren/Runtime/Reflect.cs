@@ -1,5 +1,5 @@
-// Modified by Crane Valley: rc reaches only project and Unity members and never a refused namespace (Refused); resolved
-// members are cached; ToJson enumerates arrays and materialized collections, never a lazy iterator; assembly-qualified type names aren't loaded.
+// Modified by Crane Valley: rc reaches only project and Unity members, never a refused namespace, editor-only assembly
+// or named member (Refused, docs/adr/0014), nor a path into UserSettings/Cluewren; resolved members are cached; ToJson enumerates arrays and materialized collections, never a lazy iterator; assembly-qualified type names aren't loaded.
 // rc: Remote Control compatible calls over C# reflection (docs/protocol.md, `rc`; the Unity notes in this package's
 // README). call / property (read, write) / describe on GameObjects, components, types (static members) and other Unity
 // objects. Values are native: Unity's axes, metres, vectors as lowercase {"x","y","z"}.
@@ -37,7 +37,44 @@ namespace Cluewren
         static readonly string[] RefusedNamespaces =
         {
             "System.Reflection", "System.IO", "System.Diagnostics", "System.Net", "System.Runtime.InteropServices", "Mono",
-            "Microsoft.Win32",
+            "Microsoft.Win32", "UnityEngine.Networking", "UnityEngine.Windows", "UnityEngine.WSA", "UnityEngine.Analytics",
+            "UnityEngine.Purchasing", "UnityEngine.Profiling.Memory", "UnityEngine.Apple", "UnityEngine.iOS", "UnityEngine.tvOS",
+            "UnityEngine.DedicatedServer", "UnityEngine.NVIDIA", "Unity.Networking", "Unity.Netcode", "Unity.Services",
+            "Unity.Profiling.Memory", "Unity.IO", "Unity.Loading",
+        };
+
+        static readonly HashSet<string> RefusedTypeNames = new HashSet<string>
+        {
+            "UnityEngine.Ping", "UnityEngine.Caching", "UnityEngine.Cache", "UnityEngine.Microphone", "UnityEngine.WebCamTexture",
+            "UnityEngine.ClusterInput", "UnityEngine.iPhone", "UnityEngine.WWW", "UnityEngine.WWWForm", "UnityEngine.TypeTreeStoreManager",
+            "UnityEngine.PlayerPrefs",
+        };
+
+        static readonly Dictionary<string, HashSet<string>> RefusedMembers = new Dictionary<string, HashSet<string>>
+        {
+            ["UnityEngine.Application"] = new HashSet<string> { "OpenURL" },
+            ["UnityEngine.Device.Application"] = new HashSet<string> { "OpenURL" },
+            ["UnityEngine.AssetBundle"] = new HashSet<string>
+            {
+                "LoadFromFile", "LoadFromFileAsync", "LoadFromMemory", "LoadFromMemoryAsync", "LoadFromStream", "LoadFromStreamAsync",
+                "RecompressAssetBundleAsync",
+            },
+            ["UnityEngine.ScreenCapture"] = new HashSet<string> { "CaptureScreenshot" },
+            ["UnityEngine.Handheld"] = new HashSet<string> { "PlayFullScreenMovie" },
+            ["UnityEngine.Video.VideoPlayer"] = new HashSet<string> { "url" },
+            ["UnityEngine.Profiling.Profiler"] = new HashSet<string> { "logFile", "enableBinaryLog", "AddFramesFromFile" },
+            ["UnityEngine.Rendering.GraphicsStateCollection"] = new HashSet<string> { "LoadFromFile", "SaveToFile", "SendToEditor" },
+            ["UnityEngine.Experimental.Rendering.GraphicsStateCollection"] = new HashSet<string> { "LoadFromFile", "SaveToFile", "SendToEditor" },
+            ["UnityEngine.TextCore.LowLevel.FontEngine"] = new HashSet<string> { "LoadFontFace" },
+            ["UnityEngine.TextCore.Text.FontAsset"] = new HashSet<string> { "CreateFontAsset" },
+            ["TMPro.TMP_FontAsset"] = new HashSet<string> { "CreateFontAsset" },
+            ["Unity.Burst.BurstRuntime"] = new HashSet<string> { "LoadAdditionalLibrary" },
+            ["UnityEngine.GUIUtility"] = new HashSet<string> { "systemCopyBuffer" },
+            ["UnityEngine.SystemInfo"] = new HashSet<string> { "deviceUniqueIdentifier" },
+            ["UnityEngine.Device.SystemInfo"] = new HashSet<string> { "deviceUniqueIdentifier" },
+            ["UnityEngine.Component"] = new HashSet<string> { "SendMessage", "SendMessageUpwards", "BroadcastMessage" },
+            ["UnityEngine.GameObject"] = new HashSet<string> { "SendMessage", "SendMessageUpwards", "BroadcastMessage" },
+            ["UnityEngine.MonoBehaviour"] = new HashSet<string> { "Invoke", "InvokeRepeating" },
         };
 
         // Getters that make copies, leak or log errors when read (Unity's own): never read in a dump, never by name
@@ -170,12 +207,21 @@ namespace Cluewren
                                 && (name.Length == prefix.Length || name[prefix.Length] == '.');
         }
 
+        // Set by the editor: whether an assembly is compiled for the editor alone. Its compiler knows, a player has none, and
+        // a runtime assembly built in the editor references UnityEditor too, from its UNITY_EDITOR code.
+        public static Func<Assembly, bool> EditorOnly = a => false;
+
+        static readonly Dictionary<Type, bool> reachableTypes = new Dictionary<Type, bool>();
+
         /// <summary>Whether rc may reach members declared by t: the project's, or Unity's own.</summary>
         static bool Reachable(Type t)
         {
+            if (reachableTypes.TryGetValue(t, out var known)) return known;
             var assembly = t.Assembly.GetName().Name;
-            return IsGameType(t) || InNamespace(t.Namespace, "UnityEngine") || InNamespace(assembly, "UnityEngine")
-                   || assembly.StartsWith("Unity.", StringComparison.Ordinal);
+            known = (IsGameType(t) || InNamespace(t.Namespace, "UnityEngine") || InNamespace(assembly, "UnityEngine")
+                     || assembly.StartsWith("Unity.", StringComparison.Ordinal)) && !EditorOnly(t.Assembly);
+            reachableTypes[t] = known;
+            return known;
         }
 
         /// <summary>Whether t, anything it derives from, or anything it is made of is refused.</summary>
@@ -191,9 +237,12 @@ namespace Cluewren
         static bool FindRefused(Type t)
         {
             for (var b = t; b != null; b = b.BaseType)
+            {
+                if (RefusedTypeNames.Contains(b.FullName ?? "")) return true;
                 foreach (var ns in RefusedNamespaces)
                     if (InNamespace(b.Namespace, ns))
                         return true;
+            }
             return t.IsGenericType && t.GetGenericArguments().Any(RefusedType);
         }
 
@@ -231,7 +280,27 @@ namespace Cluewren
         public static bool Refused(MemberInfo m)
         {
             if (m.DeclaringType == typeof(object)) return !ObjectMembers.Contains(m.Name);
-            return !Reachable(m.DeclaringType) || RefusedSignature(m);
+            return !Reachable(m.DeclaringType) || RefusedSignature(m) || RefusedByName(m);
+        }
+
+        static bool RefusedByName(MemberInfo m)
+        {
+            var name = m is MethodInfo accessor && accessor.IsSpecialName && accessor.Name.Length > 4 && accessor.Name[3] == '_'
+                ? accessor.Name.Substring(4) : m.Name;
+            // StartCoroutine(IEnumerator) runs what a call returned; StartCoroutine(string) calls a method by name.
+            if (m is MethodInfo start && start.DeclaringType == typeof(MonoBehaviour) && name == nameof(MonoBehaviour.StartCoroutine))
+                return start.GetParameters().FirstOrDefault()?.ParameterType == typeof(string);
+            return RefusedMembers.TryGetValue(m.DeclaringType?.FullName ?? "", out var names) && names.Contains(name);
+        }
+
+        static void ThrowIfRefused(Type t, string name)
+        {
+            const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance
+                                     | BindingFlags.DeclaredOnly | BindingFlags.IgnoreCase;
+            foreach (var type in Hierarchy(t))
+                foreach (var m in type.GetMember(name, all))
+                    if (Refused(m))
+                        throw new RcError($"{TypeName(t)}.{name} is refused", 403);
         }
 
         // -- members ----------------------------------------------------------------------------------------
@@ -395,13 +464,16 @@ namespace Cluewren
                 if (!Reachable(t) || RefusedType(t)) throw new RcError($"{t.FullName} is refused", 403);
                 return new Target { Type = t, Path = path };
             }
-            return new Target { Instance = o, Type = o.GetType(), Path = path };
+            var type = o.GetType();
+            // By the object's own type, not the type of the field it came through: a WebCamTexture is no plain Texture.
+            if (!Reachable(type) || RefusedType(type)) throw new RcError($"{TypeName(type)} is refused", 403);
+            return new Target { Instance = o, Type = type, Path = path };
         }
 
         /// <summary>The components of a GameObject to look in for a member it doesn't have itself: the game's first.</summary>
         static IEnumerable<Component> ComponentsFor(GameObject go)
         {
-            var all = go.GetComponents<Component>().Where(c => c != null).ToList();
+            var all = go.GetComponents<Component>().Where(c => c != null && Reachable(c.GetType()) && !RefusedType(c.GetType())).ToList();
             return all.Where(c => IsGameType(c.GetType())).Concat(all.Where(c => !IsGameType(c.GetType())));
         }
 
@@ -421,7 +493,10 @@ namespace Cluewren
             }
             var (owner, member) = FindOn(target, name, write);
             if (member == null)
+            {
+                ThrowIfRefused(target.Type, name);
                 throw new RcError($"Property {name} does not exist on object {path}");
+            }
             if (write)
             {
                 object value = null;
@@ -699,7 +774,10 @@ namespace Cluewren
                 }
             }
             if (candidates.Count == 0)
+            {
+                ThrowIfRefused(target.Type, name);
                 throw new RcError($"Function: {name} does not exist on object: {path}");
+            }
             MethodInfo method = null;
             object[] args = null;
             string why = null;
@@ -713,6 +791,10 @@ namespace Cluewren
             }
             if (method == null)
                 throw new RcError($"{name} on {path}: {why}");
+            // After binding too: a default value never came through FromJson.
+            foreach (var arg in args)
+                if (RefusedPathIn(arg, 0) is { } inside)
+                    throw new RcError(inside, 403);
             object returned;
             try
             {
@@ -798,7 +880,7 @@ namespace Cluewren
                     {
                         args[i] = FromJson(value, type, null);
                     }
-                    catch (RcError e)
+                    catch (RcError e) when (e.Status != 403)
                     {
                         why = $"{p.Name}: {e.Message}";
                         return false;
@@ -825,7 +907,7 @@ namespace Cluewren
                         ++used;
                         continue;
                     }
-                    catch (RcError)
+                    catch (RcError e) when (e.Status != 403)
                     {
                         // fall through
                     }
@@ -1038,10 +1120,47 @@ namespace Cluewren
             return null;
         }
 
+        // Why a value is refused, null when it isn't. A value too deep to finish checking is refused.
+        static string RefusedPathIn(object json, int depth)
+        {
+            if (depth > MaxDepth) return $"A value nested more than {MaxDepth} deep is refused: rc can't check it";
+            switch (json)
+            {
+                case string text:
+                    return (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0) && Paths.DataPath(text)
+                        ? $"{text} is refused: nothing in UserSettings/Cluewren is opened for rc" : null;
+                case IDictionary dict:
+                    foreach (DictionaryEntry e in dict)
+                        if ((RefusedPathIn(e.Key, depth + 1) ?? RefusedPathIn(e.Value, depth + 1)) is { } found) return found;
+                    return null;
+                case IList list:
+                    foreach (var item in list)
+                        if (RefusedPathIn(item, depth + 1) is { } found) return found;
+                    return null;
+            }
+            return null;
+        }
+
         public static object FromJson(object json, Type type, object current)
         {
+            var value = ConvertJson(json, type, current);
+            // Every object a value comes to, judged by its own type: GetComponent can hand back a refused component.
+            if (value is Object found && found != null && (!Reachable(found.GetType()) || RefusedType(found.GetType())))
+                throw new RcError($"{TypeName(found.GetType())} is refused as an argument", 403);
+            return value;
+        }
+
+        static object ConvertJson(object json, Type type, object current)
+        {
             if (RefusedType(type)) throw new RcError($"{TypeName(type)} is refused", 403);
-            if (type == typeof(object)) return json;
+            if (json is string text && (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0) && Paths.DataPath(text))
+                throw new RcError($"{text} is refused: nothing in UserSettings/Cluewren is opened for rc", 403);
+            if (type == typeof(object))
+            {
+                var inside = RefusedPathIn(json, 0);
+                if (inside != null) throw new RcError(inside, 403);
+                return json;
+            }
             if (json == null)
             {
                 if (type.IsValueType && Nullable.GetUnderlyingType(type) == null)
@@ -1132,6 +1251,7 @@ namespace Cluewren
                     if (p.Length == 0) return null;
                     var o = Paths.Resolve(p);
                     if (o == null || o is Object uo && uo == null) throw new RcError($"Object {p} does not exist");
+                    if (!Reachable(o.GetType()) || RefusedType(o.GetType())) throw new RcError($"{p} is refused as an argument", 403);
                     if (type.IsInstanceOfType(o)) return o;
                     if (o is GameObject go && typeof(Component).IsAssignableFrom(type))
                         return go.GetComponent(type) ?? throw new RcError($"{p} has no {TypeName(type)}");

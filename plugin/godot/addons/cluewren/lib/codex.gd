@@ -1,5 +1,5 @@
 # Modified by Crane Valley: only the project summary stays, written to .godot/cluewren_codex/; the manifest and read
-# paths are removed, the agent reading the project with its own tools.
+# paths are removed, the agent reading the project with its own tools; nothing under res://.godot/ is found as a scene.
 ## The addon's summary of the project for the agent (main scene, autoloads, input actions, global classes, each scene's
 ## nodes), written to .godot/cluewren_codex/summary.txt, or to user://cluewren_codex/ when res:// is
 ## read-only. The project's files are its .gd .cs .tscn .tres .gdshader files, skipping directories whose name starts
@@ -8,6 +8,9 @@ extends RefCounted
 
 const EXTENSIONS := ["gd", "cs", "tscn", "tres", "gdshader"]
 const Keys = preload("keys.gd")
+
+static var _short: RegEx
+static var _known := {}  # the same paths come back tick after tick
 
 
 static func skipped_dir(name: String) -> bool:
@@ -46,10 +49,39 @@ static func scenes() -> Array:
 	return out
 
 
+# res://.godot/ holds the engine's cache and Cluewren's data, harness output included: rc and a scene change never load it.
+static func data_path(path: String) -> bool:
+	if _known.has(path):
+		return _known[path]
+	if _known.size() > 4096:
+		_known.clear()
+	var found := _data_path(path)
+	_known[path] = found
+	return found
+
+
+static func _data_path(path: String) -> bool:
+	var p := path.strip_edges().replace("\\", "/")
+	if p.begins_with("uid://"):
+		var id := ResourceUID.text_to_id(p)
+		if ResourceUID.has_id(id):
+			p = ResourceUID.get_id_path(id)
+	var root := ProjectSettings.globalize_path("res://").simplify_path().to_lower().trim_suffix("/")
+	var full := ProjectSettings.globalize_path(ProjectSettings.localize_path(p)).simplify_path().to_lower()
+	var rest := full.substr(root.length()) if full.begins_with(root + "/") else full
+	# A Windows 8.3 short name (GODOT~1 for .godot) names the same folder under another spelling.
+	if _short == null:
+		_short = RegEx.create_from_string("^[^~]{1,6}~[0-9]+")
+	for part in rest.split("/", false):
+		if part == ".godot" or _short.search(part) != null:
+			return true
+	return false
+
+
 ## A scene by res:// path, or by its file's name ("level" or "level.tscn"), searched in the project.
 static func find_scene(name: String) -> String:
 	if name.begins_with("res://") or name.begins_with("uid://"):
-		return name if ResourceLoader.exists(name) else ""
+		return name if not data_path(name) and ResourceLoader.exists(name) else ""
 	var want := name.get_file()
 	if not want.ends_with(".tscn") and not want.ends_with(".scn"):
 		want += ".tscn"

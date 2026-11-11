@@ -8,8 +8,10 @@ Finding things. `game.Actors("BP_Door")`, `game.Actors("Door")` or `game.Actors(
 class, subclasses too. A Blueprint goes by its name, a C++ class by its name in the project's modules.
 `game.AllActors()`: the level's things. `game.Named("door")`: by name.
 
-Reading and calling (`game.Get`, `game.Props`, `game.Call`, `game.Ret`, `game.Describe`). They reach any object and any
-property, protected and Blueprint variables included. `game.Describe(path)` lists its class, properties and
+Reading and calling (`game.Get`, `game.Props`, `game.Call`, `game.Ret`, `game.Describe`). They reach the game's objects and
+their properties, protected and Blueprint variables included. The editor's own modules and Python, files, processes, the
+network, console commands, calls and property writes by name, bound delegates, the project's settings and anything under
+`Saved/Cluewren` answer 403 "... is refused": read the project with your own tools. `game.Describe(path)` lists its class, properties and
 Blueprint-callable functions with their arguments. Static library functions go to class default objects, as
 `game.Ret("/Script/Engine.Default__GameplayStatics", "GetPlayerCharacter", new { WorldContextObject = await game.World(),
 PlayerIndex = 0 })`. A rotation is `{"Pitch","Yaw","Roll"}` in degrees. A destroyed actor can still be read until garbage

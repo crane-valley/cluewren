@@ -1,6 +1,6 @@
 // Modified by Crane Valley: the brain is found through brain.json and must prove itself with a mutual HMAC handshake; the
 // link, token, account, usage, memory, steering and window plumbing is removed, and the brain alone starts a run: the
-// command line only connects.
+// command line only connects; a message over the brain's 16 MB limit closes the link.
 // The bridge to the brain (docs/protocol.md): one WebSocket out to the brain, JSON text frames. The socket lives on
 // background threads; everything that touches the game runs on the main thread, in Tick() (every frame), where all
 // requests that arrived since the last frame are handled, many per frame. Deferred answers (move, watch, key taps,
@@ -119,6 +119,8 @@ namespace Cluewren
         double backoff = 1.0;
         double nextReconnect = double.MaxValue;
         int generation;
+        const int MaxMessageBytes = 16 * 1024 * 1024;
+
         ClientWebSocket socket;
         CancellationTokenSource cancel;
 
@@ -274,6 +276,13 @@ namespace Cluewren
                         break;
                     }
                     message.Write(buffer, 0, result.Count);
+                    // The brain's own limit (BridgeLink.MaxFrameBytes), as Godot's and Unreal's plugins hold it: before the
+                    // handshake, whatever took the announced port could send more.
+                    if (message.Length > MaxMessageBytes)
+                    {
+                        why = "a message over 16 MB";
+                        break;
+                    }
                     if (!result.EndOfMessage) continue;
                     var text = Encoding.UTF8.GetString(message.GetBuffer(), 0, (int)message.Length);
                     message.SetLength(0);

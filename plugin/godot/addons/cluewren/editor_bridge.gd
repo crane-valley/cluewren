@@ -1,6 +1,6 @@
 # Modified by Crane Valley: reduced to the link to the brain, starting and stopping play, and the relay to the game. The
 # editor connects by itself once brain.json appears; runs, steering, memory, usage, the account, sign-in and codex ops are
-# removed, and a restart without "fresh" stays in the running game.
+# removed, and a restart without "fresh" stays in the running game; a restart never plays a scene under res://.godot/.
 ## The editor's link to the brain (hello host "editor"). The editor and the game are separate processes in Godot, so:
 ##  - this holds the one WebSocket to the brain (the brain expects one link per run, whatever the game does);
 ##  - the brain's `session` requests start, stop and restart the play session here (EditorInterface.play_main_scene /
@@ -400,6 +400,9 @@ func _session(id, args: Dictionary, text: String) -> void:
 			var target := scene
 			if target == "":
 				target = EditorInterface.get_playing_scene() if EditorInterface.is_playing_scene() else _last_played
+			if Codex.data_path(target):
+				_respond_error(id, "%s is refused: nothing under res://.godot/ is opened as a scene" % target)
+				return
 			_last_played = target
 			var gen := _game_gen
 			var phase := {"stopping": EditorInterface.is_playing_scene()}

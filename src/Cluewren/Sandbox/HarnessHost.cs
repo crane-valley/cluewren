@@ -89,12 +89,26 @@ public sealed class HarnessHost : IAsyncDisposable
 
     bool SpendDecision() => Interlocked.Increment(ref _decisions) <= _options.MaxJevDecisions;
 
-    SandboxSession Attach(ISandboxProcess process)
+    async Task<SandboxSession> Attach(ISandboxProcess process, CancellationToken ct)
     {
-        var session = new SandboxSession(process, _link, _options.Jev, SpendDecision, _options.Recorder, _say,
-            Path.Combine(_runFolder, "sandbox.log"));
-        session.Init(_runFolder, _game.Level, Math.Max(0, _options.MaxJevDecisions - JevDecisions));
-        return session;
+        SandboxSession? session = null;
+        try
+        {
+            session = new SandboxSession(process, _link, _options.Jev, SpendDecision, _options.Recorder, _say,
+                Path.Combine(_runFolder, "sandbox.log"));
+            session.Init(_runFolder, _game.Level, Math.Max(0, _options.MaxJevDecisions - JevDecisions));
+            if ((await session.Call("ping", null, 60, ct).ConfigureAwait(false)).GetString() != "pong")
+                throw new SandboxException("the child didn't answer its first call");
+            return session;
+        }
+        catch
+        {
+            if (session is null)
+                process.Dispose();
+            else
+                session.Dispose();
+            throw;
+        }
     }
 
     async Task<SandboxSession> StartChild(CancellationToken ct)
@@ -105,19 +119,16 @@ public sealed class HarnessHost : IAsyncDisposable
             _claim ??= WindowsContainer.Claim(_runFolder);
         var (process, note) = SandboxStarter.Start(spec, mode);
         _downgrade ??= note;
-        var session = Attach(process);
+        SandboxSession session;
         try
         {
-            if ((await session.Call("ping", null, 60, ct).ConfigureAwait(false)).GetString() != "pong")
-                throw new SandboxException("the child didn't answer its first call");
+            session = await Attach(process, ct).ConfigureAwait(false);
         }
         catch (SandboxException e) when (_options.Mode == SandboxMode.Auto && process.Kind != "process")
         {
-            session.Dispose();
             _downgrade = SandboxStarter.Downgraded(e.Message);
             var (plain, _) = SandboxStarter.Start(spec, SandboxMode.Process);
-            session = Attach(plain);
-            await session.Call("ping", null, 60, ct).ConfigureAwait(false);
+            session = await Attach(plain, ct).ConfigureAwait(false);
         }
         Sandbox = session.Kind;
         return session;
