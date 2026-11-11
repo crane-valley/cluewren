@@ -1,4 +1,5 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; an assembly that never names UnityEngine.Input is
+// passed over before it is read in full.
 // Points the game's calls to UnityEngine.Input's key, button, axis and mouse reads at Cluewren.LegacyInput
 // (Runtime/LegacyInput.cs), which answers as UnityEngine.Input would plus what the bridge's hands hold during a run.
 // The legacy Input Manager reads the operating system's own events, so nothing can be queued on it: this is the only way
@@ -52,7 +53,24 @@ namespace Cluewren.CodeGen
             var defines = compiledAssembly.Defines ?? Array.Empty<string>();
             if (defines.Contains("CLUEWREN_NO_LEGACY_INPUT")) return false;
             // (the runtime's define constraint: where LegacyInput is compiled too)
-            return defines.Contains("UNITY_EDITOR") || defines.Contains("DEVELOPMENT_BUILD") || defines.Contains("CLUEWREN_PLAYTEST");
+            if (!defines.Contains("UNITY_EDITOR") && !defines.Contains("DEVELOPMENT_BUILD") && !defines.Contains("CLUEWREN_PLAYTEST"))
+                return false;
+            return ReadsLegacyInput(compiledAssembly.InMemoryAssembly.PeData);
+        }
+
+        // Most assemblies never name UnityEngine.Input. A deferred read without symbols parses only the metadata
+        // tables to find that out; Rewrite's full read loads every method body and the PDB.
+        static bool ReadsLegacyInput(byte[] pe)
+        {
+            try
+            {
+                using var module = ModuleDefinition.ReadModule(new MemoryStream(pe), new ReaderParameters(ReadingMode.Deferred));
+                return module.GetTypeReferences().Any(t => t.FullName == "UnityEngine.Input");
+            }
+            catch (Exception)
+            {
+                return true;  // (Process then reports why it can't read the assembly)
+            }
         }
 
         public override ILPostProcessResult Process(ICompiledAssembly compiledAssembly)

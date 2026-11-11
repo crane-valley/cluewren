@@ -1,4 +1,5 @@
-// Modified by Crane Valley: the settings test also holds in a project with no input settings asset.
+// Modified by Crane Valley: the settings test also holds in a project with no input settings asset; the tests of what
+// a run isolates are ignored, with the reason, where Active Input Handling leaves the Input System out.
 #if CLUEWREN_INPUT_SYSTEM
 using System.Linq;
 using System.Reflection;
@@ -26,6 +27,14 @@ namespace Cluewren.Tests
 
         static InputDevice[] Persons() => InputSystem.devices.Where(d => d.native).ToArray();
 
+        static void NeedsInputSystemHandling()
+        {
+#if !ENABLE_INPUT_SYSTEM
+            Assert.Ignore("this project's Active Input Handling leaves the Input System out (ENABLE_INPUT_SYSTEM): "
+                          + "no device of the person's reaches it, and Hands compiles no isolation to test");
+#endif
+        }
+
         // A device as the person's hardware would come: reported by the fixture's runtime, so native (the runtime is
         // internal to the Input System's test framework)
         void Report<T>() where T : InputDevice
@@ -39,6 +48,7 @@ namespace Cluewren.Tests
         [Test]
         public void ARunDisablesThePersonsDevicesAndPutsThemBack()
         {
+            NeedsInputSystemHandling();
             Report<Keyboard>();
             Report<Mouse>();
             Report<Gamepad>();
@@ -62,6 +72,7 @@ namespace Cluewren.Tests
         [Test]
         public void ADeviceConnectedDuringARunIsDisabledToo()
         {
+            NeedsInputSystemHandling();
             Hands.EnsureDevices();
             Hands.IsolateDevices(true);
             Report<Gamepad>();
@@ -76,6 +87,7 @@ namespace Cluewren.Tests
         [Test]
         public void ARunSendsAllInputToTheGameAndPutsTheSettingsBack()
         {
+            NeedsInputSystemHandling();
             var before = InputSystem.settings;
             var behavior = before.editorInputBehaviorInPlayMode;
             var background = before.backgroundBehavior;
@@ -102,6 +114,7 @@ namespace Cluewren.Tests
         [Test]
         public void APlayerInputPairedWithThePersonsDevicesTakesTheBridgesAndGetsThemBack()
         {
+            NeedsInputSystemHandling();
             Report<Keyboard>();
             Report<Mouse>();
             var personsKeyboard = Persons().OfType<Keyboard>().Single();
