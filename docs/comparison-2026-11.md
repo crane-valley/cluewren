@@ -1,5 +1,7 @@
 # Comparison 2026-11
 
+This document is an engineering record of the [ADR 0006](adr/0006-autopilot-is-the-floor.md) comparison, measured under the product's earlier working name "Playtest Agent" on the developer's machine at the dates shown. It is not a performance guarantee.
+
 ## Scope and method
 
 This record is the comparison called for by ADR 0006.
