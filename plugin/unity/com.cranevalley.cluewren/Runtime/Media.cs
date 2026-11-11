@@ -1,12 +1,13 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; the picture is scaled and flipped on the GPU, so
+// only the size sent is read back.
 // Recording and stills of what the player sees (docs/protocol.md, "Recording, stills and usage"): `record` start/stop
 // sends `frame` messages while the game plays, `capture` answers one still. The picture is the game's view with its UI
 // (the editor's Game view, a player's screen), taken at the end of a frame with ScreenCapture into a render texture.
 //
-// Capture never makes the game wait: the render texture is read back with AsyncGPUReadback (the game thread never
-// waits on the GPU), and scaling, JPEG encoding (ImageConversion.EncodeArrayToJPG is thread safe), base64 and the
-// message's JSON are done on a worker thread. A frame whose time comes while the one before is still being read or
-// encoded is skipped: its number is used (a gap in `n`).
+// Capture never makes the game wait: the picture is scaled to the size sent on the GPU, read back with
+// AsyncGPUReadback (the game thread never waits on the GPU), and JPEG encoding (ImageConversion.EncodeArrayToJPG is
+// thread safe), base64 and the message's JSON are done on a worker thread. A frame whose time comes while the one
+// before is still being read or encoded is skipped: its number is used (a gap in `n`).
 //
 // A recording lasts while the brain wants it on this connection: it pauses while no game runs (play mode stopped) or
 // the game is paused, and goes on by itself when the game runs again; a new connection (a hello without `resume`)
@@ -59,7 +60,6 @@ namespace Cluewren
             public double Wall;
             public int W;
             public int H;
-            public bool Flip;
             public int State;     // a still: 0 until answered (Interlocked)
         }
 
@@ -75,8 +75,7 @@ namespace Cluewren
         static double nextDue;
 #pragma warning restore 0414
         static Job current;        // the recording's frame being read or encoded
-        static byte[] readBuffer;  // reused: the recording's read back picture, and its scaled copy
-        static byte[] fitBuffer;
+        static byte[] readBuffer;  // reused: the recording's read back picture
 #if CLUEWREN_SCREENCAPTURE && CLUEWREN_IMAGECONVERSION
         static RenderTexture recTexture;
         static readonly WaitForEndOfFrame EndOfFrame = new WaitForEndOfFrame();
@@ -332,10 +331,10 @@ namespace Cluewren
                 Done(job);
                 yield break;
             }
-            RenderTexture texture;
+            RenderTexture screen;
             if (job.Still)
             {
-                texture = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
+                screen = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
             }
             else
             {
@@ -348,31 +347,71 @@ namespace Cluewren
                     };
                     recTexture.Create();
                 }
-                texture = recTexture;
+                screen = recTexture;
             }
+            RenderTexture picture;
             try
             {
-                ScreenCapture.CaptureScreenshotIntoRenderTexture(texture);
+                ScreenCapture.CaptureScreenshotIntoRenderTexture(screen);
+                FitSize(w, h, job.MaxDim, out job.W, out job.H);
+                // (where the graphics API's textures start at the top, the screen comes into the texture upside down)
+                picture = Shrink(screen, job.W, job.H, SystemInfo.graphicsUVStartsAtTop);
             }
             catch (Exception e)
             {
-                if (job.Still) RenderTexture.ReleaseTemporary(texture);
                 FailStill(client, job, 500, "capture failed: " + e.Message);
                 Done(job);
                 yield break;
             }
+            finally
+            {
+                if (job.Still) RenderTexture.ReleaseTemporary(screen);
+            }
             job.T = Time.timeAsDouble;
             job.Wall = WallNow;
-            job.W = w;
-            job.H = h;
-            // (where the graphics API's textures start at the top, the screen comes into the texture upside down)
-            job.Flip = SystemInfo.graphicsUVStartsAtTop;
-            AsyncGPUReadback.Request(texture, 0, TextureFormat.RGBA32, request => OnReadback(client, job, request, texture));
+            AsyncGPUReadback.Request(picture, 0, TextureFormat.RGBA32, request => OnReadback(client, job, request, picture));
         }
 
-        static void OnReadback(PlaytestClient client, Job job, AsyncGPUReadbackRequest request, RenderTexture texture)
+        static RenderTexture Shrink(RenderTexture screen, int w, int h, bool flip)
         {
-            if (job.Still) RenderTexture.ReleaseTemporary(texture);
+            var active = RenderTexture.active;
+            var from = screen;
+            try
+            {
+                // Filtering an sRGB texture averages in linear light, which brightens fine detail; the picture is
+                // averaged as its bytes are stored, so they are copied to a texture that isn't sRGB first.
+                if (screen.sRGB && SystemInfo.copyTextureSupport != CopyTextureSupport.None)
+                {
+                    from = Unencoded(screen.width, screen.height);
+                    Graphics.CopyTexture(screen, from);
+                }
+                // Halving with bilinear filtering averages each 2 x 2 block; one blit to a far smaller size would skip
+                // most of the screen's pixels.
+                while (from.width / 2 > w && from.height / 2 > h)
+                {
+                    var half = Unencoded(from.width / 2, from.height / 2);
+                    Graphics.Blit(from, half);
+                    if (from != screen) RenderTexture.ReleaseTemporary(from);
+                    from = half;
+                }
+                var picture = Unencoded(w, h);
+                if (flip) Graphics.Blit(from, picture, new Vector2(1, -1), new Vector2(0, 1));
+                else Graphics.Blit(from, picture);
+                return picture;
+            }
+            finally
+            {
+                if (from != screen) RenderTexture.ReleaseTemporary(from);
+                RenderTexture.active = active;
+            }
+        }
+
+        static RenderTexture Unencoded(int w, int h) =>
+            RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+
+        static void OnReadback(PlaytestClient client, Job job, AsyncGPUReadbackRequest request, RenderTexture picture)
+        {
+            RenderTexture.ReleaseTemporary(picture);
             if (!Live(job)) return;
             if (request.hasError)
             {
@@ -387,22 +426,19 @@ namespace Cluewren
             Task.Run(() => Encode(client, job, buffer));
         }
 
-        /// <summary>Worker thread: scale, encode, base64, the message's JSON, sent.</summary>
+        /// <summary>Worker thread: encode, base64, the message's JSON, sent.</summary>
         static void Encode(PlaytestClient client, Job job, byte[] pixels)
         {
-            byte[] fit = null;
             try
             {
-                FitSize(job.W, job.H, job.MaxDim, out var dw, out var dh);
-                fit = Fit(pixels, job.W, job.H, dw, dh, job.Flip, job.Still ? null : Interlocked.Exchange(ref fitBuffer, null));
-                var jpeg = ImageConversion.EncodeArrayToJPG(fit, GraphicsFormat.R8G8B8A8_UNorm, (uint)dw, (uint)dh, 0, job.Quality);
+                var jpeg = ImageConversion.EncodeArrayToJPG(pixels, GraphicsFormat.R8G8B8A8_UNorm, (uint)job.W, (uint)job.H, 0, job.Quality);
                 if (job.Still)
                 {
                     if (Interlocked.CompareExchange(ref job.State, 1, 0) == 0)
-                        client.SendResponseText(StillJson(job.Id, dw, dh, job.T, Convert.ToBase64String(jpeg)));
+                        client.SendResponseText(StillJson(job.Id, job.W, job.H, job.T, Convert.ToBase64String(jpeg)));
                     return;
                 }
-                var message = FrameMessage(job.N, job.T, job.Wall, dw, dh, jpeg);
+                var message = FrameMessage(job.N, job.T, job.Wall, job.W, job.H, jpeg);
                 lock (gate)
                 {
                     if (want && current == job && job.RecGen == recGen && client.SendIfConnection(message, job.ConnGen))
@@ -423,7 +459,6 @@ namespace Cluewren
                 if (!job.Still)
                 {
                     readBuffer = pixels;
-                    if (fit != null) fitBuffer = fit;
                     Done(job);
                 }
             }
@@ -453,49 +488,6 @@ namespace Cluewren
             var scale = (double)maxDim / longer;
             dw = Math.Max(1, (int)Math.Round(w * scale));
             dh = Math.Max(1, (int)Math.Round(h * scale));
-        }
-
-        /// <summary>RGBA pixels (rows bottom first, or top first with flip) scaled to dw x dh by averaging, rows bottom
-        /// first (as EncodeArrayToJPG takes them). into: a buffer to reuse when it is the right size.</summary>
-        public static byte[] Fit(byte[] src, int w, int h, int dw, int dh, bool flip, byte[] into = null)
-        {
-            var size = dw * dh * 4;
-            var dst = into != null && into.Length == size ? into : new byte[size];
-            var stride = w * 4;
-            if (dw == w && dh == h)
-            {
-                for (var y = 0; y < h; ++y)
-                    Buffer.BlockCopy(src, (flip ? h - 1 - y : y) * stride, dst, y * stride, stride);
-                return dst;
-            }
-            for (var dy = 0; dy < dh; ++dy)
-            {
-                var y0 = (int)((long)dy * h / dh);
-                var y1 = Math.Max(y0 + 1, (int)((long)(dy + 1) * h / dh));
-                for (var dx = 0; dx < dw; ++dx)
-                {
-                    var x0 = (int)((long)dx * w / dw);
-                    var x1 = Math.Max(x0 + 1, (int)((long)(dx + 1) * w / dw));
-                    int r = 0, g = 0, b = 0, n = 0;
-                    for (var sy = y0; sy < y1; ++sy)
-                    {
-                        var i = (flip ? h - 1 - sy : sy) * stride + x0 * 4;
-                        for (var sx = x0; sx < x1; ++sx, i += 4)
-                        {
-                            r += src[i];
-                            g += src[i + 1];
-                            b += src[i + 2];
-                            ++n;
-                        }
-                    }
-                    var o = (dy * dw + dx) * 4;
-                    dst[o] = (byte)(r / n);
-                    dst[o + 1] = (byte)(g / n);
-                    dst[o + 2] = (byte)(b / n);
-                    dst[o + 3] = 255;
-                }
-            }
-            return dst;
         }
 
         static string Num(double v) => Json.Round(v, 3).ToString("R", CultureInfo.InvariantCulture);

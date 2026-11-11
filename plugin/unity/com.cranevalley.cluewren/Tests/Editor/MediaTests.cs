@@ -1,6 +1,7 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
-// Recording's pure parts: the size pictures are sent at, scaling and flipping, the messages' JSON, and JPEG encoding on
-// a worker thread (the picture itself needs a rendered game: not here).
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; scaling and flipping moved to the GPU, so their
+// tests went with Media.Fit.
+// Recording's pure parts: the size pictures are sent at, the messages' JSON, and JPEG encoding on a worker thread (the
+// picture itself, scaled and flipped on the GPU, needs a rendered game: not here).
 
 using System;
 using System.Collections.Generic;
@@ -42,34 +43,6 @@ namespace Cluewren.Tests
         }
 
         [Test]
-        public void FitFlipsRows()
-        {
-            var src = Picture(3, 2, (x, y) => (byte)(y * 100 + x));
-            var same = Media.Fit(src, 3, 2, 3, 2, false);
-            Assert.AreEqual(src, same);
-            var flipped = Media.Fit(src, 3, 2, 3, 2, true);
-            Assert.AreEqual(100, flipped[0]);      // (row 0 is the source's last row)
-            Assert.AreEqual(2, flipped[(1 * 3 + 2) * 4]);
-        }
-
-        [Test]
-        public void FitAveragesBoxes()
-        {
-            // 4 x 2 -> 2 x 1: each output pixel is the mean of a 2 x 2 box
-            var src = Picture(4, 2, (x, y) => (byte)(x < 2 ? (y == 0 ? 10 : 30) : 200));
-            var into = new byte[2 * 1 * 4];
-            var dst = Media.Fit(src, 4, 2, 2, 1, false, into);
-            Assert.AreSame(into, dst);
-            Assert.AreEqual(20, dst[0]);
-            Assert.AreEqual(235, dst[1]);
-            Assert.AreEqual(7, dst[2]);
-            Assert.AreEqual(255, dst[3]);
-            Assert.AreEqual(200, dst[4]);
-            // a wrong-sized buffer isn't used
-            Assert.AreNotSame(into, Media.Fit(src, 4, 2, 1, 1, true, into));
-        }
-
-        [Test]
         public void MessagesAreJson()
         {
             var message = Media.FrameMessage(17, 12.3456, 1790000000.1234, 960, 540, new byte[] { 65, 66, 67 });
@@ -106,12 +79,9 @@ namespace Cluewren.Tests
         public void JpegEncodesOnAWorkerThread()
         {
             Assert.IsTrue(Media.Compiled);
-            var src = Picture(64, 36, (x, y) => (byte)(x * 4));
+            var src = Picture(32, 18, (x, y) => (byte)(x * 8));
             var jpeg = Task.Run(() =>
-            {
-                var fit = Media.Fit(src, 64, 36, 32, 18, true);
-                return UnityEngine.ImageConversion.EncodeArrayToJPG(fit, UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm, 32, 18, 0, 75);
-            }).Result;
+                UnityEngine.ImageConversion.EncodeArrayToJPG(src, UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm, 32, 18, 0, 75)).Result;
             Assert.Greater(jpeg.Length, 100);
             Assert.AreEqual(0xFF, jpeg[0]);
             Assert.AreEqual(0xD8, jpeg[1]);
