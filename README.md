@@ -35,7 +35,7 @@ The plugin connects out to the Cluewren process on the same machine over a loopb
 
 2. Unzip it to a folder that will stay put.
 
-3. Run `cluewren.exe connect claude` or `cluewren.exe connect codex` from that folder:
+3. In that folder, run `.\cluewren.exe connect claude` or `.\cluewren.exe connect codex`:
    - `connect claude` registers the MCP server with `claude mcp add --scope user` (every project) and writes `~/.claude/skills/cluewren/SKILL.md` and `~/.claude/agents/frame-describer.md`.
    - `connect codex` adds a marked `[mcp_servers."cluewren"]` table to `~/.codex/config.toml` (backing up the old file as `config.toml.before-cluewren`) and writes `~/.agents/skills/cluewren/SKILL.md` and `~/.codex/agents/frame_describer.toml`.
    `connect` records the absolute path of the binary. After moving the folder or installing a new version, run `connect` again. Use `--remove` with either command to take them out.
@@ -120,7 +120,7 @@ To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex 
 
 ## Upgrade
 
-To upgrade, download the new zip, replace the folder's contents (or unzip to a new folder), run `cluewren.exe connect claude` or `cluewren.exe connect codex` again, and replace the engine plugin in each project with the same version. Upgrade the binary and the engine plugin together; they do not negotiate versions.
+To upgrade, download the new zip, replace the folder's contents (or unzip to a new folder), run `.\cluewren.exe connect claude` or `.\cluewren.exe connect codex` in that folder again, and replace the engine plugin in each project with the same version. Upgrade the binary and the engine plugin together; they do not negotiate versions.
 
 ## Status
 
