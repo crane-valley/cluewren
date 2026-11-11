@@ -53,6 +53,8 @@ Rules:
   -5.1 s, interval -35 to 24, median -3.9 s, ours faster in 3 of 6, cost $0.66 against $0.71.
 - Accepted by the owner on 2026-11-11 for release 0.1.0, and still unmeasured: no untuned Unity game; Jev tokens and
   subscription usage; frame rate on Godot and Unreal. The changelog lists them as known limitations.
-- The rc refusals of [ADR 0014](0014-rc-refusals-on-every-engine.md) add time per rc op on Godot (measured there). Frame
-  rate in a game was not re-measured after them.
+- The rc refusals of [ADR 0014](0014-rc-refusals-on-every-engine.md) add time per rc op on Godot: reads 6.3 us for 5.1,
+  calls 3 to 5 us more, Props and Describe about 20% longer; Unity is within noise and Unreal adds about 0.6 us. Accepted
+  by the owner on 2026-11-11 for release 0.1.0, as the price of the three engines refusing the same things. Frame rate in
+  a game was not re-measured after them.
 - [ADR 0009](0009-unreal-and-godot-before-release.md) requires Unreal and Godot comparisons before release.
