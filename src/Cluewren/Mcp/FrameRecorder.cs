@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Cluewren.Bridge;
 using Cluewren.Kit;
@@ -135,8 +136,9 @@ public sealed class FrameRecorder : IEpisodeRecorder, IAsyncDisposable
             if (shown.Length == 0)
             {
                 var times = frames.Where(frame => frame.T is not null).Select(frame => frame.T!.Value).ToArray();
-                var there = times.Length > 0 ? $" (its frames show game times {times.Min():F2} to {times.Max():F2} s)" : "";
-                return new FramePick($"No frames of {label} show game times {start} to {end}{there}.", []);
+                var there = times.Length > 0
+                    ? string.Create(CultureInfo.InvariantCulture, $" (its frames show game times {times.Min():F2} to {times.Max():F2} s)") : "";
+                return new FramePick(string.Create(CultureInfo.InvariantCulture, $"No frames of {label} show game times {start} to {end}{there}."), []);
             }
             frames = shown;
         }
@@ -148,7 +150,7 @@ public sealed class FrameRecorder : IEpisodeRecorder, IAsyncDisposable
         var wanted = chosen.Length;
         while (wanted > 1 && chosen.Sum(frame => (long)frame.Jpeg.Length) * 4 / 3 > MaxAnswerBytes)
             chosen = Spread(frames, --wanted);
-        var at = string.Join(", ", chosen.Select(frame => frame.T is { } t ? t.ToString("F2") : "?"));
+        var at = string.Join(", ", chosen.Select(frame => frame.T is { } t ? t.ToString("F2", CultureInfo.InvariantCulture) : "?"));
         return new FramePick($"{chosen.Length} frames of {frames.Length} ({label}), in order, at game times {at} s:",
             chosen.Select(frame => frame.Jpeg).ToArray());
     }

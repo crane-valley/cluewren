@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.0.0",
+	"VersionName": "0.1.0",
 	"FriendlyName": "Cluewren",
 	"Description": "The game's side of Cluewren: connects out over a WebSocket to the brain on this machine.",
 	"Category": "Testing",

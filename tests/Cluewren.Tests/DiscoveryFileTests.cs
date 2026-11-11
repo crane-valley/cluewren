@@ -18,6 +18,20 @@ public sealed class DiscoveryFileTests : IDisposable
     }
 
     [Fact]
+    public void Withdrawing_leaves_an_announcement_another_brain_has_written_since()
+    {
+        var mine = new Discovery("ws://127.0.0.1:1/v1/bridge", "bWluZQ==", 7, DateTimeOffset.UnixEpoch);
+        var path = DiscoveryFile.Write(mine, _folder);
+        var theirs = mine with { Url = "ws://127.0.0.1:2/v1/bridge", Secret = "dGhlaXJz", Pid = 8 };
+        DiscoveryFile.Write(theirs, _folder);
+        DiscoveryFile.Withdraw(path, mine);
+        Assert.Equal(theirs, DiscoveryFile.Read(path));
+        DiscoveryFile.Withdraw(path, theirs);
+        Assert.False(File.Exists(path));
+        DiscoveryFile.Withdraw(path, theirs);
+    }
+
+    [Fact]
     public void Only_the_owner_has_access()
     {
         var path = DiscoveryFile.Write(new Discovery("u", "s", 1, DateTimeOffset.UnixEpoch), _folder);

@@ -34,6 +34,19 @@ public static class DiscoveryFile
         return JsonSerializer.Deserialize(stream, DiscoveryJson.Default.Discovery);
     }
 
+    // Another session may have announced itself here since: its announcement must stay for its editor to find.
+    public static void Withdraw(string path, Discovery discovery)
+    {
+        try
+        {
+            if (Read(path) == discovery)
+                File.Delete(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
+        {
+        }
+    }
+
     static void CreateOwnerOnlyFolder(string folder)
     {
         if (OperatingSystem.IsWindows())

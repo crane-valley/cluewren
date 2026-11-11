@@ -12,9 +12,35 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
       - run: dotnet build Cluewren.slnx -c Release
       - run: dotnet test tests/Cluewren.Tests -c Release --no-build
+      - name: Check for vulnerable packages
+        shell: pwsh
+        run: |
+          $json = dotnet list Cluewren.slnx package --vulnerable --include-transitive --format json
+          if ($LASTEXITCODE -ne 0) {
+            throw "dotnet list package failed"
+          }
+          $report = $json | Out-String | ConvertFrom-Json
+          $hits = foreach ($project in $report.projects) {
+            foreach ($framework in $project.frameworks) {
+              foreach ($package in @($framework.topLevelPackages) + @($framework.transitivePackages)) {
+                foreach ($advisory in $package.vulnerabilities) {
+                  "$($package.id) $($package.resolvedVersion) ($($advisory.severity)) $($advisory.advisoryurl) in $($project.path)"
+                }
+              }
+            }
+          }
+          $problems = foreach ($problem in $report.problems) { "$($problem.level): $($problem.text) $($problem.project)" }
+          if ($hits -or $problems) {
+            throw "Vulnerable packages, or packages that could not be checked:`n$((@($hits) + @($problems)) -join "`n")"
+          }
+      - name: Package
+        shell: pwsh
+        run: ./eng/package.ps1 -OutputDirectory "$env:RUNNER_TEMP/assets"

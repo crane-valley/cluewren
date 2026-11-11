@@ -77,14 +77,18 @@ public sealed class LineReader(Stream stream, int maxLine = 32 << 20)
             }
             if (take > 0 || at >= 0)
             {
-                var grown = ArrayPool<byte>.Shared.Rent(Math.Max(heldLength + take, 512));
-                if (held is not null)
+                if (held is null || heldLength + take > held.Length)
                 {
-                    held.AsSpan(0, heldLength).CopyTo(grown);
-                    ArrayPool<byte>.Shared.Return(held);
+                    var grown = ArrayPool<byte>.Shared.Rent(
+                        (int)Math.Min(Array.MaxLength, Math.Max(heldLength + take, 2L * (held?.Length ?? 256))));
+                    if (held is not null)
+                    {
+                        held.AsSpan(0, heldLength).CopyTo(grown);
+                        ArrayPool<byte>.Shared.Return(held);
+                    }
+                    held = grown;
                 }
-                _chunk.AsSpan(_start, take).CopyTo(grown.AsSpan(heldLength));
-                held = grown;
+                _chunk.AsSpan(_start, take).CopyTo(held.AsSpan(heldLength));
                 heldLength += take;
             }
             if (at >= 0)
