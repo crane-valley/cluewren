@@ -51,6 +51,8 @@ Rules:
 - ArenaShooter accepted by the owner on 2026-11-02, with time not shown to be no worse: Autopilot was faster in 9 of 10
   randomized blocks (mean 19.9 s, interval -4 to 44) before the Shoot fix; after it, 6 balanced blocks give mean
   -5.1 s, interval -35 to 24, median -3.9 s, ours faster in 3 of 6, cost $0.66 against $0.71.
-- Open and blocking until fixed or accepted by the owner: no untuned Unity game; Jev tokens and subscription usage
-  unmeasured; frame rate on Godot and Unreal unmeasured.
+- Accepted by the owner on 2026-11-11 for release 0.1.0, and still unmeasured: no untuned Unity game; Jev tokens and
+  subscription usage; frame rate on Godot and Unreal. The changelog lists them as known limitations.
+- The rc refusals of [ADR 0014](0014-rc-refusals-on-every-engine.md) add time per rc op on Godot (measured there). Frame
+  rate in a game was not re-measured after them.
 - [ADR 0009](0009-unreal-and-godot-before-release.md) requires Unreal and Godot comparisons before release.
