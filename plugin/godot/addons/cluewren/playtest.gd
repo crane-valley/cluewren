@@ -161,8 +161,8 @@ func _parse_command_line() -> void:
 static func plugin_version() -> String:
 	var cfg := ConfigFile.new()
 	if cfg.load("res://addons/cluewren/plugin.cfg") == OK:
-		return str(cfg.get_value("plugin", "version", "1.0.0"))
-	return "1.0.0"
+		return str(cfg.get_value("plugin", "version", "0.1.0"))
+	return "0.1.0"
 
 
 func _hello() -> Dictionary:

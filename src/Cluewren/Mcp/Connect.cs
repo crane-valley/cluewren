@@ -63,20 +63,79 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
             : [process, Assembly.GetEntryAssembly()?.Location ?? "", "mcp"];
     }
 
+    const int CommandSeconds = 120;
+
+    // cmd.exe parses its command line again whatever the quoting: % and ! expand, and & | < > ^ ( ) act as operators.
+    static readonly char[] CmdSpecial = ['&', '|', '<', '>', '^', '%', '!', '"', '(', ')', '\r', '\n', '\0'];
+
+    static readonly string[] Runnable = [".COM", ".EXE", ".BAT", ".CMD"];
+
+    // Only full PATH entries: CreateProcess would try the current directory first, where a project could plant a claude.exe.
+    static string? OnPath(string name)
+    {
+        var extensions = !OperatingSystem.IsWindows() ? [""]
+            : (Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+                .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(extension => Runnable.Contains(extension, StringComparer.OrdinalIgnoreCase)).ToArray();
+        foreach (var entry in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+        {
+            var folder = entry.Trim().Trim('"');
+            if (!Path.IsPathFullyQualified(folder))
+                continue;
+            foreach (var extension in extensions)
+            {
+                var candidate = Path.Combine(folder, name + extension);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+        }
+        return null;
+    }
+
+    static string Quoted(string arg) =>
+        arg.Length > 0 && !arg.Any(c => char.IsWhiteSpace(c) || c is ',' or ';' or '=') && arg.IndexOfAny(CmdSpecial) < 0 ? arg
+            : $"\"{arg}{new string('\\', arg.Length - arg.TrimEnd('\\').Length)}\"";
+
+    static string Shown(IEnumerable<string> command) => string.Join(' ', command.Select(Quoted));
+
     (int? Code, string Output) Run(string[] command)
     {
         if (runner is not null)
             return runner(command);
-        try
+        if (OnPath(command[0]) is not { } program)
+            return (null, $"Claude Code's `{command[0]}` command isn't on PATH");
+        ProcessStartInfo info;
+        if (Path.GetExtension(program).ToUpperInvariant() is ".CMD" or ".BAT")
         {
-            var info = new ProcessStartInfo(command[0]) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            string[] line = [program, .. command.Skip(1)];
+            if (line.Any(arg => arg.IndexOfAny(CmdSpecial) >= 0))
+                return (null, $"{program} runs through cmd.exe, which can't be given these arguments safely");
+            info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe")) { Arguments = $"/d /s /c \"{Shown(line)}\"" };
+        }
+        else
+        {
+            info = new ProcessStartInfo(program);
             foreach (var arg in command.Skip(1))
                 info.ArgumentList.Add(arg);
+        }
+        info.RedirectStandardOutput = true;
+        info.RedirectStandardError = true;
+        info.UseShellExecute = false;
+        try
+        {
             using var process = Process.Start(info)!;
+            var output = process.StandardOutput.ReadToEndAsync();
             var error = process.StandardError.ReadToEndAsync();
-            var text = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(120_000);
-            return (process.ExitCode, text + error.Result);
+            if (Task.WhenAll(output, error, process.WaitForExitAsync()).Wait(TimeSpan.FromSeconds(CommandSeconds)))
+                return (process.ExitCode, output.Result + error.Result);
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
+            {
+            }
+            return (null, $"`{Shown(command)}` didn't finish within {CommandSeconds} s and was stopped");
         }
         catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
@@ -195,7 +254,14 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
 
     bool ClaudeServer(string[]? command)
     {
+        var byHand = command is null ? $"Remove the server by hand: claude mcp remove --scope user {Name}"
+            : $"Add the server by hand: claude mcp add --scope user {Name} -- {Shown(command)}";
         var (code, output) = Run(["claude", "mcp", "get", Name]);
+        if (code is null)
+        {
+            say($"{output}. {byHand}");
+            return false;
+        }
         var there = code == 0;
         if (there && !output.Replace('\\', '/').Contains("cluewren", StringComparison.Ordinal))
         {
@@ -213,7 +279,7 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         (code, output) = Run(["claude", "mcp", "add", "--scope", "user", Name, "--", .. command]);
         if (code is null)
         {
-            say($"Claude Code's `claude` command isn't on PATH. Add the server by hand: claude mcp add --scope user {Name} -- {string.Join(' ', command)}");
+            say($"{output}. {byHand}");
             return false;
         }
         if (code != 0)

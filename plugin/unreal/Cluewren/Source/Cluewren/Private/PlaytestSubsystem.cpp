@@ -176,7 +176,7 @@ void UPlaytestSubsystem::SendHello()
 	TSharedRef<FJsonObject> Hello = MakeShared<FJsonObject>();
 	Hello->SetStringField(TEXT("type"), TEXT("hello"));
 	Hello->SetNumberField(TEXT("protocol"), ProtocolVersion);
-	FString Version = TEXT("1.0.0");
+	FString Version = TEXT("0.1.0");
 	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Cluewren")))
 	{
 		Version = Plugin->GetDescriptor().VersionName;

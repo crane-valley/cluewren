@@ -286,4 +286,25 @@ public class FrameRecorderTests
         Assert.Contains("No episode 3", recorder.Pick(3, null, null, null).Text);
         Assert.Contains("run_harness first", recorder.Pick(0, null, null, null).Text);
     }
+
+    [Fact]
+    public async Task Game_times_read_the_same_whatever_this_machine_speaks()
+    {
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("de-DE");
+            await using var recorder = Recorder();
+            recorder.Begin(1);
+            for (var t = 0; t < 10; t++)
+                Feed(recorder, t + 0.5);
+            recorder.End(1);
+            Assert.Contains("at game times 0.50, 9.50 s", recorder.Pick(1, null, null, 2).Text);
+            Assert.Contains("show game times 50.5 to 60.5 (its frames show game times 0.50 to 9.50 s)", recorder.Pick(1, 50.5, 60.5, 4).Text);
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = culture;
+        }
+    }
 }

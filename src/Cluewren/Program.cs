@@ -1,8 +1,17 @@
+using System.Globalization;
 using System.Text;
 using Cluewren.Bridge;
 using Cluewren.Jev;
 using Cluewren.Mcp;
 using Cluewren.Sandbox;
+
+const string Usage = """
+    usage:
+      cluewren connect claude|codex [--remove]   set up your own agent to use Cluewren
+      cluewren mcp                               the MCP server your agent starts
+      cluewren run <run folder> [seconds]        play <run folder>/harness.cs once, without an agent
+      cluewren --version                         this build's version
+    """;
 
 switch (args.FirstOrDefault())
 {
@@ -16,13 +25,14 @@ switch (args.FirstOrDefault())
         return 0;
     case "run" when args.Length >= 2:
         return await RunHarness();
+    case "--version":
+        Console.WriteLine($"cluewren {McpServer.Version}");
+        return 0;
+    case "--help" or "-h":
+        Console.WriteLine(Usage);
+        return 0;
     default:
-        Console.Error.WriteLine("""
-            usage:
-              cluewren connect claude|codex [--remove]   set up your own agent to use Cluewren
-              cluewren mcp                               the MCP server your agent starts
-              cluewren run <run folder> [seconds]        play <run folder>/harness.cs once, without an agent
-            """);
+        Console.Error.WriteLine(Usage);
         return 2;
 }
 
@@ -38,7 +48,7 @@ static async Task<int> ServeMcp()
 
 async Task<int> RunHarness()
 {
-    var seconds = args.Length > 2 && double.TryParse(args[2], out var parsed) ? parsed : 30;
+    var seconds = args.Length > 2 && double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : 30;
     using var cancel = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) =>
     {
@@ -48,8 +58,8 @@ async Task<int> RunHarness()
 
     var secret = Handshake.NewSecret();
     await using var server = await BridgeServer.StartAsync(secret);
-    var path = DiscoveryFile.Write(new Discovery(server.Url, Convert.ToBase64String(secret), Environment.ProcessId,
-        DateTimeOffset.UtcNow), DiscoveryFile.DefaultFolder);
+    var announced = new Discovery(server.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow);
+    var path = DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder);
 
     try
     {
@@ -72,6 +82,6 @@ async Task<int> RunHarness()
     }
     finally
     {
-        File.Delete(path);
+        DiscoveryFile.Withdraw(path, announced);
     }
 }

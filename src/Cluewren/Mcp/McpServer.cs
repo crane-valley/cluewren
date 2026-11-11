@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Cluewren.Bridge;
@@ -10,6 +11,9 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
 {
     const string Protocol = "2025-06-18";
     const string Name = "cluewren";
+
+    public static string Version { get; } =
+        typeof(McpServer).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
 
     const string Instructions = "Cluewren playtests the game open in the user's Unity, Unreal or Godot editor: call start_run with the user's "
         + "request (explore it, test it, verify a claim, reach a goal), then follow the INSTRUCTIONS.md it names. A long call answers "
@@ -75,12 +79,14 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     readonly SemaphoreSlim _send = new(1, 1);
     readonly object _gate = new();
     readonly CancellationTokenSource _stopping = new();
+    readonly SemaphoreSlim _runLock = new(1, 1);
     (Task<ToolResult> Task, string Tool, DateTimeOffset Since)? _pending;
     string _client = "an MCP client";
     BridgeServer? _bridge;
-    string? _discovery;
+    (string Path, Discovery Announced)? _discovery;
     JevClient? _jev;
     PlaytestRun? _run;
+    (string Run, string Reason, string Folder)? _ended;
     Task? _watch;
 
     public string? JevKey { get; init; }
@@ -161,7 +167,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
                 {
                     ["protocolVersion"] = parameters?["protocolVersion"]?.GetValue<string>() ?? Protocol,
                     ["capabilities"] = new JsonObject { ["tools"] = new JsonObject { ["listChanged"] = false } },
-                    ["serverInfo"] = new JsonObject { ["name"] = Name, ["version"] = "0.1.0" },
+                    ["serverInfo"] = new JsonObject { ["name"] = Name, ["version"] = Version },
                     ["instructions"] = Instructions,
                 };
                 break;
@@ -241,20 +247,63 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
 
     async Task<ToolResult> DoAsync(string tool, JsonObject args)
     {
-        if (tool == "start_run")
-            return await StartAsync(args).ConfigureAwait(false);
-        if (_run is null)
+        await _runLock.WaitAsync(_stopping.Token).ConfigureAwait(false);
+        try
+        {
+            if (tool == "start_run")
+                return await StartAsync(args).ConfigureAwait(false);
+            if (_run is not { } run)
+                return NoRun();
+            var endedBefore = run.Ended is not null;
+            var result = await run.CallAsync(tool, args, _stopping.Token).ConfigureAwait(false);
+            if (run.Ended is not null)
+                await CloseRunAsync(remember: !endedBefore).ConfigureAwait(false);
+            return result;
+        }
+        finally
+        {
+            _runLock.Release();
+        }
+    }
+
+    ToolResult NoRun()
+    {
+        if (_ended is not { } ended)
             return ToolResult.Say("No run has started: call start_run first.", true);
-        var result = await _run.CallAsync(tool, args, _stopping.Token).ConfigureAwait(false);
-        if (_run.Ended is not null)
-            await CloseRunAsync().ConfigureAwait(false);
-        return result;
+        _ended = null;
+        return ToolResult.Say($"Run {ended.Run} has ended ({ended.Reason}); its report is {Path.Combine(ended.Folder, "report.json")}. "
+            + "Tell the user its outcome; start_run starts another.", true);
+    }
+
+    // The watch's cleanup waits for the tool call in progress and closes only the run it watched: by then a later start_run
+    // may have replaced it.
+    async Task CloseWhenEndedAsync(PlaytestRun run)
+    {
+        await run.WatchAsync(_stopping.Token).ConfigureAwait(false);
+        try
+        {
+            await _runLock.WaitAsync(_stopping.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        try
+        {
+            if (_run == run && run.Ended is not null)
+                await CloseRunAsync(remember: true).ConfigureAwait(false);
+        }
+        finally
+        {
+            _runLock.Release();
+        }
     }
 
     async Task<ToolResult> StartAsync(JsonObject args)
     {
         if (_run is { Ended: null })
             return ToolResult.Say($"Run {_run.RunId} is going: finish it with report first.", true);
+        _ended = null;
         await CloseRunAsync().ConfigureAwait(false);
         var key = JevKey ?? ApiKeys.Find(ApiKeys.TypeSafeKey);
         if (string.IsNullOrWhiteSpace(key))
@@ -268,8 +317,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         _ = Task.Run(HarnessCompiler.Warm);
         var secret = Handshake.NewSecret();
         _bridge = await BridgeServer.StartAsync(secret).ConfigureAwait(false);
-        _discovery = DiscoveryFile.Write(new Discovery(_bridge.Url, Convert.ToBase64String(secret), Environment.ProcessId,
-            DateTimeOffset.UtcNow), DiscoveryFile.DefaultFolder);
+        var announced = new Discovery(_bridge.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow);
+        _discovery = (DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder), announced);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
         deadline.CancelAfter(TimeSpan.FromSeconds(connectSeconds));
         try
@@ -278,7 +327,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             _jev = new JevClient(new JevOptions(key));
             _run = await PlaytestRun.OpenAsync(link, new RunRequest(request, kind, args["minutes"]?.GetValue<double>(),
                 args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, _stopping.Token).ConfigureAwait(false);
-            _watch = _run.WatchAsync(_stopping.Token);
+            _watch = CloseWhenEndedAsync(_run);
             return ToolResult.Say(_run.Opening);
         }
         catch (OperationCanceledException)
@@ -294,16 +343,20 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         }
     }
 
-    async Task CloseRunAsync()
+    async Task CloseRunAsync(bool remember = false)
     {
         if (_run is not null)
+        {
+            if (remember && _run.Ended is { } reason)
+                _ended = (_run.RunId, reason, _run.RunFolder);
             await _run.DisposeAsync().ConfigureAwait(false);
+        }
         _run = null;
         if (_jev is not null)
             await _jev.DisposeAsync().ConfigureAwait(false);
         _jev = null;
-        if (_discovery is not null && File.Exists(_discovery))
-            File.Delete(_discovery);
+        if (_discovery is { } discovery)
+            DiscoveryFile.Withdraw(discovery.Path, discovery.Announced);
         _discovery = null;
         if (_bridge is not null)
             await _bridge.DisposeAsync().ConfigureAwait(false);
@@ -318,5 +371,6 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         await CloseRunAsync().ConfigureAwait(false);
         _stopping.Dispose();
         _send.Dispose();
+        _runLock.Dispose();
     }
 }

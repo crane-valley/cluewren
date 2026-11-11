@@ -93,19 +93,19 @@ static class Bench
             public override double TickHz => 30;
             public override double StallSeconds => 0;
 
-            public override async Task<Obs> Observe(Game game, CancellationToken ct)
+            public override async Task<Obs> Observe(Game game)
             {
-                var (pose, again) = await game.Batch(() => game.Pose(ct), () => game.Pose(ct));
+                var (pose, again) = await game.Batch(() => game.Pose(), () => game.Pose());
                 return new Obs { ["_pose"] = pose.Value, ["x"] = again.Value.At.X };
             }
 
             public override List<Option> Options(Obs obs) =>
             [
-                new("sway", "Keep moving", async (g, o, ct) =>
+                new("sway", "Keep moving", async (g, o) =>
                 {
                     for (var i = 0; ; i++)
                     {
-                        var p = await g.Pose(ct);
+                        var p = await g.Pose();
                         g.Hold("W");
                         g.Mouse(i % 2 == 0 ? 30 : -30);
                         await g.Tick();
