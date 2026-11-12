@@ -139,7 +139,12 @@ public class JevClientTests
     {
         await using var fake = await FakeJev.StartAsync();
         var dualStackName = new UriBuilder(fake.Url) { Host = "localhost" }.Uri;
-        await using var client = Client(fake, options => options with { BaseUrl = dualStackName });
+        // Not the decision deadline: a runner busy starting the other tests has stalled this first call past it.
+        var patience = TimeSpan.FromMinutes(1);
+        await using var client = Client(fake, options => options with
+        {
+            BaseUrl = dualStackName, AttemptTimeout = patience, TotalTimeout = patience,
+        });
         var decision = await client.DecideAsync(Request, default);
         Assert.Equal(0.9, decision.Probabilities["a"]);
     }

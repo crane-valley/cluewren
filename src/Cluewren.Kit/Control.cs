@@ -46,6 +46,13 @@ public static partial class Control
     public const double ReverseHold = 3.0;
     public const double TurnBack = 100.0;
 
+    // Every walk in tests/Cluewren.Bench plans within this in one tick, so spreading longer plans leaves those walks as
+    // they were.
+    const int PlanSteps = 20000;
+
+    readonly record struct PendingPlan(NavMap.Planning Planning, List<Vec>? Old, bool MovedGoal, Vec At, Vec Goal, double Feet,
+        double Since, bool Forgot);
+
     static readonly double[] DefaultTurns = [0, -30, 30, -60, 60, -90, 90, 180];
 
     public static async ValueTask<Vec> PointOf(Game game, Target target, CancellationToken ct = default)
@@ -551,6 +558,7 @@ public static partial class Control
         var plannedVersion = -1;
         Vec? plannedGoal = null;
         var replans = 0;
+        PendingPlan? planning = null;
         List<SonarWay> ways = [];
         var waysYaw = 0.0;
         var blind = false;
@@ -615,27 +623,41 @@ public static partial class Control
                         nav.Observe(at, p.Yaw, ways, now, avoidDrops, maxDrop, feet);
                 }
                 var movedGoal = plannedGoal is not { } planned || goal.Dist2d(planned) > Math.Max(100.0, 0.15 * d);
-                if (path is null || movedGoal || (nav.Version != plannedVersion
-                                                  && nav.WayBlocked(at, path, feet, ReplanAhead)))
+                (List<Vec>? Way, List<Vec>? Old, bool MovedGoal)? settled = null;
+                if (planning is null && (path is null || movedGoal || (nav.Version != plannedVersion
+                                                                       && nav.WayBlocked(at, path, feet, ReplanAhead))))
                 {
                     (plannedVersion, plannedGoal) = (nav.Version, goal);
-                    var old = path;
                     if (nav.LineFree(at, goal, feet))
-                    {
-                        path = [goal];
-                    }
+                        settled = ([goal], path, movedGoal);
                     else
+                        planning = new PendingPlan(nav.StartPlan(at, goal, within, feet), path, movedGoal, at, goal, feet, now, false);
+                }
+                if (planning is { } going)
+                {
+                    var steps = PlanSteps;
+                    var done = going.Planning.Advance(ref steps);
+                    if (done && going.Planning.Way is null && !going.Forgot)
                     {
-                        path = nav.Plan(at, goal, within, feet);
-                        if (path is null)
-                        {
-                            nav.Forget(now - 5.0);
-                            plannedVersion = nav.Version;
-                            path = nav.Plan(at, goal, within, feet);
-                        }
-                        replans++;
+                        nav.Forget(going.Since - 5.0);
+                        plannedVersion = nav.Version;
+                        var map = going.Planning.Map;
+                        if (map != nav)
+                            map.Forget(going.Since - 5.0);
+                        going = going with { Planning = map.StartPlan(going.At, going.Goal, within, going.Feet), Forgot = true };
+                        done = going.Planning.Advance(ref steps);
                     }
-                    if (path is not null && old is { Count: > 0 } && !movedGoal && TurnsBack(at, old[0], path[0]))
+                    planning = done ? null : going;
+                    if (done)
+                    {
+                        replans++;
+                        settled = (going.Planning.Way, going.Old, going.MovedGoal);
+                    }
+                }
+                if (settled is { } plan)
+                {
+                    path = plan.Way;
+                    if (path is not null && plan.Old is { Count: > 0 } old && !plan.MovedGoal && TurnsBack(at, old[0], path[0]))
                     {
                         if (now - turnedBackAt < ReverseHold && !nav.WayBlocked(at, old, feet, ReverseAhead))
                             path = old;
@@ -644,6 +666,14 @@ public static partial class Control
                     }
                     blind = path is null;
                     path = blind ? [goal] : [.. path!];
+                }
+                else if (path is null)
+                {
+                    game.Release(fwd);
+                    if (runKey is not null)
+                        game.Release(runKey);
+                    await game.Tick();
+                    continue;
                 }
                 var vel = p.Velocity.Flat;
                 var reach = Math.Max(WaypointReached, vel.Length * step);

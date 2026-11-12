@@ -235,35 +235,117 @@ public sealed class NavMap
 
     public List<Vec>? Plan(Vec start, Vec goal, double within, double z, double? margin = null)
     {
-        if (margin is { } given)
-            return PlanWithin(start, goal, within, z, given);
+        var planning = StartPlan(start, goal, within, z, margin);
+        var steps = int.MaxValue;
+        planning.Advance(ref steps);
+        return planning.Way;
+    }
+
+    internal Planning StartPlan(Vec start, Vec goal, double within, double z, double? margin = null)
+    {
         var @base = Math.Max(1500.0, 0.6 * goal.Dist2d(start));
-        foreach (var m in new[] { @base, @base * 3, @base * 8 })
+        return new Planning(this, start, goal, within, z, margin is { } given ? [given] : [@base, @base * 3, @base * 8]);
+    }
+
+    NavMap Copy() => new(Cell)
+    {
+        Hits = new(Hits), Solid = new(Solid), Guesses = new(Guesses), Passes = new(Passes), Lingered = new(Lingered),
+        LingerT = LingerT, Version = Version,
+    };
+
+    // Sonar keeps changing the live map between ticks: a plan carried over them reads the copy taken when it paused, so
+    // it finds the way the same plan made in one go would.
+    internal sealed class Planning(NavMap live, Vec start, Vec goal, double within, double z, double[] margins)
+    {
+        readonly NavMap _live = live;
+        Search? _search;
+        int _margin;
+
+        public NavMap Map { get; private set; } = live;
+
+        public bool Done { get; private set; }
+
+        public List<Vec>? Way { get; private set; }
+
+        public bool Advance(ref int steps)
         {
-            var way = PlanWithin(start, goal, within, z, m);
-            if (way is not null)
-                return way;
+            while (!Done)
+            {
+                if (_search is null)
+                {
+                    if (_margin == margins.Length)
+                    {
+                        Done = true;
+                        break;
+                    }
+                    _search = new Search(Map, start, goal, within, z, margins[_margin++]);
+                }
+                if (_search.Step(ref steps) is not { } outcome)
+                {
+                    if (ReferenceEquals(Map, _live))
+                        _search.Map = Map = _live.Copy();
+                    return false;
+                }
+                _search = null;
+                if (outcome.Way is not null || outcome.Enclosed)
+                    (Way, Done) = (outcome.Way, true);
+            }
+            return true;
         }
-        return null;
     }
 
     static readonly (int, int)[] Neighbours = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 
-    List<Vec>? PlanWithin(Vec start, Vec goal, double within, double z, double margin)
+    // A* learns that a goal is out of reach only by searching the whole box, and each larger one. The moves go both
+    // ways, so a fill back from the cells that count as arrived that runs dry without meeting the start proves it far
+    // sooner when the goal is shut in.
+    sealed class Search
     {
-        var c = Cell;
-        var k = K(z);
-        var (loI, loJ) = Ij(Math.Min(start.X, goal.X) - margin, Math.Min(start.Y, goal.Y) - margin, c);
-        var (hiI, hiJ) = Ij(Math.Max(start.X, goal.X) + margin, Math.Max(start.Y, goal.Y) + margin, c);
-        var s = Ij(start.X, start.Y, c);
-        var reach = Math.Max(within * 0.9, c * 0.75);
-        var blocked = new Dictionary<(int, int), bool>();
-        var lingered = Lingered.Count > 0;
+        public const int FillLimit = 4096;
+
+        readonly Vec _start, _goal;
+        readonly double _z, _reach;
+        readonly int _k, _loI, _loJ, _hiI, _hiJ;
+        readonly (int, int) _s;
+        readonly bool _lingered, _arrivalsInside;
+        readonly Dictionary<(int, int), bool> _blocked = [];
+        readonly PriorityQueue<(int, int), QueueOrder> _frontier = new();
+        readonly Dictionary<(int, int), (int, int)?> _came;
+        readonly Dictionary<(int, int), double> _cost;
+        Queue<(int, int)>? _fill = new();
+        readonly HashSet<(int, int)> _filled = [];
+        int _expansions, _fillPops;
+        bool _fillLeftBox;
+
+        public NavMap Map;
+
+        public Search(NavMap map, Vec start, Vec goal, double within, double z, double margin)
+        {
+            (Map, _start, _goal, _z) = (map, start, goal, z);
+            var c = map.Cell;
+            _k = K(z);
+            (_loI, _loJ) = Ij(Math.Min(start.X, goal.X) - margin, Math.Min(start.Y, goal.Y) - margin, c);
+            (_hiI, _hiJ) = Ij(Math.Max(start.X, goal.X) + margin, Math.Max(start.Y, goal.Y) + margin, c);
+            _s = Ij(start.X, start.Y, c);
+            _reach = Math.Max(within * 0.9, c * 0.75);
+            _lingered = map.Lingered.Count > 0;
+            _frontier.Enqueue(_s, new QueueOrder(H(_s.Item1, _s.Item2), 0, _s.Item1, _s.Item2));
+            _came = new() { [_s] = null };
+            _cost = new() { [_s] = 0 };
+            var (aI, aJ) = Ij(goal.X - _reach, goal.Y - _reach, c);
+            var (bI, bJ) = Ij(goal.X + _reach, goal.Y + _reach, c);
+            (aI, aJ, bI, bJ) = (aI - 1, aJ - 1, bI + 1, bJ + 1);
+            _arrivalsInside = aI >= _loI && aJ >= _loJ && bI <= _hiI && bJ <= _hiJ;
+            for (var i = Math.Max(aI, _loI); i <= Math.Min(bI, _hiI); i++)
+                for (var j = Math.Max(aJ, _loJ); j <= Math.Min(bJ, _hiJ); j++)
+                    if (Arrived(i, j) && !IsBlocked(i, j))
+                        Reach((i, j));
+        }
 
         bool IsBlocked(int i, int j)
         {
-            if (!blocked.TryGetValue((i, j), out var v))
-                blocked[(i, j)] = v = (i, j) != s && BlockedKey((i, j, k));
+            if (!_blocked.TryGetValue((i, j), out var v))
+                _blocked[(i, j)] = v = (i, j) != _s && Map.BlockedKey((i, j, _k));
             return v;
         }
 
@@ -278,65 +360,114 @@ public sealed class NavMap
 
         double H(int i, int j)
         {
-            var dx = Math.Abs((i + 0.5) * c - goal.X);
-            var dy = Math.Abs((j + 0.5) * c - goal.Y);
-            return HeuristicWeight * Math.Max(0.0, Hypot(dx, dy) - reach);
+            var dx = Math.Abs((i + 0.5) * Map.Cell - _goal.X);
+            var dy = Math.Abs((j + 0.5) * Map.Cell - _goal.Y);
+            return HeuristicWeight * Math.Max(0.0, Hypot(dx, dy) - _reach);
         }
 
-        bool Arrived(int i, int j) => Hypot((i + 0.5) * c - goal.X, (j + 0.5) * c - goal.Y) <= reach;
+        bool Arrived(int i, int j) => Hypot((i + 0.5) * Map.Cell - _goal.X, (j + 0.5) * Map.Cell - _goal.Y) <= _reach;
 
-        var frontier = new PriorityQueue<(int, int), QueueOrder>();
-        frontier.Enqueue(s, new QueueOrder(H(s.Item1, s.Item2), 0, s.Item1, s.Item2));
-        var came = new Dictionary<(int, int), (int, int)?> { [s] = null };
-        var cost = new Dictionary<(int, int), double> { [s] = 0 };
-        (int, int)? end = null;
-        var expansions = 0;
-        while (frontier.TryDequeue(out var current, out var order))
+        bool Inside(int i, int j) => i >= _loI && i <= _hiI && j >= _loJ && j <= _hiJ;
+
+        void Reach((int, int) cell)
         {
-            if (order.G > cost.GetValueOrDefault(current, 1e18))
-                continue;
+            if (cell == _s)
+                _fill = null;
+            else if (_fill is not null && _filled.Add(cell))
+                _fill.Enqueue(cell);
+        }
+
+        public (List<Vec>? Way, bool Enclosed)? Step(ref int steps)
+        {
+            while (steps > 0)
+            {
+                steps--;
+                if (_fill is not null && FillOne() is { } dry)
+                    return dry;
+                if (SearchOne() is { } found)
+                    return found;
+            }
+            return null;
+        }
+
+        (List<Vec>?, bool)? FillOne()
+        {
+            if (_fillPops++ >= FillLimit)
+            {
+                _fill = null;
+                return null;
+            }
+            if (!_fill!.TryDequeue(out var cell))
+                return (null, !_fillLeftBox && _arrivalsInside);
+            var (bi, bj) = cell;
+            foreach (var (di, dj) in Neighbours)
+            {
+                var (ai, aj) = (bi + di, bj + dj);
+                if (IsBlocked(ai, aj))
+                    continue;
+                if (!Inside(ai, aj))
+                {
+                    _fillLeftBox = true;
+                    continue;
+                }
+                if (di != 0 && dj != 0 && (IsBlocked(bi + di, bj) || IsBlocked(bi, bj + dj)))
+                    continue;
+                Reach((ai, aj));
+                if (_fill is null)
+                    break;
+            }
+            return null;
+        }
+
+        (List<Vec>?, bool)? SearchOne()
+        {
+            if (!_frontier.TryDequeue(out var current, out var order))
+                return (null, false);
+            if (order.G > _cost.GetValueOrDefault(current, 1e18))
+                return null;
             var (ci, cj) = current;
             if (Arrived(ci, cj))
-            {
-                end = current;
-                break;
-            }
-            expansions++;
-            if (expansions > MaxExpansions)
-                break;
+                return (Way(current), false);
+            _expansions++;
+            if (_expansions > MaxExpansions)
+                return (null, false);
+            var c = Map.Cell;
             foreach (var (di, dj) in Neighbours)
             {
                 var (ni, nj) = (ci + di, cj + dj);
-                if (ni < loI || ni > hiI || nj < loJ || nj > hiJ || IsBlocked(ni, nj))
+                if (!Inside(ni, nj) || IsBlocked(ni, nj))
                     continue;
                 if (di != 0 && dj != 0 && (IsBlocked(ci + di, cj) || IsBlocked(ci, cj + dj)))
                     continue;
                 var step = c * (di != 0 && dj != 0 ? 1.4142 : 1.0);
-                if (GuessedKey((ni, nj, k)))
+                if (Map.GuessedKey((ni, nj, _k)))
                     step *= GuessCost;
                 else if (Near(ni, nj))
                     step *= NearCost;
-                if (lingered)
-                    step *= LingerCost(ni, nj, k, LingerT);
+                if (_lingered)
+                    step *= Map.LingerCost(ni, nj, _k, Map.LingerT);
                 var ng = order.G + step;
-                if (ng < cost.GetValueOrDefault((ni, nj), 1e18))
+                if (ng < _cost.GetValueOrDefault((ni, nj), 1e18))
                 {
-                    cost[(ni, nj)] = ng;
-                    came[(ni, nj)] = current;
-                    frontier.Enqueue((ni, nj), new QueueOrder(ng + H(ni, nj), ng, ni, nj));
+                    _cost[(ni, nj)] = ng;
+                    _came[(ni, nj)] = current;
+                    _frontier.Enqueue((ni, nj), new QueueOrder(ng + H(ni, nj), ng, ni, nj));
                 }
             }
-        }
-        if (end is null)
             return null;
-        var cells = new List<(int, int)>();
-        for (var cell = end; cell is { } at; cell = came[at])
-            cells.Add(at);
-        cells.Reverse();
-        var points = cells.Skip(1).Select(cell => Center(cell.Item1, cell.Item2, z)).ToList();
-        if (points.Count == 0)
-            points.Add(new Vec(goal.X, goal.Y, z));
-        return Smooth(start, points, z);
+        }
+
+        List<Vec> Way((int, int) end)
+        {
+            var cells = new List<(int, int)>();
+            for (var cell = ((int, int)?)end; cell is { } at; cell = _came[at])
+                cells.Add(at);
+            cells.Reverse();
+            var points = cells.Skip(1).Select(cell => Map.Center(cell.Item1, cell.Item2, _z)).ToList();
+            if (points.Count == 0)
+                points.Add(new Vec(_goal.X, _goal.Y, _z));
+            return Map.Smooth(_start, points, _z);
+        }
     }
 
     static double Hypot(double x, double y) => Math.Sqrt(x * x + y * y);

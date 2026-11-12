@@ -41,6 +41,10 @@ public sealed class ArenaLink : SimLink
 
     public Enemy? Enemy { get; set; }
 
+    // Game time passing with each pose read, a tick's, instead of the wall clock's: a loaded machine then can't let the
+    // enemy cover more ground between two reads than an idle one does.
+    public double? SecondsPerPose { get; set; }
+
     public double Ground(double x) => Slope * (x - 600);
 
     static double Mod(double value, double by) => value - by * Math.Floor(value / by);
@@ -51,10 +55,10 @@ public sealed class ArenaLink : SimLink
         return Math.Abs(Mod(Yaw - want + 180, 360) - 180) < 10;
     }
 
-    void Advance()
+    void Advance(string op)
     {
         var now = Stopwatch.GetTimestamp();
-        var dt = Stopwatch.GetElapsedTime(_wall, now).TotalSeconds;
+        var dt = SecondsPerPose is { } frame ? (op == "pose" ? frame : 0) : Stopwatch.GetElapsedTime(_wall, now).TotalSeconds;
         _wall = now;
         GameTime = (GameTime ?? 0) + dt;
         var me = Pos[Hero];
@@ -92,7 +96,7 @@ public sealed class ArenaLink : SimLink
     {
         lock (_gate)
         {
-            Advance();
+            Advance(op);
             switch (op)
             {
                 case "context":
@@ -511,9 +515,10 @@ public class ResearchTests
     {
         _link.Enemy = new Enemy(Gob1, 400, 110, 0.3, 25, 2.0, 30);
         _link.Health[Gob1] = 20;
+        _link.SecondsPerPose = 1.0 / 15;
         var r = await Research.EnemyProfile(_game, "/Game/BP_Goblin.BP_Goblin_C", seconds: 6, safeDistance: 600);
         Assert.Equal(Gob1, r["target"]);
-        Assert.Equal(true, r["comes"]);
+        Assert.True(r["comes"] is true, Fmt.Json(r));
         Assert.True((long)r["start_distance"]! is >= 480 and <= 610 && (long)r["min_distance"]! <= 115, Fmt.Json(r));
         Assert.True((long)r["approach_speed"]! is >= 300 and <= 500 && (long)r["speed"]! is >= 300 and <= 500, Fmt.Json(r));
         Assert.Equal(600.0, r["player_speed"]);
