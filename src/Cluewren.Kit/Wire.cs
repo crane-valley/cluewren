@@ -97,7 +97,17 @@ public sealed class LineReader(Stream stream, int maxLine = 32 << 20)
                 return (held!, heldLength);
             }
             _start = _end = 0;
-            var read = stream.Read(_chunk, 0, _chunk.Length);
+            int read;
+            try
+            {
+                read = stream.Read(_chunk, 0, _chunk.Length);
+            }
+            catch
+            {
+                if (held is not null)
+                    ArrayPool<byte>.Shared.Return(held);
+                throw;
+            }
             if (read <= 0)
             {
                 if (held is not null)
