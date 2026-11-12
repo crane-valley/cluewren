@@ -222,7 +222,7 @@ namespace Cluewren
             if (TestWire != null) return;  // (tests: no socket)
             CloseSocket(WebSocketCloseStatus.NormalClosure, "reconnect");
             Uri uri = null;
-            var why = Discovery.Read(Discovery.FilePath(), out var brain);
+            var why = Discovery.Read(Discovery.FilePath(), Host.ProjectDir, out var brain);
             if (why == null)
             {
                 Url = string.IsNullOrEmpty(givenUrl) ? brain.Url : givenUrl;
@@ -430,6 +430,7 @@ namespace Cluewren
         void SendHello()
         {
             pluginNonce = Handshake.NewNonce();
+            var projectDir = Host.ProjectDir ?? "";
             var hello = new Dictionary<string, object>
             {
                 ["type"] = "hello",
@@ -443,6 +444,8 @@ namespace Cluewren
                 // what this plugin does beyond the protocol's first version: the brain falls back for one without them
                 ["features"] = Media.Compiled ? new List<object> { "timed_hold", "pointer", "levels", "media" } : new List<object> { "timed_hold", "pointer", "levels" },
                 ["nonce"] = Convert.ToBase64String(pluginNonce),
+                ["project_dir"] = projectDir,
+                ["mac"] = Convert.ToBase64String(Handshake.HelloMac(secret, pluginNonce, projectDir)),
             };
             var id = Host.ProjectId;
             if (!string.IsNullOrEmpty(id)) hello["project_id"] = id;
@@ -781,7 +784,8 @@ namespace Cluewren
             Problem = "";
             ProblemCode = 0;
             SetConnected(true);
-            // (only now: these were held for a brain that has proved itself)
+            // (only now, for a brain that has proved itself: the devices, as these held answers)
+            Hands.EnsureDevices();
             foreach (var r in heldResponses) outgoing.Add(r);
             heldResponses.Clear();
             Status("Connected to the playtest service");

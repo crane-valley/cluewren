@@ -85,11 +85,11 @@ namespace Cluewren.Tests
             try
             {
                 var secret = Convert.ToBase64String(Range(0));
-                Assert.IsNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, secret), out var brain));
+                Assert.IsNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, secret), dir, out var brain));
                 Assert.AreEqual(Range(0), brain.Secret);
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, 0, secret), out _));
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, "short"), out _));
-                Assert.IsNotNull(Discovery.Read(Path.Combine(dir, "missing.json"), out _));
+                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, 0, secret), dir, out _));
+                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, "short"), dir, out _));
+                Assert.IsNotNull(Discovery.Read(Path.Combine(dir, "missing.json"), dir, out _));
             }
             finally
             {

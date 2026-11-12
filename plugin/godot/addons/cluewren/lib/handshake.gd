@@ -4,6 +4,7 @@ extends RefCounted
 
 const BRAIN_ROLE := "brain-proof"
 const PLUGIN_ROLE := "plugin-proof"
+const HELLO_ROLE := "hello"
 const NONCE_BYTES := 32
 
 
@@ -16,6 +17,15 @@ static func prove(secret: PackedByteArray, role: String, plugin_nonce: PackedByt
 	input.append(0)
 	input.append_array(plugin_nonce)
 	input.append_array(brain_nonce)
+	return Crypto.new().hmac_digest(HashingContext.HASH_SHA256, secret, input)
+
+
+static func hello_mac(secret: PackedByteArray, plugin_nonce: PackedByteArray, project_dir: String) -> PackedByteArray:
+	var input := HELLO_ROLE.to_ascii_buffer()
+	input.append(0)
+	input.append_array(plugin_nonce)
+	input.append(0)
+	input.append_array(project_dir.to_utf8_buffer())
 	return Crypto.new().hmac_digest(HashingContext.HASH_SHA256, secret, input)
 
 

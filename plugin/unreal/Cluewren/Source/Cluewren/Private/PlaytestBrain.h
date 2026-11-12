@@ -6,6 +6,8 @@
 
 #include "CoreMinimal.h"
 
+class FJsonObject;
+
 namespace PlaytestBrain
 {
 	constexpr int32 NonceBytes = 32;
@@ -21,8 +23,14 @@ namespace PlaytestBrain
 	/** %LOCALAPPDATA%\Cluewren\brain.json. */
 	FString FilePath();
 
-	/** Why the brain announced in Path can't be used, or "" with its address. */
-	FString Read(const FString& Path, FAddress& Out);
+	/** Why the brain announced in Path can't be used by the project in ProjectDir, or "" with its address. */
+	FString Read(const FString& Path, const FString& ProjectDir, FAddress& Out);
+
+	FString ProjectDir();
+
+	/** Why a run announced in brain.json isn't this project's, or "". The same rule and words as the Unity and Godot
+	 *  plugins: no `folders` (a brain before 0.1.1) is no filter; an unknown `match` is never a match. */
+	FString ForAnotherProject(const FJsonObject& Said, const FString& ProjectDir);
 
 	/** Why Url is refused, or "" with its parts. The only URL connected to: ws:// to 127.0.0.1 or [::1], with no userinfo. */
 	FString CheckUrl(const FString& Url, FAddress& Out);
@@ -34,6 +42,9 @@ namespace PlaytestBrain
 
 	bool Verify(const TArray<uint8>& Secret, const TCHAR* Role, const TArray<uint8>& PluginNonce, const TArray<uint8>& BrainNonce, const TArray<uint8>& Proof);
 
+	TArray<uint8> HelloMac(const TArray<uint8>& Secret, const TArray<uint8>& PluginNonce, const FString& ProjectDir);
+
 	inline const TCHAR* const BrainRole = TEXT("brain-proof");
 	inline const TCHAR* const PluginRole = TEXT("plugin-proof");
+	inline const TCHAR* const HelloRole = TEXT("hello");
 }

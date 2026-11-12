@@ -3,6 +3,7 @@
 // starting, stopping and restarting play, pausing, a fixed time step, and the clocks.
 
 #include "PlaytestOps.h"
+#include "PlaytestBrain.h"
 #include "PlaytestRefusal.h"
 #include "Misc/EngineVersionComparison.h"
 
@@ -187,9 +188,7 @@ namespace
 		Result->SetStringField(TEXT("host"), GIsEditor ? TEXT("editor") : TEXT("game"));
 		Result->SetStringField(TEXT("engine"), TEXT("unreal"));
 		Result->SetStringField(TEXT("engine_version"), FEngineVersion::Current().ToString(EVersionComponent::Patch));
-		FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
-		FPaths::NormalizeDirectoryName(ProjectDir);
-		Result->SetStringField(TEXT("project_dir"), ProjectDir);
+		Result->SetStringField(TEXT("project_dir"), PlaytestBrain::ProjectDir());
 		Result->SetBoolField(TEXT("session_running"), World != nullptr);
 		Result->SetBoolField(TEXT("paused"), World && World->IsPaused());
 		Result->SetField(TEXT("game_time"), PlaytestJson::Number(World ? World->GetTimeSeconds() : 0.0));

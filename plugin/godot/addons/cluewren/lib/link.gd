@@ -69,7 +69,7 @@ func _connect() -> void:
 		problem = why
 		next_try = _now() + FILE_POLL_SECONDS
 		return
-	var brain := Discovery.read(path)
+	var brain := Discovery.read(path, Discovery.project_dir())
 	if brain.has("error"):
 		problem = brain.error
 		next_try = _now() + FILE_POLL_SECONDS
@@ -142,6 +142,8 @@ func _send_hello() -> void:
 	h.type = "hello"
 	h.protocol = PROTOCOL
 	h.nonce = Marshalls.raw_to_base64(_nonce)
+	h.project_dir = Discovery.project_dir()
+	h.mac = Marshalls.raw_to_base64(Handshake.hello_mac(_secret, _nonce, h.project_dir))
 	_asked_resume = session
 	if session != "":
 		h.resume = session

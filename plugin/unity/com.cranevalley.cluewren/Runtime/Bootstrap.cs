@@ -67,7 +67,6 @@ namespace Cluewren
                 ExitOnFailure = true,
                 ConnectTimeout = PlaytestClient.CommandLineConnectTimeout(),
             };
-            Hands.EnsureDevices();
             // -PlaytestMap: the scene to play (a name, path or build index) in place of the build's first; restart
             // reopens it
             var map = PlaytestClient.Arg("PlaytestMap");

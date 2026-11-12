@@ -95,10 +95,14 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IJevRelay jev, string client,
         SandboxMode sandbox, CancellationToken ct = default)
     {
-        var probe = new Game(link);
-        var project = (await probe.Context(fresh: true, ct).ConfigureAwait(false))["project_dir"].Text;
+        var project = link.Project;
         if (string.IsNullOrEmpty(project))
-            throw new InvalidOperationException("the game didn't say which project it is");
+            throw new InvalidOperationException("the editor connected without a verified project");
+        var probe = new Game(link);
+        var said = (await probe.Context(fresh: true, ct).ConfigureAwait(false))["project_dir"].Text;
+        if (string.IsNullOrEmpty(said) || !ProjectScope.SameFolder(said, project))
+            throw new InvalidOperationException($"the editor connected for {project}, but its game says its project is "
+                + $"{(string.IsNullOrEmpty(said) ? "none" : said)}");
         var memory = MemoryFolder(project);
         var id = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
         var runFolder = Path.Combine(memory, "runs", id);
