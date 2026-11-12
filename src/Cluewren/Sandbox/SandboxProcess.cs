@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text.RegularExpressions;
 using Cluewren.Bridge;
 
 namespace Cluewren.Sandbox;
@@ -67,10 +68,17 @@ public sealed record ChildSpec(string Dotnet, string ChildDll, string RunFolder,
 
 public static class ChildRuntime
 {
+    const string Ready = ".ready";
+
     static readonly string[] Files =
         ["Cluewren.Child.dll", "Cluewren.Child.runtimeconfig.json", "Cluewren.Child.deps.json", "Cluewren.Kit.dll"];
 
+    static readonly Regex Leftover = new(@"^[0-9a-f]{16}(\.(new|old)-[0-9a-f]{32})?$");
+
     static readonly Lock Gate = new();
+    static FileStream? _lease;
+    static string? _leased;
+    static bool _pruned;
 
     public static string Dotnet()
     {
@@ -85,20 +93,172 @@ public static class ChildRuntime
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         foreach (var name in Files)
             hash.AppendData(File.ReadAllBytes(Path.Combine(source, name)));
-        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Cluewren-child", Convert.ToHexStringLower(hash.GetHashAndReset())[..16]);
+        var version = Convert.ToHexStringLower(hash.GetHashAndReset())[..16];
+        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Cluewren-child");
+        var folder = Path.Combine(root, version);
         lock (Gate)
         {
-            if (File.Exists(Path.Combine(folder, ".ready")))
+            if (_leased == folder && Complete(folder))
                 return folder;
-            Directory.CreateDirectory(folder);
-            foreach (var name in Files)
-                File.Copy(Path.Combine(source, name), Path.Combine(folder, name), overwrite: true);
-            if (OperatingSystem.IsWindows())
-                GrantAllAppContainers(folder);
-            File.WriteAllText(Path.Combine(folder, ".ready"), "");
+            _lease?.Dispose();
+            (_lease, _leased) = (null, null);
+            _lease = Lease(source, root, version);
+            _leased = folder;
+            if (!_pruned && OperatingSystem.IsWindows())
+            {
+                _pruned = true;
+                Prune(root, version);
+            }
         }
         return folder;
+    }
+
+    static bool Complete(string folder) =>
+        File.Exists(Path.Combine(folder, Ready)) && Files.All(name => File.Exists(Path.Combine(folder, name)));
+
+    // Held until the brain exits. No delete sharing keeps the marker, and Windows refuses to rename a folder with a
+    // handle open inside, so another brain's pruning leaves this version alone.
+    static FileStream Lease(string source, string root, string version)
+    {
+        var folder = Path.Combine(root, version);
+        var deadline = Stopwatch.GetTimestamp() + 60 * Stopwatch.Frequency;
+        while (true)
+        {
+            if (TryLease(folder) is { } lease)
+                return lease;
+            if (!Directory.Exists(folder))
+                Build(source, root, version);
+            else if (!AwaitComplete(folder))
+                Bury(root, folder);
+            if (Stopwatch.GetTimestamp() > deadline)
+                throw new SandboxException($"the child's program folder {folder} couldn't be prepared");
+        }
+    }
+
+    static FileStream? TryLease(string folder)
+    {
+        FileStream lease;
+        try
+        {
+            lease = new FileStream(Path.Combine(folder, Ready), FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            Thread.Sleep(50);
+            return null;
+        }
+        if (Complete(folder))
+            return lease;
+        lease.Dispose();
+        return null;
+    }
+
+    // Long enough for a 0.1.0 brain, which copies into the version folder itself, to finish.
+    static bool AwaitComplete(string folder)
+    {
+        var until = Stopwatch.GetTimestamp() + 10 * Stopwatch.Frequency;
+        while (Directory.Exists(folder) && !Complete(folder))
+        {
+            if (Stopwatch.GetTimestamp() > until)
+                return false;
+            Thread.Sleep(100);
+        }
+        return true;
+    }
+
+    static void Bury(string root, string folder)
+    {
+        var tomb = Path.Combine(root, Path.GetFileName(folder) + ".old-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.Move(folder, tomb);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            if (Complete(folder))
+                return;
+            throw new SandboxException($"the child's program folder {folder} is incomplete and something holds a file in it: "
+                + "close what holds it, or delete the folder");
+        }
+        Delete(tomb);
+    }
+
+    static void Build(string source, string root, string version)
+    {
+        var folder = Path.Combine(root, version);
+        var staging = Path.Combine(root, version + ".new-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(staging);
+        try
+        {
+            // Open until the copy is whole, so another brain's pruning cannot take the staging folder halfway.
+            using (var held = new FileStream(Path.Combine(staging, Files[0]), FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            {
+                using (var from = File.OpenRead(Path.Combine(source, Files[0])))
+                    from.CopyTo(held);
+                foreach (var name in Files.Skip(1))
+                    File.Copy(Path.Combine(source, name), Path.Combine(staging, name));
+                if (OperatingSystem.IsWindows())
+                    GrantAllAppContainers(staging);
+                File.WriteAllText(Path.Combine(staging, Ready), "");
+            }
+            try
+            {
+                Directory.Move(staging, folder);
+            }
+            catch (IOException) when (Directory.Exists(folder) || !Directory.Exists(staging))
+            {
+            }
+        }
+        finally
+        {
+            Delete(staging);
+        }
+    }
+
+    static void Prune(string root, string version)
+    {
+        try
+        {
+            foreach (var entry in Directory.GetDirectories(root))
+            {
+                var name = Path.GetFileName(entry);
+                if (name == version || !Leftover.IsMatch(name))
+                    continue;
+                var tomb = name.Contains(".old-", StringComparison.Ordinal) ? entry
+                    : Path.Combine(root, name[..16] + ".old-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    if (tomb != entry)
+                        Directory.Move(entry, tomb);
+                    Directory.Delete(tomb, true);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    static void Delete(string folder)
+    {
+        try
+        {
+            Directory.Delete(folder, true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
     }
 
     // Every run has its own container SID. One grant to all containers beats an entry per run on files that hold no secret.
@@ -113,15 +273,14 @@ public static class ChildRuntime
     }
 }
 
+// Off Windows only: there the plain child is created inside its job by WindowsContainer.
 public sealed class PlainChild : ISandboxProcess
 {
     readonly Process _process;
-    readonly IntPtr _job;
 
-    PlainChild(Process process, IntPtr job, string kind)
+    PlainChild(Process process, string kind)
     {
         _process = process;
-        _job = job;
         Kind = kind;
     }
 
@@ -155,14 +314,7 @@ public sealed class PlainChild : ISandboxProcess
         start.Environment.Clear();
         foreach (var (name, value) in spec.Environment())
             start.Environment[name] = value;
-        var process = Process.Start(start) ?? throw new SandboxException("the child didn't start");
-        var job = IntPtr.Zero;
-        if (OperatingSystem.IsWindows())
-        {
-            job = WindowsContainer.NewJob(spec.MemoryLimitBytes, processes: 1);
-            WindowsContainer.Assign(job, process.Handle);
-        }
-        return new PlainChild(process, job, kind);
+        return new PlainChild(Process.Start(start) ?? throw new SandboxException("the child didn't start"), kind);
     }
 
     public void Kill()
@@ -180,8 +332,6 @@ public sealed class PlainChild : ISandboxProcess
     {
         Kill();
         _process.Dispose();
-        if (OperatingSystem.IsWindows() && _job != IntPtr.Zero)
-            WindowsContainer.CloseJob(_job);
     }
 }
 
@@ -196,12 +346,14 @@ public static class SandboxStarter
         _ => null,
     };
 
+    // Absolute entries only: a relative or empty one names a different folder depending on where the brain was started.
+    public static string? FindBubblewrap(string? path) =>
+        path?.Split(Path.PathSeparator).Where(Path.IsPathFullyQualified)
+            .Select(folder => Path.GetFullPath(Path.Combine(folder, "bwrap"))).FirstOrDefault(File.Exists);
+
     static string[]? Bubblewrap(ChildSpec spec)
     {
-        if (Environment.GetEnvironmentVariable("PATH") is not { } path)
-            return null;
-        var bwrap = path.Split(Path.PathSeparator).Select(folder => Path.Combine(folder, "bwrap")).FirstOrDefault(File.Exists);
-        if (bwrap is null)
+        if (FindBubblewrap(Environment.GetEnvironmentVariable("PATH")) is not { } bwrap)
             return null;
         var command = new List<string>
         {
@@ -215,38 +367,52 @@ public static class SandboxStarter
         return [.. command];
     }
 
-    public static (ISandboxProcess Process, string? Note) Start(ChildSpec spec, SandboxMode mode)
+    public static (ISandboxProcess Process, string? Note, string? Uncapped) Start(ChildSpec spec, SandboxMode mode)
     {
-        if (mode == SandboxMode.Process)
-            return (PlainChild.Start(spec), null);
         if (OperatingSystem.IsWindows())
+            return StartOnWindows(spec, mode);
+        if (mode == SandboxMode.Process)
+            return (PlainChild.Start(spec), null, null);
+        if (OperatingSystem.IsLinux())
+        {
+            if (Bubblewrap(spec) is { } wrapper)
+                return (PlainChild.Start(spec, wrapper, "bwrap"), null, null);
+            if (mode == SandboxMode.Contained)
+                throw new SandboxException("bubblewrap isn't available");
+            return (PlainChild.Start(spec), Downgraded("bubblewrap isn't available"), null);
+        }
+        const string none = "this platform has no container for harness code";
+        if (mode == SandboxMode.Contained)
+            throw new SandboxException(none);
+        return (PlainChild.Start(spec), Downgraded(none), null);
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    static (ISandboxProcess Process, string? Note, string? Uncapped) StartOnWindows(ChildSpec spec, SandboxMode mode)
+    {
+        string? note = null;
+        if (mode != SandboxMode.Process)
         {
             try
             {
-                return (WindowsContainer.Start(spec), null);
+                var contained = WindowsContainer.Start(spec, contained: true, requireCpuCeiling: mode == SandboxMode.Contained);
+                return (contained, null, Uncapped(contained.Uncapped));
             }
             catch (Exception e) when (e is System.ComponentModel.Win32Exception or SandboxException or UnauthorizedAccessException)
             {
                 if (mode == SandboxMode.Contained)
                     throw new SandboxException($"the container couldn't be created: {e.Message}");
-                return (PlainChild.Start(spec), Downgraded(e.Message));
+                note = Downgraded(e.Message);
             }
         }
-        if (OperatingSystem.IsLinux())
-        {
-            if (Bubblewrap(spec) is { } wrapper)
-                return (PlainChild.Start(spec, wrapper, "bwrap"), null);
-            if (mode == SandboxMode.Contained)
-                throw new SandboxException("bubblewrap isn't available");
-            return (PlainChild.Start(spec), Downgraded("bubblewrap isn't available"));
-        }
-        const string none = "this platform has no container for harness code";
-        if (mode == SandboxMode.Contained)
-            throw new SandboxException(none);
-        return (PlainChild.Start(spec), Downgraded(none));
+        var plain = WindowsContainer.Start(spec, contained: false, requireCpuCeiling: false);
+        return (plain, note, Uncapped(plain.Uncapped));
     }
 
     public static string Downgraded(string why) =>
         $"The sandbox couldn't be used ({why}): harness code ran in a plain child with no keys in its environment. It can "
         + "read this user's files and reach the network.";
+
+    static string? Uncapped(string? why) =>
+        why is null ? null : $"The harness child's CPU ceiling couldn't be set ({why}): it could use every processor.";
 }

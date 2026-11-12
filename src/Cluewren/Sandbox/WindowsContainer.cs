@@ -22,22 +22,29 @@ public sealed class WindowsContainer : ISandboxProcess
     static readonly nint AttributeHandleList = 0x00020002;
     static readonly nint AttributeJobList = 0x0002000D;
     const int JobObjectExtendedLimitInformation = 9;
+    const int JobObjectCpuRateControlInformation = 15;
     const uint LimitKillOnJobClose = 0x2000;
     const uint LimitActiveProcess = 0x8;
     const uint LimitJobMemory = 0x200;
+    const uint CpuRateControlEnable = 0x1;
+    const uint CpuRateControlHardCap = 0x4;
+    const ushort AllProcessorGroups = 0xFFFF;
+    const int CeilingProcessors = 2;
     const string ClaimFile = ".container";
 
     readonly IntPtr _job;
     readonly IntPtr _process;
     int _closed;
 
-    WindowsContainer(IntPtr job, IntPtr process, Stream input, Stream output, Stream error)
+    WindowsContainer(IntPtr job, IntPtr process, Stream input, Stream output, Stream error, string kind, string? uncapped)
     {
         _job = job;
         _process = process;
         Input = input;
         Output = output;
         Error = error;
+        Kind = kind;
+        Uncapped = uncapped;
     }
 
     public Stream Input { get; }
@@ -46,9 +53,11 @@ public sealed class WindowsContainer : ISandboxProcess
 
     public Stream Error { get; }
 
-    public string Kind => "appcontainer";
+    public string Kind { get; }
 
-    public static IntPtr NewJob(long memoryLimitBytes, int processes)
+    public string? Uncapped { get; }
+
+    static IntPtr NewJob(long memoryLimitBytes, int processes)
     {
         var job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero)
@@ -71,13 +80,21 @@ public sealed class WindowsContainer : ISandboxProcess
         return job;
     }
 
-    public static void Assign(IntPtr job, IntPtr process)
+    // CpuRate is a share of the whole machine in 1/10000, not of one processor (measured: 1000 of 20 is 2.1 processors' worth).
+    static string? CapCpu(IntPtr job)
     {
-        if (!AssignProcessToJobObject(job, process))
-            throw new Win32Exception();
+        var processors = GetActiveProcessorCount(AllProcessorGroups);
+        if (processors <= CeilingProcessors)
+            return null;
+        var rate = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+        {
+            ControlFlags = CpuRateControlEnable | CpuRateControlHardCap, CpuRate = (uint)(CeilingProcessors * 10000 / processors),
+        };
+        return SetInformationJobObject(job, JobObjectCpuRateControlInformation, ref rate,
+            Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()) ? null : new Win32Exception().Message;
     }
 
-    public static void CloseJob(IntPtr job)
+    static void CloseJob(IntPtr job)
     {
         TerminateJobObject(job, 1);
         CloseHandle(job);
@@ -200,11 +217,30 @@ public sealed class WindowsContainer : ISandboxProcess
         return Marshal.StringToHGlobalUni(text.ToString());
     }
 
-    public static WindowsContainer Start(ChildSpec spec)
+    // The plain child comes through here too, so that it starts inside its job rather than being put there once it runs.
+    public static WindowsContainer Start(ChildSpec spec, bool contained, bool requireCpuCeiling)
     {
-        var sid = Profile(spec.ContainerName);
-        Grant(spec.RunFolder, SidOf(sid));
-        var job = NewJob(spec.MemoryLimitBytes, processes: 1);
+        var sid = contained ? Profile(spec.ContainerName) : IntPtr.Zero;
+        IntPtr job;
+        string? uncapped;
+        try
+        {
+            if (contained)
+                Grant(spec.RunFolder, SidOf(sid));
+            job = NewJob(spec.MemoryLimitBytes, processes: 1);
+            uncapped = CapCpu(job);
+            if (uncapped is not null && requireCpuCeiling)
+            {
+                CloseJob(job);
+                throw new SandboxException($"the CPU ceiling couldn't be set ({uncapped})");
+            }
+        }
+        catch
+        {
+            if (sid != IntPtr.Zero)
+                FreeSid(sid);
+            throw;
+        }
         var attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(), bInheritHandle = 1 };
         var (inParent, inChild) = Pipe(ref attributes, parentWrites: true);
         var (outParent, outChild) = Pipe(ref attributes, parentWrites: false);
@@ -214,6 +250,7 @@ public sealed class WindowsContainer : ISandboxProcess
         var jobs = Marshal.AllocHGlobal(IntPtr.Size);
         var environment = EnvironmentBlock(spec.Environment());
         var list = IntPtr.Zero;
+        var process = IntPtr.Zero;
         try
         {
             Marshal.StructureToPtr(new SECURITY_CAPABILITIES { AppContainerSid = sid }, capabilities, false);
@@ -221,12 +258,14 @@ public sealed class WindowsContainer : ISandboxProcess
             Marshal.WriteIntPtr(handles, IntPtr.Size, outChild);
             Marshal.WriteIntPtr(handles, 2 * IntPtr.Size, errChild);
             Marshal.WriteIntPtr(jobs, job);
+            var count = contained ? 3 : 2;
             nint size = 0;
-            InitializeProcThreadAttributeList(IntPtr.Zero, 3, 0, ref size);
+            InitializeProcThreadAttributeList(IntPtr.Zero, count, 0, ref size);
             list = Marshal.AllocHGlobal(size);
-            if (!InitializeProcThreadAttributeList(list, 3, 0, ref size))
+            if (!InitializeProcThreadAttributeList(list, count, 0, ref size))
                 throw new Win32Exception();
-            Attribute(list, AttributeSecurityCapabilities, capabilities, Marshal.SizeOf<SECURITY_CAPABILITIES>());
+            if (contained)
+                Attribute(list, AttributeSecurityCapabilities, capabilities, Marshal.SizeOf<SECURITY_CAPABILITIES>());
             // Only these three cross: the default inherits every inheritable handle in the brain.
             Attribute(list, AttributeHandleList, handles, 3 * IntPtr.Size);
             Attribute(list, AttributeJobList, jobs, IntPtr.Size);
@@ -243,15 +282,19 @@ public sealed class WindowsContainer : ISandboxProcess
                     ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment, environment, spec.RunFolder,
                     ref startup, out var created))
                 throw new Win32Exception();
+            process = created.hProcess;
             CloseHandle(created.hThread);
-            return new WindowsContainer(job, created.hProcess,
+            return new WindowsContainer(job, process,
                 new FileStream(new SafeFileHandle(inParent, true), FileAccess.Write, 1, false),
                 new FileStream(new SafeFileHandle(outParent, true), FileAccess.Read, 1, false),
-                new FileStream(new SafeFileHandle(errParent, true), FileAccess.Read, 1, false));
+                new FileStream(new SafeFileHandle(errParent, true), FileAccess.Read, 1, false),
+                contained ? "appcontainer" : "process", uncapped);
         }
         catch
         {
             CloseJob(job);
+            if (process != IntPtr.Zero)
+                CloseHandle(process);
             CloseHandle(inParent);
             CloseHandle(outParent);
             CloseHandle(errParent);
@@ -271,7 +314,8 @@ public sealed class WindowsContainer : ISandboxProcess
             Marshal.FreeHGlobal(handles);
             Marshal.FreeHGlobal(jobs);
             Marshal.FreeHGlobal(environment);
-            FreeSid(sid);
+            if (sid != IntPtr.Zero)
+                FreeSid(sid);
         }
     }
 
@@ -362,6 +406,13 @@ public sealed class WindowsContainer : ISandboxProcess
         public nuint ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+    {
+        public uint ControlFlags;
+        public uint CpuRate;
+    }
+
     [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
     static extern int CreateAppContainerProfile(string name, string display, string description, IntPtr capabilities, int count, out IntPtr sid);
 
@@ -402,7 +453,10 @@ public sealed class WindowsContainer : ISandboxProcess
     static extern bool SetInformationJobObject(IntPtr job, int kind, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION information, int size);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    static extern bool SetInformationJobObject(IntPtr job, int kind, ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION information, int size);
+
+    [DllImport("kernel32.dll")]
+    static extern int GetActiveProcessorCount(ushort group);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool TerminateJobObject(IntPtr job, uint code);
