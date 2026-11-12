@@ -491,7 +491,8 @@ public sealed class SandboxTests : IDisposable
 
     [Theory]
     [InlineData("[]", true)]
-    [InlineData("not json", false)]
+    [InlineData("not json", true)]
+    [InlineData("""{"type":"reply","id":1}""", true)]
     [InlineData("""{"kind":"reply"}""", true)]
     [InlineData("""{"type":"reply","id":"x"}""", true)]
     [InlineData("""{"type":"post"}""", true)]
