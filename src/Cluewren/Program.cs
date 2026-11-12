@@ -9,6 +9,7 @@ using Cluewren.Sandbox;
 const string Usage = """
     usage:
       cluewren connect claude|codex [--remove]   set up your own agent to use Cluewren
+      cluewren connect codex --approve-tools     the same, and Codex calls Cluewren's tools without asking
       cluewren mcp                               the MCP server your agent starts
       cluewren run <run folder> [seconds] [--project <folder>]
                                                  play <run folder>/harness.cs once, without an agent, in the
@@ -22,7 +23,13 @@ switch (args.FirstOrDefault())
         return await ServeMcp();
     case "connect" when args.Length >= 2 && args[1] is "claude" or "codex":
         var connect = new Connect(Console.WriteLine);
-        return args.Contains("--remove") ? connect.Remove(args[1]) : connect.Add(args[1]);
+        var approveTools = args.Contains("--approve-tools");
+        if (approveTools && (args[1] == "claude" || args.Contains("--remove")))
+        {
+            Console.Error.WriteLine(Usage);
+            return 2;
+        }
+        return args.Contains("--remove") ? connect.Remove(args[1]) : connect.Add(args[1], approveTools);
     case "describer":
         Console.WriteLine(Connect.DescriberInstructions());
         return 0;

@@ -19,7 +19,19 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         + "request (explore it, test it, verify a claim, reach a goal), then follow the INSTRUCTIONS.md it names. A long call answers "
         + "\"still going\": call wait for its result.";
 
-    static readonly HashSet<string> ReadOnly = ["wait", "snapshot", "frames"];
+    static readonly Dictionary<string, (string Title, bool ReadOnly, bool OpenWorld)> Hints = new()
+    {
+        ["start_run"] = ("Start a playtest run", false, true),
+        ["wait"] = ("Wait for the call still going", true, false),
+        ["probe"] = ("Probe the live game", false, true),
+        ["use_harness"] = ("Reuse an earlier harness", false, false),
+        ["check_harness"] = ("Check the harness", false, true),
+        ["run_harness"] = ("Play an episode with Jev", false, true),
+        ["snapshot"] = ("What the player sees", false, false),
+        ["restart_level"] = ("Restart the level", false, false),
+        ["frames"] = ("Frames of an episode", true, false),
+        ["report"] = ("Report the outcome", false, false),
+    };
 
     static readonly TimeSpan StopPatience = TimeSpan.FromSeconds(15);
 
@@ -155,14 +167,18 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     {
         var list = new JsonArray();
         foreach (var (name, description, schema) in Tools)
+        {
+            var (title, readOnly, openWorld) = Hints[name];
+            // A 2025-03-26 client reads the title from the annotations only; 2025-06-18 added the tool's own.
             list.Add(new JsonObject
             {
-                ["name"] = name, ["description"] = description, ["inputSchema"] = JsonNode.Parse(schema),
+                ["name"] = name, ["title"] = title, ["description"] = description, ["inputSchema"] = JsonNode.Parse(schema),
                 ["annotations"] = new JsonObject
                 {
-                    ["readOnlyHint"] = ReadOnly.Contains(name), ["destructiveHint"] = false, ["openWorldHint"] = false,
+                    ["title"] = title, ["readOnlyHint"] = readOnly, ["destructiveHint"] = !readOnly, ["openWorldHint"] = openWorld,
                 },
             });
+        }
         return list;
     }
 
