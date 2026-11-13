@@ -81,9 +81,15 @@ public sealed class BridgeServer : IAsyncDisposable
         }
         catch
         {
-            if (app is not null)
-                await app.DisposeAsync().ConfigureAwait(false);
-            scope.Dispose();
+            try
+            {
+                if (app is not null)
+                    await app.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                scope.Dispose();
+            }
             throw;
         }
     }
