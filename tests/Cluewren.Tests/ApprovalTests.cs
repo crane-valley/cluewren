@@ -115,7 +115,63 @@ public class CodexApprovalTests
     public void Command_or_args_this_editor_cannot_rewrite_are_left_to_the_user(string text)
     {
         Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command));
-        Assert.DoesNotContain("cluewren", Connect.CodexConfig(text, null));
+        Assert.Throws<FormatException>(() => Connect.CodexConfig(text.Replace("\"x\"", "\"C:/tools/cluewren.exe\""), Command));
+    }
+
+    [Theory]
+    [InlineData("[mcp_servers.\"cluewren\"]\nurl = \"https://example.com/mcp\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]\n[mcp_servers.cluewren.http_headers]\nX = \"y\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"node\"\nargs = [\"C:/srv/cluewren.js\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"serve\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren-helper.exe\"\nargs = [\"mcp\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\n  \"mcp\",\n]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\nenabled = false\n")]
+    [InlineData("[mcp_servers.cluewren.env]\nKEY = \"v\"\n")]
+    public void Remove_leaves_a_server_that_is_not_cluewrens(string text)
+    {
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, null));
+    }
+
+    [Theory]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"node\"\nargs = [\"C:/srv/cluewren.js\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"serve\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren-helper.exe\"\nargs = [\"mcp\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = ['mcp']\n")]
+    public void Connect_leaves_a_users_own_server_named_cluewren(string text)
+    {
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command));
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command, approve: true));
+    }
+
+    [Theory]
+    [InlineData("command = \"C:/Program Files/dotnet/dotnet.exe\"\nargs = [\"C:/src/bin/cluewren.dll\", \"mcp\"]\n")]
+    [InlineData("command = 'D:\\Other\\Cluewren.exe'\nargs = [\"mcp\"]\n")]
+    public void Connect_rewrites_cluewrens_own_table_in_either_install_shape(string owned)
+    {
+        Assert.Equal(Lines("[mcp_servers.\"cluewren\"]", "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]", "cwd = \"C:/Games\""),
+            Connect.CodexConfig("[mcp_servers.\"cluewren\"]\n" + owned + "cwd = \"C:/Games\"\n", Command));
+    }
+
+    [Theory]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = 'C:\\tools\\Cluewren.exe'\nargs = [\"mcp\"]\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/Program Files/dotnet/dotnet.exe\"\nargs = [\"C:/src/bin/cluewren.dll\", \"mcp\"]\n[mcp_servers.cluewren.env]\nCLUEWREN_SANDBOX = \"required\"\n")]
+    public void Remove_takes_out_cluewrens_server_in_either_install_shape(string text)
+    {
+        Assert.Equal("model = \"m\"\n", Connect.CodexConfig("model = \"m\"\n\n" + text, null));
+    }
+
+    [Theory]
+    [InlineData("[mcp_servers.\"cluewren\"]\nurl = \"https://example.com/mcp\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\nbearer_token_env_var = \"TOKEN\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\nenv_http_headers = { X = \"Y\" }\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\n[mcp_servers.\"cluewren\".http_headers]\nX = \"y\"\n")]
+    [InlineData("[mcp_servers.cluewren.http_headers]\nX = \"y\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\"]\nenabled = false\n")]
+    public void A_server_that_is_not_a_stdio_server_is_left_to_the_user(string text)
+    {
+        Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command));
+        Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command, approve: true));
     }
 
     [Fact]
@@ -142,7 +198,19 @@ public class ClaudeRegistrationTests
 
     const string User = "User config (available in all your projects)";
 
-    sealed class Claude(string get, int getCode = 0, Func<string[], int>? add = null)
+    internal static readonly string Saved = Path.Combine(Bridge.DiscoveryFile.DefaultFolder, "claude-cluewren-entry.json");
+
+    // The file lives in this machine's real Cluewren folder: one a real connect left there is its user's only copy of those settings.
+    internal sealed class UnlessSavedFactAttribute : FactAttribute
+    {
+        public UnlessSavedFactAttribute()
+        {
+            if (File.Exists(Saved))
+                Skip = $"{Saved} is there already (left by a real connect); this test would write over it";
+        }
+    }
+
+    sealed class Claude(string get, int getCode = 0, Func<string[], int>? add = null, string addSays = "")
     {
         public readonly List<string> Calls = [];
         public readonly List<string> Said = [];
@@ -153,7 +221,7 @@ public class ClaudeRegistrationTests
             return command[2] switch
             {
                 "get" => (getCode, get),
-                "add" => (add?.Invoke(command) ?? 0, ""),
+                "add" => (add?.Invoke(command) ?? 0, addSays),
                 _ => (0, ""),
             };
         }
@@ -172,17 +240,18 @@ public class ClaudeRegistrationTests
         Assert.Equal([Getting], claude.Calls);
     }
 
-    [Fact]
+    [UnlessSavedFact]
     public void An_older_cluewren_is_replaced_with_its_environment_carried_over()
     {
-        var claude = new Claude(Get(User, @"C:\Tools\Clue wren\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=required", "NOTE=a b", "EQ=x=y"));
+        var claude = new Claude(Get(User, @"C:\Tools\Clue wren\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=required", @"PATHS=C:\x;D:\y", "EQ=x=y"));
         Assert.True(claude.Register(Command));
         Assert.Equal([Getting, Removing,
-            $@"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|-e|NOTE=a b|-e|EQ=x=y|--|{Command[0]}|mcp"], claude.Calls);
+            $@"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|-e|PATHS=C:\x;D:\y|-e|EQ=x=y|--|{Command[0]}|mcp"], claude.Calls);
         Assert.DoesNotContain(claude.Said, said => said.Contains("required"));
+        Assert.False(File.Exists(Saved));
     }
 
-    [Fact]
+    [UnlessSavedFact]
     public void A_failed_add_puts_the_old_entry_back()
     {
         var claude = new Claude(Get(User, @"C:\Program Files\dotnet\dotnet.exe", @"C:\src\cluewren\bin\cluewren.dll mcp", "CLUEWREN_SANDBOX=required"),
@@ -193,15 +262,61 @@ public class ClaudeRegistrationTests
             @"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|--|C:\Program Files\dotnet\dotnet.exe|C:\src\cluewren\bin\cluewren.dll|mcp"],
             claude.Calls);
         Assert.Contains("back as it was", claude.Said[^1]);
+        Assert.False(File.Exists(Saved));
     }
 
-    [Fact]
-    public void When_putting_it_back_fails_too_the_exact_command_to_restore_it_is_printed()
+    [UnlessSavedFact]
+    public void An_earlier_saved_entry_is_never_written_over()
     {
-        var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=s3cret"), add: _ => 1);
-        Assert.False(claude.Register(Command));
-        Assert.Equal(4, claude.Calls.Count);
-        Assert.EndsWith(@"claude mcp add --scope user cluewren -e ""KEY=s3cret"" -- C:\Tools\cluewren.exe mcp", claude.Said[^1]);
+        var there = File.Exists(Saved);
+        try
+        {
+            if (!there)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Saved)!);
+                File.WriteAllText(Saved, "earlier");
+            }
+            var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=v"));
+            Assert.False(claude.Register(Command));
+            Assert.Equal([Getting], claude.Calls);
+            Assert.Contains(Saved, claude.Said[^1]);
+            Assert.Equal("earlier", File.ReadAllText(Saved));
+        }
+        finally
+        {
+            if (!there)
+                File.Delete(Saved);
+        }
+    }
+
+    [UnlessSavedFact]
+    public void No_environment_value_is_printed_and_one_that_could_not_be_put_back_is_kept_for_the_user_alone()
+    {
+        var there = File.Exists(Saved);
+        try
+        {
+            var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=s3cret"), add: _ => 1,
+                addSays: "Invalid environment variable format: KEY=s3cret");
+            Assert.False(claude.Register(Command));
+            Assert.Equal(4, claude.Calls.Count);
+            Assert.DoesNotContain(claude.Said, said => said.Contains("s3cret"));
+            Assert.Contains(Saved, claude.Said[^1]);
+            Assert.Contains(@"-e KEY=<value> -- C:\Tools\cluewren.exe mcp", claude.Said[^1]);
+            var saved = JsonNode.Parse(File.ReadAllText(Saved))!;
+            Assert.Equal(@"C:\Tools\cluewren.exe", saved["command"]!.GetValue<string>());
+            Assert.Equal("mcp", saved["args"]![0]!.GetValue<string>());
+            Assert.Equal("s3cret", saved["env"]!["KEY"]!.GetValue<string>());
+            if (OperatingSystem.IsWindows())
+            {
+                var rules = new FileInfo(Saved).GetAccessControl();
+                Assert.True(rules.AreAccessRulesProtected);
+            }
+        }
+        finally
+        {
+            if (!there)
+                File.Delete(Saved);
+        }
     }
 
     public static TheoryData<string> Unsafe => new()
@@ -212,6 +327,10 @@ public class ClaudeRegistrationTests
         Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=a") + "Warning: something else\n",
         Get("Local config (private to you in this project)", @"C:\Tools\cluewren.exe", "mcp"),
         "something this version of claude prints instead\n",
+        Get(User, @"C:\Tools\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=${POLICY}"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp", "NOTE=a b"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp", "NAME=\u00fc"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp", "LONG=" + new string('x', 601)),
     };
 
     [Theory]
