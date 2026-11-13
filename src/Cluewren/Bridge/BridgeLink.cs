@@ -13,33 +13,14 @@ public sealed class BridgeLink : IGameLink
 
     const int MaxFrameBytes = 16 * 1024 * 1024;
     const int MaxReplayFrames = 1024;
-    const long MaxReplayBytes = 8 << 20;
-
-    sealed class Outgoing(long id, byte[] frame, ChildBudget? owner)
-    {
-        public readonly long Id = id;
-        public readonly byte[] Frame = frame;
-        public readonly ChildBudget? Owner = owner;
-        public bool Dropped;
-
-        public void Release() => Owner?.Release(Frame.Length);
-    }
 
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonDocument>> _pending = new();
-    readonly Channel<bool> _wake = Channel.CreateBounded<bool>(
-        new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite, SingleReader = true });
+    readonly Channel<(long Id, byte[] Frame)> _outgoing =
+        Channel.CreateUnbounded<(long, byte[])>(new UnboundedChannelOptions { SingleReader = true });
     readonly Channel<JsonDocument> _messages = Channel.CreateUnbounded<JsonDocument>();
-    readonly Lock _queues = new();
-    readonly LinkedList<Outgoing> _outgoing = new();
-    readonly LinkedList<Outgoing> _sent = new();
-    readonly LinkedList<Outgoing> _replay = new();
-    readonly LinkedList<Outgoing> _unsent = new();
-    readonly List<Outgoing> _writing = new(1);
-    static readonly object BrainFrames = new();
-
-    // Per owner, so that a failed child's frames, which nobody replays, never make a resume look incomplete.
-    readonly Dictionary<object, long> _lostThrough = new();
-    long _sentBytes;
+    readonly Queue<(long Id, byte[] Frame)> _sent = new();
+    readonly Queue<(long Id, byte[] Frame)> _replay = new();
+    (long Id, byte[] Frame)? _unsent;
     long _nextId;
     long _gameTime = BitConverter.DoubleToInt64Bits(double.NaN);
     volatile string? _closed;
@@ -99,11 +80,12 @@ public sealed class BridgeLink : IGameLink
         var id = Interlocked.Increment(ref _nextId);
         var answer = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[id] = answer;
-        if (!Enqueue(id, EncodeRequest(id, op, args)))
+        if (_closed is { } why)
         {
             _pending.TryRemove(id, out _);
-            throw new GameDisconnectedException(_closed ?? "the harness child's session ended");
+            throw new GameDisconnectedException(why);
         }
+        _outgoing.Writer.TryWrite((id, EncodeRequest(id, op, args)));
         try
         {
             var document = await answer.Task.WaitAsync(timeout ?? DefaultTimeout, ct).ConfigureAwait(false);
@@ -145,7 +127,7 @@ public sealed class BridgeLink : IGameLink
             frame(json);
             json.WriteEndObject();
         }
-        Enqueue(0, buffer.WrittenSpan.ToArray());
+        _outgoing.Writer.TryWrite((0, buffer.WrittenSpan.ToArray()));
     }
 
     public void Post(string op, Action<Utf8JsonWriter>? args = null)
@@ -153,94 +135,8 @@ public sealed class BridgeLink : IGameLink
         if (_closed is null)
         {
             var id = Interlocked.Increment(ref _nextId);
-            Enqueue(id, EncodeRequest(id, op, args));
+            _outgoing.Writer.TryWrite((id, EncodeRequest(id, op, args)));
         }
-    }
-
-    bool Enqueue(long id, byte[] frame)
-    {
-        var owner = ChildBudget.Current;
-        lock (_queues)
-        {
-            if (_closed is not null || owner is { Ended: true })
-                return false;
-            if (owner is not null && !Charge(owner, frame.Length))
-            {
-                owner.Overran();
-                return false;
-            }
-            _outgoing.AddLast(new Outgoing(id, frame, owner));
-        }
-        _wake.Writer.TryWrite(true);
-        return true;
-    }
-
-    public bool Reserve(ChildBudget owner, long bytes)
-    {
-        lock (_queues)
-            if (Charge(owner, bytes))
-                return true;
-        owner.Overran();
-        return false;
-    }
-
-    // A frame already written is kept only for a replay: this child's go first, oldest first, so a child that sends
-    // many small messages is never ended by what is kept for a replay.
-    bool Charge(ChildBudget owner, long bytes)
-    {
-        while (!owner.TryAdd(bytes))
-        {
-            var kept = _sent.First;
-            while (kept is not null && kept.Value.Owner != owner)
-                kept = kept.Next;
-            if (kept is null)
-                return false;
-            Evict(kept);
-        }
-        return true;
-    }
-
-    void Evict(LinkedListNode<Outgoing> kept)
-    {
-        _sent.Remove(kept);
-        _sentBytes -= kept.Value.Frame.Length;
-        var key = (object?)kept.Value.Owner ?? BrainFrames;
-        _lostThrough[key] = _lostThrough.TryGetValue(key, out var lost) ? Math.Max(lost, kept.Value.Id) : kept.Value.Id;
-        kept.Value.Release();
-    }
-
-    // Nothing a failed child asked for goes out or comes back on a resume, except a frame already on the socket, which
-    // finishes and is not kept.
-    public void Drop(ChildBudget owner)
-    {
-        lock (_queues)
-        {
-            Remove(_outgoing, owner);
-            Remove(_replay, owner);
-            Remove(_unsent, owner);
-            _sentBytes -= Remove(_sent, owner);
-            _lostThrough.Remove(owner);
-            foreach (var frame in _writing)
-                if (frame.Owner == owner)
-                    frame.Dropped = true;
-        }
-    }
-
-    static long Remove(LinkedList<Outgoing> frames, ChildBudget? owner)
-    {
-        long removed = 0;
-        for (var node = frames.First; node is not null;)
-        {
-            var next = node.Next;
-            if (owner is null || node.Value.Owner == owner)
-            {
-                frames.Remove(node);
-                removed += node.Value.Frame.Length;
-                node.Value.Release();
-            }
-            node = next;
-        }
-        return removed;
     }
 
     static byte[] EncodeRequest(long id, string op, Action<Utf8JsonWriter>? args)
@@ -291,47 +187,16 @@ public sealed class BridgeLink : IGameLink
         {
             while (true)
             {
-                Outgoing? frame = null;
-                ValueTask write = default;
-                // Taken and begun in one step: a Drop finds the frame either still queued or with its write begun.
-                lock (_queues)
-                {
-                    if ((_replay.First ?? _outgoing.First) is { } next)
-                    {
-                        next.List!.Remove(next);
-                        frame = next.Value;
-                        _writing.Add(frame);
-                        write = Begin(socket, frame.Frame, ct);
-                    }
-                }
-                if (frame is null)
-                {
-                    if (!await _wake.Reader.WaitToReadAsync(ct).ConfigureAwait(false))
-                        return;
-                    _wake.Reader.TryRead(out _);
-                    continue;
-                }
-                var sent = false;
-                try
-                {
-                    await write.ConfigureAwait(false);
-                    sent = true;
-                }
-                finally
-                {
-                    lock (_queues)
-                    {
-                        _writing.Remove(frame);
-                        if (frame.Dropped)
-                            frame.Release();
-                        else if (sent)
-                            Keep(frame);
-                        else
-                            // Held until sent: a Unity script reload can drop the socket mid-send, and the frame then
-                            // goes out on the resumed connection.
-                            _unsent.AddLast(frame);
-                    }
-                }
+                // Held until sent: a Unity script reload can drop the socket mid-send, and the frame then goes out on
+                // the resumed connection.
+                _unsent ??= _replay.TryDequeue(out var replayed)
+                    ? replayed
+                    : await _outgoing.Reader.ReadAsync(ct).ConfigureAwait(false);
+                await socket.SendAsync(_unsent.Value.Frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+                _sent.Enqueue(_unsent.Value);
+                if (_sent.Count > MaxReplayFrames)
+                    _sent.Dequeue();
+                _unsent = null;
             }
         }
         catch (Exception e) when (e is WebSocketException or OperationCanceledException or ChannelClosedException)
@@ -339,55 +204,19 @@ public sealed class BridgeLink : IGameLink
         }
     }
 
-    static ValueTask Begin(WebSocket socket, byte[] frame, CancellationToken ct)
-    {
-        try
-        {
-            return socket.SendAsync(frame.AsMemory(), WebSocketMessageType.Text, true, ct);
-        }
-        catch (Exception e)
-        {
-            return ValueTask.FromException(e);
-        }
-    }
-
-    void Keep(Outgoing frame)
-    {
-        _sent.AddLast(frame);
-        _sentBytes += frame.Frame.Length;
-        while (_sent.Count > MaxReplayFrames || _sentBytes > MaxReplayBytes)
-            Evict(_sent.First!);
-    }
-
-    // A frame the plugin had not taken yet and the link let go to stay bounded makes the resume incomplete.
-    internal bool CanResume(long received)
-    {
-        lock (_queues)
-            return _lostThrough.Values.All(lost => lost <= received);
-    }
-
     // A send can succeed after the plugin's 1012 close left it, while the socket still reads Open, so only the plugin
     // knows what arrived. Runs between pumps: no send loop is alive.
     internal void Rewind(long received)
     {
-        lock (_queues)
+        foreach (var frame in _sent)
         {
-            foreach (var frame in _sent)
-            {
-                if (frame.Id > received)
-                    _replay.AddLast(frame);
-                else
-                    frame.Release();
-            }
-            _sent.Clear();
-            _sentBytes = 0;
-            foreach (var frame in _unsent)
-                _replay.AddLast(frame);
-            _unsent.Clear();
-            foreach (var (key, lost) in _lostThrough.ToList())
-                if (lost <= received)
-                    _lostThrough.Remove(key);
+            if (frame.Id > received)
+                _replay.Enqueue(frame);
         }
+        _sent.Clear();
+        if (_unsent is { } unsent)
+            _replay.Enqueue(unsent);
+        _unsent = null;
     }
 
     void Feed(JsonDocument frame)
@@ -419,18 +248,7 @@ public sealed class BridgeLink : IGameLink
     internal void Close(string why)
     {
         _closed ??= why;
-        lock (_queues)
-        {
-            Remove(_outgoing, null);
-            Remove(_replay, null);
-            Remove(_unsent, null);
-            Remove(_sent, null);
-            _sentBytes = 0;
-            _lostThrough.Clear();
-            foreach (var frame in _writing)
-                frame.Dropped = true;
-        }
-        _wake.Writer.TryComplete();
+        _outgoing.Writer.TryComplete();
         _messages.Writer.TryComplete();
         foreach (var pending in _pending.Values)
             pending.TrySetException(new GameDisconnectedException(why));
@@ -471,79 +289,5 @@ public sealed class BridgeLink : IGameLink
         {
             ArrayPool<byte>.Shared.Return(chunk);
         }
-    }
-}
-
-public sealed class ChildBudget(int maxItems, long maxBytes)
-{
-    [ThreadStatic] static ChildBudget? t_current;
-
-    readonly Lock _lock = new();
-    int _items;
-    long _bytes;
-    volatile bool _ended;
-    volatile bool _overrun;
-
-    public static ChildBudget? Current => t_current;
-
-    public int Items
-    {
-        get
-        {
-            lock (_lock)
-                return _items;
-        }
-    }
-
-    public long Bytes
-    {
-        get
-        {
-            lock (_lock)
-                return _bytes;
-        }
-    }
-
-    public bool Ended => _ended;
-
-    public bool Overrun => _overrun;
-
-    public void End() => _ended = true;
-
-    public void Overran() => _overrun = true;
-
-    public bool TryAdd(long bytes)
-    {
-        lock (_lock)
-        {
-            if (_items >= maxItems || _bytes + bytes > maxBytes)
-                return false;
-            _items++;
-            _bytes += bytes;
-            return true;
-        }
-    }
-
-    public void Release(long bytes)
-    {
-        lock (_lock)
-        {
-            _items--;
-            _bytes -= bytes;
-        }
-    }
-
-    // The child's messages reach the link through IGameLink and the host's status callback, which carry no owner: what
-    // a link queues on this thread while the scope lasts is charged here.
-    public Scope Charge()
-    {
-        var previous = t_current;
-        t_current = this;
-        return new Scope(previous);
-    }
-
-    public readonly struct Scope(ChildBudget? previous) : IDisposable
-    {
-        public void Dispose() => t_current = previous;
     }
 }

@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Text.Json;
-using Cluewren.Bridge;
 using Cluewren.Jev;
 using Cluewren.Kit;
 
@@ -49,7 +48,6 @@ public sealed class SandboxSession : IDisposable
     readonly Action<string> _say;
     readonly LineWriter _out;
     readonly Dictionary<long, TaskCompletionSource<Line?>> _calls = new();
-    readonly ChildBudget _held = new(MaxHeldItems, MaxHeldBytes);
     readonly CancellationTokenSource _closing = new();
     readonly Action<JsonElement> _forward;
     // Orders call registration, reply delivery, accepting what the child forwards, and the end of the session.
@@ -57,8 +55,11 @@ public sealed class SandboxSession : IDisposable
     readonly Lock _ending = new();
     readonly Queue<(string Text, int Bytes)> _statuses = new();
     long _ids;
+    int _heldItems;
+    long _heldBytes;
     bool _ended;
     bool _saying;
+    bool _overrun;
     int _disposed;
     string? _failure;
 
@@ -165,7 +166,7 @@ public sealed class SandboxSession : IDisposable
                     Fail($"the child broke the protocol ({e.GetType().Name}: {e.Message})");
                     return;
                 }
-                if (_held.Overrun)
+                if (_overrun)
                 {
                     Fail($"the child had the brain hold more than {MaxHeldItems} messages or {MaxHeldBytes >> 20} MB for it");
                     return;
@@ -189,9 +190,11 @@ public sealed class SandboxSession : IDisposable
         lock (_gate)
         {
             _ended = true;
-            _held.End();
             while (_statuses.TryDequeue(out var status))
-                _held.Release(status.Bytes);
+            {
+                _heldItems--;
+                _heldBytes -= status.Bytes;
+            }
             var calls = _calls.Values.ToList();
             _calls.Clear();
             return calls;
@@ -202,7 +205,6 @@ public sealed class SandboxSession : IDisposable
     {
         Interlocked.CompareExchange(ref _failure, why, null);
         var calls = End();
-        (_link as BridgeLink)?.Drop(_held);
         // Under the lock Dispose takes: a job handle closed and reused by the next child must never be killed from here.
         lock (_ending)
             if (_disposed == 0)
@@ -221,17 +223,29 @@ public sealed class SandboxSession : IDisposable
     bool Admit(Line line)
     {
         lock (_gate)
-            return !_ended && Reserve(line.Length);
+            return !_ended && Hold(line.Length);
     }
 
-    bool Reserve(long bytes)
+    // Under the gate. What the session holds for the child: requests being served and statuses waiting to be shown.
+    bool Hold(int bytes)
     {
-        if (_link is BridgeLink bridge)
-            return bridge.Reserve(_held, bytes);
-        if (_held.TryAdd(bytes))
-            return true;
-        _held.Overran();
-        return false;
+        if (_heldItems >= MaxHeldItems || _heldBytes + bytes > MaxHeldBytes)
+        {
+            _overrun = true;
+            return false;
+        }
+        _heldItems++;
+        _heldBytes += bytes;
+        return true;
+    }
+
+    void Let(int bytes)
+    {
+        lock (_gate)
+        {
+            _heldItems--;
+            _heldBytes -= bytes;
+        }
     }
 
     static string Text(JsonElement root, string name) =>
@@ -266,10 +280,7 @@ public sealed class SandboxSession : IDisposable
                 var op = Text(root, "op");
                 if (!Admit(line))
                     break;
-                Task handler;
-                using (_held.Charge())
-                    handler = ServeRequest(rid, op, root);
-                _ = Serve(handler, line);
+                _ = Serve(ServeRequest(rid, op, root), line);
                 return;
             }
             case "post":
@@ -278,17 +289,20 @@ public sealed class SandboxSession : IDisposable
                 var args = root.TryGetProperty("args", out var posted) ? posted : default;
                 lock (_gate)
                     if (!_ended)
-                        using (_held.Charge())
-                            _link.Post(op, json => WriteFields(json, args));
+                        _link.Post(op, json => WriteFields(json, args));
                 break;
             }
             case "send":
             {
                 var frame = root.GetProperty("frame");
+                // A request takes its id from the brain (req, post): a raw one could answer for the brain's own.
+                if (frame.ValueKind == JsonValueKind.Object)
+                    foreach (var field in frame.EnumerateObject())
+                        if (field.NameEquals("type") && field.Value.ValueEquals("request"))
+                            throw new FormatException("a raw frame that claims to be a request");
                 lock (_gate)
                     if (!_ended)
-                        using (_held.Charge())
-                            _link.Send(json => WriteFields(json, frame));
+                        _link.Send(json => WriteFields(json, frame));
                 break;
             }
             case "status":
@@ -297,7 +311,7 @@ public sealed class SandboxSession : IDisposable
                 bool start;
                 lock (_gate)
                 {
-                    if (_ended || !Reserve(line.Length))
+                    if (_ended || !Hold(line.Length))
                         break;
                     _statuses.Enqueue((text, line.Length));
                     start = !_saying;
@@ -339,8 +353,7 @@ public sealed class SandboxSession : IDisposable
             }
             try
             {
-                using (_held.Charge())
-                    _say(status.Text);
+                _say(status.Text);
             }
             catch (Exception e)
             {
@@ -348,7 +361,7 @@ public sealed class SandboxSession : IDisposable
             }
             finally
             {
-                _held.Release(status.Bytes);
+                Let(status.Bytes);
             }
         }
     }
@@ -365,7 +378,7 @@ public sealed class SandboxSession : IDisposable
         }
         finally
         {
-            _held.Release(line.Length);
+            Let(line.Length);
             line.Dispose();
         }
     }

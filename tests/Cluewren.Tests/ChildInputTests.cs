@@ -1,9 +1,7 @@
 using System.Buffers;
-using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
-using Cluewren.Bridge;
 using Cluewren.Jev;
 using Cluewren.Kit;
 using Cluewren.Sandbox;
@@ -223,6 +221,19 @@ sealed class RecordingLink : IGameLink
     {
         lock (_posts)
             _posts.Add(op);
+    }
+
+    public void Send(Action<Utf8JsonWriter> frame)
+    {
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            frame(json);
+            json.WriteEndObject();
+        }
+        lock (_posts)
+            _posts.Add("send " + Encoding.UTF8.GetString(buffer.WrittenSpan));
     }
 }
 
@@ -457,97 +468,65 @@ public sealed class ChildInputTests : IDisposable
         await Until(() => jev.Cancelled == jev.Asked);
     }
 
-    [Theory]
-    [InlineData("post")]
-    [InlineData("send")]
-    [InlineData("req")]
-    public async Task A_flood_while_the_plugin_is_away_ends_the_session_and_drops_what_it_queued(string kind)
+    // Before: requests were served at once whatever their number, each holding its line and its game request.
+    [Fact]
+    public async Task A_flood_of_requests_ends_the_session_at_the_budget_and_cancels_what_it_asked()
     {
-        await using var server = await BridgeServer.StartAsync(LinkRetentionTests.Secret);
-        var first = await FakePlugin.ConnectAsync(server.Url, LinkRetentionTests.Secret);
-        var link = await server.NextLinkAsync();
         var child = new ScriptedChild();
+        var link = new RecordingLink();
         using var session = Start(child, link);
-        first.Socket.Abort();
-        await first.DisposeAsync();
-        var pad = new string('x', 8000);
-        const int count = 4000;
-        for (var i = 1; i <= count; i++)
-            child.Out.Write(kind switch
-            {
-                "post" => $$$"""{"type":"post","op":"key","args":{"n":{{{i}}},"pad":"{{{pad}}}"}}""",
-                "send" => $$$"""{"type":"send","frame":{"type":"note","n":{{{i}}},"pad":"{{{pad}}}"}}""",
-                _ => $$$"""{"type":"req","rid":{{{i}}},"op":"pose","args":{"n":{{{i}}},"pad":"{{{pad}}}"}}""",
-            } + "\n");
+        var flood = new StringBuilder();
+        for (var i = 1; i <= 2000; i++)
+            flood.Append($$"""{"type":"req","rid":{{i}},"op":"pose","args":{} }""").Append('\n');
+        child.Out.Write(flood.ToString());
         await child.KillStarted.Task.WaitAsync(Patience);
         var failed = await Assert.ThrowsAsync<SandboxException>(
             () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
         Assert.Contains("hold more than", failed.Message);
-        await using var second = await LinkRetentionTests.ResumeAsync(server.Url, first.Session);
-        link.Send(json => json.WriteString("type", "marker"));
-        var received = 0;
-        while (true)
-        {
-            using var frame = await LinkRetentionTests.ReceiveAsync(second.Socket);
-            if (frame.RootElement.GetProperty("type").GetString() == "marker")
-                break;
-            received++;
-        }
-        Assert.Equal(0, received);
+        await link.Abandoned.Task.WaitAsync(Patience);
     }
 
+    // Before: statuses were shown one by one on the reader, and a host that showed them slowly held up everything else;
+    // now they wait in the session's queue, which counts on the budget.
     [Fact]
-    public async Task More_small_posts_than_the_budget_holds_all_reach_a_plugin_that_reads_and_the_session_lives()
+    public async Task A_flood_of_statuses_behind_a_slow_host_ends_the_session_at_the_budget()
     {
-        await using var server = await BridgeServer.StartAsync(LinkRetentionTests.Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, LinkRetentionTests.Secret);
-        var link = await server.NextLinkAsync();
         var child = new ScriptedChild();
-        using var session = Start(child, link);
-        for (var i = 1; i <= 2000; i++)
+        using var release = new ManualResetEventSlim();
+        var session = new SandboxSession(child, new RecordingLink(), null, () => true, null, _ => release.Wait(Patience), _log);
+        try
         {
-            child.Out.Write($$$"""{"type":"post","op":"key","args":{"n":{{{i}}}}}""" + "\n");
-            using var frame = await LinkRetentionTests.ReceiveAsync(plugin.Socket);
-            Assert.Equal(i, frame.RootElement.GetProperty("args").GetProperty("n").GetInt32());
+            var flood = new StringBuilder();
+            for (var i = 1; i <= 2000; i++)
+                flood.Append($$"""{"type":"status","text":"step {{i}}"}""").Append('\n');
+            child.Out.Write(flood.ToString());
+            await child.KillStarted.Task.WaitAsync(Patience);
+            var failed = await Assert.ThrowsAsync<SandboxException>(
+                () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
+            Assert.Contains("hold more than", failed.Message);
         }
-        Assert.Equal("pong", await Ping(session, child));
-        Assert.DoesNotContain("kill", child.Events);
+        finally
+        {
+            release.Set();
+            session.Dispose();
+        }
     }
 
-    // Before: after Fail the failed child's posts still sat in the link and went out again on a resume.
+    // Before: a raw frame typed as a request reached the plugin with an id the child chose, which can answer for one of
+    // the brain's own requests.
     [Fact]
-    public async Task After_a_failure_a_resume_replays_none_of_the_failed_sessions_frames()
+    public async Task A_raw_frame_that_claims_to_be_a_request_ends_the_session_and_is_not_sent()
     {
-        await using var server = await BridgeServer.StartAsync(LinkRetentionTests.Secret);
-        var first = await FakePlugin.ConnectAsync(server.Url, LinkRetentionTests.Secret);
-        var link = await server.NextLinkAsync();
         var child = new ScriptedChild();
+        var link = new RecordingLink();
         using var session = Start(child, link);
-        link.Post("brain", json => json.WriteNumber("n", 1));
-        child.Out.Write("""{"type":"post","op":"child","args":{"n":2}}""" + "\n");
-        using (await LinkRetentionTests.ReceiveAsync(first.Socket))
-        using (await LinkRetentionTests.ReceiveAsync(first.Socket))
-        {
-        }
-        link.Post("brain", json => json.WriteNumber("n", 3));
-        using (await LinkRetentionTests.ReceiveAsync(first.Socket))
-        {
-        }
-        first.Socket.Abort();
-        await first.DisposeAsync();
-        child.Out.Write(Broken);
+        child.Out.Write("""{"type":"send","frame":{"type":"note","n":1}}""" + "\n"
+                        + """{"type":"send","frame":{"type":"request","id":1,"op":"key","args":{}}}""" + "\n");
         await child.KillStarted.Task.WaitAsync(Patience);
-        await using var second = await LinkRetentionTests.ResumeAsync(server.Url, first.Session);
-        link.Send(json => json.WriteString("type", "marker"));
-        var replayed = new List<string>();
-        while (true)
-        {
-            using var frame = await LinkRetentionTests.ReceiveAsync(second.Socket);
-            if (frame.RootElement.GetProperty("type").GetString() == "marker")
-                break;
-            replayed.Add(frame.RootElement.GetProperty("op").GetString()!);
-        }
-        Assert.Equal(["brain", "brain"], replayed);
+        var failed = await Assert.ThrowsAsync<SandboxException>(
+            () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
+        Assert.Contains("claims to be a request", failed.Message);
+        Assert.Equal(["""send {"type":"note","n":1}"""], link.Posts);
     }
 
     // Before, the status callback ran under the gate on the reader: a callback that blocked kept the failure from ever
@@ -594,141 +573,6 @@ public sealed class ChildInputTests : IDisposable
         using var session = Start(child, new RecordingLink());
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => session.Call("ping", null, seconds, CancellationToken.None));
         Assert.Equal("pong", await Ping(session, child));
-    }
-}
-
-public class LinkRetentionTests
-{
-    internal static readonly byte[] Secret = Handshake.NewSecret();
-
-    internal static async Task<JsonDocument> ReceiveAsync(WebSocket socket)
-    {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var message = new MemoryStream();
-        var buffer = new byte[64 * 1024];
-        while (true)
-        {
-            var result = await socket.ReceiveAsync(buffer, timeout.Token);
-            message.Write(buffer, 0, result.Count);
-            if (result.EndOfMessage)
-                return JsonDocument.Parse(message.ToArray());
-        }
-    }
-
-    internal static async Task<FakePlugin> ResumeAsync(string url, string session)
-    {
-        for (var i = 0; i < 200; i++)
-        {
-            var plugin = await FakePlugin.ConnectAsync(url, Secret, resume: session);
-            if (plugin.Session == session)
-                return plugin;
-            await plugin.DisposeAsync();
-            await Task.Delay(10);
-        }
-        throw new TimeoutException("the session was never resumable");
-    }
-
-    static async Task Marker(BridgeLink link, WebSocket socket, Action<JsonElement>? seen = null)
-    {
-        link.Send(json => json.WriteString("type", "marker"));
-        while (true)
-        {
-            using var frame = await ReceiveAsync(socket);
-            if (frame.RootElement.GetProperty("type").GetString() == "marker")
-                return;
-            seen?.Invoke(frame.RootElement);
-        }
-    }
-
-    [Fact]
-    public async Task What_is_kept_for_a_replay_after_sending_stays_under_the_byte_cap()
-    {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
-        var link = await server.NextLinkAsync();
-        var budget = new ChildBudget(100000, 1L << 40);
-        var pad = new string('x', 64 * 1024);
-        for (var i = 0; i < 300; i++)
-            using (budget.Charge())
-                link.Post("big", json => json.WriteString("pad", pad));
-        var received = 0;
-        await Marker(link, plugin.Socket, _ => received++);
-        Assert.Equal(300, received);
-        Assert.InRange(budget.Bytes, 1, 8 << 20);
-    }
-
-    [Fact]
-    public async Task What_is_kept_for_a_replay_after_sending_stays_under_the_frame_window()
-    {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
-        var link = await server.NextLinkAsync();
-        var budget = new ChildBudget(100000, 1L << 40);
-        for (var i = 0; i < 3000; i++)
-            using (budget.Charge())
-                link.Post("small", json => json.WriteNumber("n", i));
-        var received = 0;
-        await Marker(link, plugin.Socket, _ => received++);
-        Assert.Equal(3000, received);
-        Assert.InRange(budget.Items, 1, 1024);
-    }
-
-    // The reader of a session passed its ended check, then the session failed: what it forwards afterwards is refused.
-    [Fact]
-    public async Task A_link_refuses_what_an_ended_session_forwards()
-    {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
-        var link = await server.NextLinkAsync();
-        var budget = new ChildBudget(16, 1 << 20);
-        Assert.False(budget.Ended);
-        budget.End();
-        link.Drop(budget);
-        Task<GameAnswer> asked;
-        using (budget.Charge())
-        {
-            link.Post("key", json => json.WriteString("key", "W"));
-            link.Send(json => json.WriteString("type", "note"));
-            asked = link.RequestAsync("pose");
-        }
-        await Assert.ThrowsAsync<GameDisconnectedException>(() => asked);
-        var seen = new List<string>();
-        await Marker(link, plugin.Socket, frame => seen.Add(frame.GetRawText()));
-        Assert.Empty(seen);
-        Assert.Equal((0, 0L), (budget.Items, budget.Bytes));
-    }
-
-    // No barrier can hold the write: Kestrel takes a whole frame without waiting for the peer, so the Drop lands during
-    // the copy or after it. Either way the frame arrives whole, its charge is released once, and nothing keeps it.
-    [Fact]
-    public async Task A_drop_racing_a_frame_write_lets_it_arrive_whole_releases_it_once_and_keeps_it_nowhere()
-    {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
-        var link = await server.NextLinkAsync();
-        var budget = new ChildBudget(16, 1L << 30);
-        var pad = new string('x', 15 << 20);
-        using (budget.Charge())
-            link.Send(json =>
-            {
-                json.WriteString("type", "big");
-                json.WriteString("pad", pad);
-            });
-        var buffer = new byte[64 * 1024];
-        var first = await plugin.Socket.ReceiveAsync(buffer, CancellationToken.None);
-        Assert.False(first.EndOfMessage);
-        link.Drop(budget);
-        var length = (long)first.Count;
-        while (true)
-        {
-            var part = await plugin.Socket.ReceiveAsync(buffer, CancellationToken.None);
-            length += part.Count;
-            if (part.EndOfMessage)
-                break;
-        }
-        Assert.True(length > 15 << 20);
-        await Marker(link, plugin.Socket);
-        Assert.Equal((0, 0L), (budget.Items, budget.Bytes));
     }
 }
 
