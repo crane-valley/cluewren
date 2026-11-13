@@ -613,6 +613,33 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         Assert.Contains("failed the proof", McpServer.NoEditorText(server, 60));
     }
 
+    // Regression: the start-map preflight child was relayed to the editor's link, so a harness could start the game
+    // before its project was checked.
+    [Fact]
+    public async Task A_harness_that_reaches_for_the_game_in_the_preflight_reaches_nothing_and_does_not_run()
+    {
+        var foo = Folder("Foo");
+        var runFolder = Folder("run");
+        await File.WriteAllTextAsync(Path.Combine(runFolder, "harness.cs"), """
+            class A : Harness
+            {
+                public A()
+                {
+                    var line = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"post\",\"op\":\"session\",\"args\":{\"action\":\"start\"}}\n");
+                    var output = System.Console.OpenStandardOutput();
+                    output.Write(line, 0, line.Length);
+                    output.Flush();
+                }
+            }
+            """);
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+        var link = await server.NextLinkAsync();
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Assert.Equal(1, await RunCommand.PlayAsync(link, runFolder, 1, SandboxMode.Auto, limit.Token));
+        await AssertNothingMoreAsync(plugin);
+    }
+
     // Regression: the stored file id was kept without its folder held open, and Windows may give a deleted folder's id to
     // another one. An open handle shows as a parent that can't be renamed; the id reuse itself can't be provoked here.
     [Fact]

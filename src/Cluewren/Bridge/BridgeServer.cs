@@ -60,20 +60,32 @@ public sealed class BridgeServer : IAsyncDisposable
 
     public event Action<string>? Refusing;
 
+    // The server owns the scope from this call on, also when it fails to start: the caller gets nothing to dispose.
     public static async Task<BridgeServer> StartAsync(byte[] secret, ProjectScope scope, TimeSpan? resumeWindow = null)
     {
-        var builder = WebApplication.CreateSlimBuilder();
-        builder.Logging.ClearProviders();
-        builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
-        var app = builder.Build();
-        var server = new BridgeServer(secret, scope, resumeWindow ?? TimeSpan.FromSeconds(90), app);
-        app.UseWebSockets();
-        app.Map("/v1/bridge", server.HandleAsync);
-        await app.StartAsync().ConfigureAwait(false);
-        var address = app.Services.GetRequiredService<Microsoft.AspNetCore.Hosting.Server.IServer>()
-            .Features.Get<IServerAddressesFeature>()!.Addresses.First();
-        server.Url = $"ws://127.0.0.1:{new Uri(address).Port}/v1/bridge";
-        return server;
+        WebApplication? app = null;
+        try
+        {
+            var builder = WebApplication.CreateSlimBuilder();
+            builder.Logging.ClearProviders();
+            builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
+            app = builder.Build();
+            var server = new BridgeServer(secret, scope, resumeWindow ?? TimeSpan.FromSeconds(90), app);
+            app.UseWebSockets();
+            app.Map("/v1/bridge", server.HandleAsync);
+            await app.StartAsync().ConfigureAwait(false);
+            var address = app.Services.GetRequiredService<Microsoft.AspNetCore.Hosting.Server.IServer>()
+                .Features.Get<IServerAddressesFeature>()!.Addresses.First();
+            server.Url = $"ws://127.0.0.1:{new Uri(address).Port}/v1/bridge";
+            return server;
+        }
+        catch
+        {
+            if (app is not null)
+                await app.DisposeAsync().ConfigureAwait(false);
+            scope.Dispose();
+            throw;
+        }
     }
 
     public ValueTask<BridgeLink> NextLinkAsync(CancellationToken ct = default) => _connected.Reader.ReadAsync(ct);
@@ -253,9 +265,18 @@ public sealed class BridgeServer : IAsyncDisposable
                 return (resumable, hello);
             }
             var link = new BridgeLink(session, root) { Project = verified };
-            kept = true;
             _sessions[session] = link;
-            await _connected.Writer.WriteAsync(link, deadline.Token).ConfigureAwait(false);
+            try
+            {
+                await _connected.Writer.WriteAsync(link, deadline.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                _sessions.TryRemove(session, out _);
+                End(link, "the editor's hand-over to the run didn't finish");
+                throw;
+            }
+            kept = true;
             return (link, hello);
         }
         catch (Exception e) when (e is WebSocketException or OperationCanceledException or JsonException
@@ -366,12 +387,18 @@ public sealed class BridgeServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await _stopping.CancelAsync().ConfigureAwait(false);
-        foreach (var link in _sessions.Values)
-            End(link, "the agent service stopped");
-        await _app.StopAsync().ConfigureAwait(false);
-        await _app.DisposeAsync().ConfigureAwait(false);
-        Scope.Dispose();
-        _stopping.Dispose();
+        try
+        {
+            await _stopping.CancelAsync().ConfigureAwait(false);
+            foreach (var link in _sessions.Values)
+                End(link, "the agent service stopped");
+            await _app.StopAsync().ConfigureAwait(false);
+            await _app.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            Scope.Dispose();
+            _stopping.Dispose();
+        }
     }
 }

@@ -56,15 +56,19 @@ brain.json.
 - Each stored identity keeps its folder's handle open, because Windows may give a deleted folder's file id to another
   folder once no handle is open. The handle is opened as for the comparison (read attributes, backup semantics,
   sharing read, write and delete), so the user can still delete the folder or rename it; renaming a folder above it
-  is refused while the handle is open. The run's folder is held from the start of the run until its bridge closes. An
+  is refused while the handle is open. The run's folder is held from the start of the run until its bridge closes; the
+  bridge owns it from the moment it is asked to start, so a bridge that fails to start or to stop still lets it go. An
   editor's folder is held from its verified hello until its link ends: a normal close, the resume window running out
-  or the bridge closing. A hello refused after its folder was opened lets it go at once.
+  or the bridge closing. A hello refused after its folder was opened, or one whose hand-over to the run doesn't finish,
+  lets it go at once.
 - The game is started and its project confirmed before anything else. The game's `context.project_dir` must be the
   verified folder before the game starts and again once it runs (Godot answers from the editor until then), and the
   verified path must still lead to it. Only then is the memory folder made, recording started and run_started sent.
   start_run and `cluewren run` share this step, and `cluewren run` takes it before any harness starts. start_run
   starts its `level`. `cluewren run` starts its harness's StartMap, read in the sandbox child so that the harness is
-  never made in the brain's process; a harness that doesn't load stops it before the game starts. A later restart,
+  never made in the brain's process. That child's session reaches no game: every request, post, send or status it
+  makes is refused, and a harness that tries is reported as not loading. A harness that doesn't load stops the run
+  before the game starts. A later restart,
   with another map too, happens in the game the verified editor started, from that editor's project, and is not
   checked again.
 - Limits: at most 8 handshakes in progress, further connections are answered 503 before the upgrade. A hello of exactly
