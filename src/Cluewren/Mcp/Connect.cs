@@ -1,10 +1,8 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
-using Cluewren.Bridge;
 
 namespace Cluewren.Mcp;
 
@@ -44,19 +42,10 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
     const string ApprovalLine = "default_tools_approval_mode = \"approve\"";
     const string ApprovalMark = $"# {Mark} --approve-tools: Codex calls these tools without asking you first";
     const string OldApprovalMark = "# (its tools reach only the game open in the editor and the game's memory folder)";
-    static readonly string[] Owned = ["command", "args", "default_tools_approval_mode"];
+    static readonly string[] OwnedKeys = ["command", "args", "default_tools_approval_mode"];
 
     // Codex 0.167.2 refuses each of these next to command ("... is not supported for stdio").
     static readonly string[] HttpOnly = ["url", "bearer_token_env_var", "bearer_token", "http_headers", "env_http_headers", "oauth_resource"];
-
-    [GeneratedRegex("^    [A-Za-z_][A-Za-z0-9_]*=")]
-    private static partial Regex EnvSetting();
-
-    // Only what `claude mcp get` (2.1.322) was seen to show exactly: it shows ${A:-b} as ${A}, trims trailing spaces and shows a line
-    // break or tab as a space, so no $ and no space; ASCII because Run reads its output in the console's code page; 600 is the
-    // longest value tried.
-    [GeneratedRegex("^[!-#%-~]{0,600}$")]
-    private static partial Regex ShownExactly();
 
     public static string ClaudeHome() => Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR")?.Trim() is { Length: > 0 } home ? home
         : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
@@ -69,7 +58,7 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
     public static string[] ServerCommand()
     {
         var process = Environment.ProcessPath ?? "dotnet";
-        return Path.GetFileNameWithoutExtension(process) == Name ? [process, "mcp"]
+        return Path.GetFileNameWithoutExtension(process).Equals(Name, StringComparison.OrdinalIgnoreCase) ? [process, "mcp"]
             : [process, Assembly.GetEntryAssembly()?.Location ?? "", "mcp"];
     }
 
@@ -107,22 +96,6 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
             : $"\"{arg}{new string('\\', arg.Length - arg.TrimEnd('\\').Length)}\"";
 
     static string Shown(IEnumerable<string> command) => string.Join(' ', command.Select(Quoted));
-
-    static string[] Masked(string[] command) =>
-        [.. command.Select((arg, i) => i > 0 && command[i - 1] == "-e" && arg.IndexOf('=') is > 0 and var at ? $"{arg[..at]}=<value>" : arg)];
-
-    static string Hidden(string text, string[] env)
-    {
-        foreach (var setting in env.OrderByDescending(setting => setting.Length))
-        {
-            var at = setting.IndexOf('=');
-            if (at == setting.Length - 1)
-                continue;
-            text = setting.Length - at - 1 >= 3 ? text.Replace(setting[(at + 1)..], "<value>", StringComparison.Ordinal)
-                : text.Replace(setting, $"{setting[..at]}=<value>", StringComparison.Ordinal);
-        }
-        return text;
-    }
 
     string? Refusal(string[] command)
     {
@@ -170,7 +143,7 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
             catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
             {
             }
-            return (null, $"`{Shown(Masked(command))}` didn't finish within {CommandSeconds} s and was stopped");
+            return (null, $"`{Shown(command)}` didn't finish within {CommandSeconds} s and was stopped");
         }
         catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
@@ -369,111 +342,181 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         return lines;
     }
 
-    static int? ServerTable(List<TomlLine> lines)
+    // Anything it can't read whole stops the edit: otherwise a spelling of the cluewren table it missed would be written twice.
+    static (int? Main, bool Sub) Tables(List<TomlLine> lines)
     {
         int? main = null;
-        string[]? table = [];
+        var sub = false;
+        string[] table = [];
         for (var i = 0; i < lines.Count; i++)
         {
             var line = lines[i];
-            var named = line.Text.Contains(Name, StringComparison.OrdinalIgnoreCase);
+            if (line.Kind == Kind.Unread)
+                throw new FormatException($"line {i + 1} isn't one connect reads");
             if (line.Kind == Kind.Header)
             {
-                table = line.Path;
-                if (table is null && named)
-                    throw new FormatException($"a table header naming the {Name} server there isn't one this editor reads");
-                if (table is null || !InTable(table))
+                if (line.Path is not { } path)
+                    throw new FormatException($"the table header on line {i + 1} isn't one connect reads");
+                if (line.ArrayTable && path[0] == "mcp_servers")
+                    throw new FormatException($"line {i + 1} makes mcp_servers an array of tables");
+                table = path;
+                if (!InTable(table))
                     continue;
-                if (line.ArrayTable)
-                    throw new FormatException($"the {Name} server is written there as an array of tables");
                 if (table.Length > 2)
-                    continue;
-                if (main is not null)
+                    sub = true;
+                else if (main is not null)
                     throw new FormatException($"the {Name} server's table is there twice");
-                main = i;
+                else
+                    main = i;
             }
-            else if (line.Kind == Kind.Key && table is not null)
-            {
-                string[] full = [.. table, .. line.Path!];
-                if (!InTable(table) && InTable(full))
-                    throw new FormatException($"the {Name} server is set up there by a dotted key");
-                if (full is ["mcp_servers"])
-                    throw new FormatException("mcp_servers is written there as one inline table");
-            }
-            else if (line.Kind is Kind.Unread or Kind.Key && named)
-                throw new FormatException($"a line naming the {Name} server there isn't one this editor reads");
+            else if (line.Kind == Kind.Key && (table is [] && line.Path![0] == "mcp_servers" || table is ["mcp_servers"]))
+                throw new FormatException($"line {i + 1} sets mcp_servers by a key, not by a table header");
         }
         if (lines[^1].Open)
             throw new FormatException("a value in it never ends");
-        return main;
+        return (main, sub);
     }
 
     public sealed class NotCluewrensException(string why) : Exception(why);
 
-    static string? TomlString(string value)
+    static string? BasicOrLiteral(string line, ref int at)
     {
-        value = value.Trim();
-        if (value.Length >= 2 && value[0] == '\'' && value.IndexOf('\'', 1) == value.Length - 1)
-            return value[1..^1];
-        try
-        {
-            return value.StartsWith('"') ? JsonNode.Parse(value)?.GetValue<string>() : null;
-        }
-        catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException)
-        {
+        if (at >= line.Length || line.AsSpan(at).StartsWith("'''") || line.AsSpan(at).StartsWith("\"\"\""))
             return null;
+        if (line[at] == '\'')
+        {
+            var end = line.IndexOf('\'', at + 1);
+            if (end < 0)
+                return null;
+            var literal = line[(at + 1)..end];
+            at = end + 1;
+            return literal;
+        }
+        if (line[at] != '"')
+            return null;
+        var text = new StringBuilder();
+        for (var i = at + 1; i < line.Length; i++)
+        {
+            if (line[i] == '"')
+            {
+                at = i + 1;
+                return text.ToString();
+            }
+            if (line[i] != '\\')
+            {
+                text.Append(line[i]);
+                continue;
+            }
+            if (++i == line.Length)
+                return null;
+            switch (line[i])
+            {
+                case 'b': text.Append('\b'); break;
+                case 't': text.Append('\t'); break;
+                case 'n': text.Append('\n'); break;
+                case 'f': text.Append('\f'); break;
+                case 'r': text.Append('\r'); break;
+                case '"': text.Append('"'); break;
+                case '\\': text.Append('\\'); break;
+                case 'u' or 'U':
+                    var digits = line[i] == 'u' ? 4 : 8;
+                    if (i + digits >= line.Length
+                        || !int.TryParse(line.AsSpan(i + 1, digits), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out var code)
+                        || code is < 0 or > 0x10FFFF or (>= 0xD800 and <= 0xDFFF))
+                        return null;
+                    text.Append(char.ConvertFromUtf32(code));
+                    i += digits;
+                    break;
+                default:
+                    return null;
+            }
+        }
+        return null;
+    }
+
+    static string[]? StringArray(string line, ref int at)
+    {
+        if (at >= line.Length || line[at] != '[')
+            return null;
+        at++;
+        var items = new List<string>();
+        while (true)
+        {
+            SkipSpace(line, ref at);
+            if (at < line.Length && line[at] == ']')
+            {
+                at++;
+                return [.. items];
+            }
+            if (BasicOrLiteral(line, ref at) is not { } item)
+                return null;
+            items.Add(item);
+            SkipSpace(line, ref at);
+            if (at < line.Length && line[at] == ',')
+                at++;
+            else if (at < line.Length && line[at] == ']')
+            {
+                at++;
+                return [.. items];
+            }
+            else
+                return null;
         }
     }
 
-    static string[]? TomlStrings(string value)
+    static int ValueStart(string line)
     {
-        try
-        {
-            return value.Trim().StartsWith('[') && JsonNode.Parse(value) is JsonArray items
-                ? [.. items.Select(item => item is JsonValue text && text.TryGetValue<string>(out var arg) ? arg : throw new FormatException())]
-                : null;
-        }
-        catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException)
-        {
-            return null;
-        }
+        var at = 0;
+        KeyPath(line, ref at);
+        at++;
+        SkipSpace(line, ref at);
+        return at;
     }
 
-    static string? NotCluewrens(List<TomlLine> lines, int? main)
+    // Cluewren's server runs what ServerCommand gives for an install, and nothing else: a .cmd wrapper or another host is not it.
+    static bool Cluewrens(string command, string[] args)
+    {
+        var file = Path.GetFileName(command);
+        return args is ["mcp"] && (file.Equals(Name, StringComparison.OrdinalIgnoreCase) || file.Equals($"{Name}.exe", StringComparison.OrdinalIgnoreCase))
+            || args is [var dll, "mcp"] && (file.Equals("dotnet", StringComparison.OrdinalIgnoreCase) || file.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+            && Path.GetFileName(dll).Equals("Cluewren.dll", StringComparison.OrdinalIgnoreCase);
+    }
+
+    readonly record struct Owned(int Command, int CommandStart, int CommandEnd, int Args, int ArgsStart, int ArgsEnd, int? Approval);
+
+    // The messages name keys, never values: another server's command line may hold a key of its own.
+    static Owned OwnedLines(List<TomlLine> lines, int header)
     {
         if (lines.Any(line => line.Kind == Kind.Header && line.Path is ["mcp_servers", Name, var key, ..] && HttpOnly.Contains(key)))
-            return "it isn't Cluewren's: it is an HTTP server";
-        if (main is not { } header)
-            return "it isn't Cluewren's: it has no table of its own with a command";
-        string? command = null;
-        string[]? args = [];
+            throw new NotCluewrensException("it is an HTTP server");
         var end = lines.FindIndex(header + 1, line => line.Kind == Kind.Header);
-        var reads = true;
+        var found = new int?[OwnedKeys.Length];
         for (var i = header + 1; i < (end < 0 ? lines.Count : end); i++)
         {
             var line = lines[i];
             if (line.Kind != Kind.Key)
                 continue;
             if (HttpOnly.Contains(line.Path![0]))
-                return "it isn't Cluewren's: it is an HTTP server";
-            var value = Plain(line)[(Plain(line).IndexOf('=') + 1)..];
-            if (line.Path is ["command"])
-            {
-                reads &= command is null && !line.Open;
-                command = TomlString(value);
-                reads &= command is not null;
-            }
-            else if (line.Path is ["args"])
-            {
-                reads &= !line.Open;
-                args = TomlStrings(value);
-            }
+                throw new NotCluewrensException("it is an HTTP server");
+            if (Array.IndexOf(OwnedKeys, line.Path[0]) is not (>= 0 and var key))
+                continue;
+            if (line.Path.Length > 1 || line.Open || found[key] is not null)
+                throw new NotCluewrensException($"connect can't read its {OwnedKeys[key]} exactly");
+            found[key] = i;
         }
-        if (!reads || args is null)
-            return "it may not be Cluewren's: its command or args aren't written in a way this reads";
-        if (command is null)
-            return "it isn't Cluewren's: it has no command";
-        return Cluewrens(command, args) ? null : $"it isn't Cluewren's: it runs {Shown([command, .. args])}";
+        if (found[0] is not { } command)
+            throw new NotCluewrensException("it has no command");
+        if (found[1] is not { } args)
+            throw new NotCluewrensException("it isn't Cluewren's");
+        var commandLine = Plain(lines[command]);
+        var argsLine = Plain(lines[args]);
+        int commandStart = ValueStart(commandLine), commandEnd = commandStart, argsStart = ValueStart(argsLine), argsEnd = argsStart;
+        if (BasicOrLiteral(commandLine, ref commandEnd) is not { } program || !Ends(commandLine, commandEnd)
+            || StringArray(argsLine, ref argsEnd) is not { } arguments || !Ends(argsLine, argsEnd))
+            throw new NotCluewrensException("connect can't read its command or args exactly");
+        if (!Cluewrens(program, arguments))
+            throw new NotCluewrensException("it isn't Cluewren's");
+        return new(command, commandStart, commandEnd, args, argsStart, argsEnd, found[2]);
     }
 
     static string Without(List<TomlLine> lines)
@@ -498,53 +541,35 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
     public static string CodexConfig(string text, string[]? command, bool approve = false)
     {
         var lines = Scan(text);
-        var main = ServerTable(lines);
-        if (command is null)
-        {
-            if (!lines.Any(line => line.Kind == Kind.Header && line.Path is { } path && InTable(path)))
-                return text;
-            if (NotCluewrens(lines, main) is { } why)
-                throw new NotCluewrensException(why);
-            return Without(lines);
-        }
-        if (lines.FirstOrDefault(line => line.Kind == Kind.Header && line.Path is ["mcp_servers", Name, var key, ..] && HttpOnly.Contains(key))
-            is { Path: { } http })
-            throw new FormatException($"the {Name} server there isn't a stdio server (it has {http[2]})");
+        var (main, sub) = Tables(lines);
         if (main is not { } header)
         {
+            if (sub)
+                throw new NotCluewrensException("it has settings there but no table of its own");
+            if (command is null)
+                return text;
             var kept = text.TrimEnd('\n', '\r');
             return (kept.Length > 0 ? kept + "\n\n" : "") + CodexTable(command, approve);
         }
-        var end = lines.FindIndex(header + 1, line => line.Kind == Kind.Header);
-        var found = new int?[Owned.Length];
-        for (var i = header + 1; i < (end < 0 ? lines.Count : end); i++)
-        {
-            var line = lines[i];
-            if (line.Kind == Kind.Unread)
-                throw new FormatException($"a line in the {Name} server's table isn't one this editor reads");
-            if (line.Kind == Kind.Key && HttpOnly.Contains(line.Path![0]))
-                throw new FormatException($"the {Name} server there isn't a stdio server (it has {line.Path[0]})");
-            if (line.Kind != Kind.Key || Array.IndexOf(Owned, line.Path![0]) is not (>= 0 and var key))
-                continue;
-            if (line.Path.Length > 1 || line.Open || found[key] is not null)
-                throw new FormatException($"the {Name} server's {Owned[key]} is written there in a way this editor leaves alone");
-            found[key] = i;
-        }
-        if (found[0] is null)
-            throw new FormatException($"the {Name} server's table there has no command, so it isn't a stdio server this editor rewrites");
-        if (NotCluewrens(lines, main) is { } theirs)
-            throw new NotCluewrensException(theirs);
-        var cr = lines[header].Text.EndsWith('\r') ? "\r" : "";
-        var approval = found[2];
+        var owned = OwnedLines(lines, header);
+        if (command is null)
+            return Without(lines);
+        var approval = owned.Approval;
         var markedAbove = approval is { } a && Plain(lines[a - 1]) is ApprovalMark or OldApprovalMark;
         var cluewrens = markedAbove && Plain(lines[approval!.Value]) == ApprovalLine;
         var output = new List<string>();
         for (var i = 0; i < lines.Count; i++)
         {
-            if (i == found[0])
-                output.Add(CommandLine(command) + cr);
-            else if (i == found[1])
-                output.Add(ArgsLine(command) + cr);
+            var plain = Plain(lines[i]);
+            var cr = lines[i].Text.EndsWith('\r') ? "\r" : "";
+            if (i == owned.Command)
+                output.Add(plain[..owned.CommandStart] + JsonSerializer.Serialize(command[0]) + plain[owned.CommandEnd..] + cr);
+            else if (i == owned.Args)
+            {
+                output.Add(plain[..owned.ArgsStart] + JsonSerializer.Serialize(command[1..]) + plain[owned.ArgsEnd..] + cr);
+                if (approve && approval is null)
+                    output.AddRange([ApprovalMark + cr, ApprovalLine + cr]);
+            }
             else if (cluewrens && !approve && (i == approval || i == approval - 1))
                 continue;
             else if (i == approval && approve && !cluewrens)
@@ -555,48 +580,92 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
             }
             else
                 output.Add(lines[i].Text);
-            if (i != header)
-                continue;
-            if (found[1] is null)
-                output.Add(ArgsLine(command) + cr);
-            if (approve && approval is null)
-                output.AddRange([ApprovalMark + cr, ApprovalLine + cr]);
         }
         return string.Join('\n', output);
     }
 
-    bool EditCodexConfig(string[]? command, bool approve)
+    public sealed record CodexChange(string Path, byte[]? Before, byte[]? After, string Message, bool Refused);
+
+    static readonly UTF8Encoding StrictUtf8 = new(false, true);
+
+    public static CodexChange PlanCodex(string path, string[]? command, bool approve)
     {
-        var path = Path.Combine(CodexHome(), "config.toml");
-        var text = File.Exists(path) ? File.ReadAllText(path) : "";
-        string changed;
+        var before = File.Exists(path) ? File.ReadAllBytes(path) : null;
+        var bom = before is [0xEF, 0xBB, 0xBF, ..];
+        string text;
         try
         {
-            changed = CodexConfig(text, command, approve);
+            text = before is null ? "" : StrictUtf8.GetString(before, bom ? 3 : 0, before.Length - (bom ? 3 : 0));
+        }
+        catch (DecoderFallbackException)
+        {
+            return new(path, before, null, $"Left {path} as it is: it isn't UTF-8 text", true);
+        }
+        var lines = command is null ? "" : $"{CommandLine(command)}, {ArgsLine(command)}" + (approve ? $", {ApprovalLine}" : "");
+        try
+        {
+            var changed = CodexConfig(text, command, approve);
+            return new(path, before, changed == text ? null : [.. (bom ? (byte[])[0xEF, 0xBB, 0xBF] : []), .. Utf8.GetBytes(changed)],
+                $"{(command is null ? "Removed" : "Set up")} the {Name} MCP server in {path}" + (approve ? ": Codex calls its tools without asking you first" : ""),
+                false);
         }
         catch (NotCluewrensException e)
         {
-            say($"Left the {Name} MCP server in {path} as it is: {e.Message}" + (command is null ? ""
-                : $". To have Cluewren's there, rename that server and connect again, or set it up there by hand: {CommandLine(command)}, "
-                + $"{ArgsLine(command)}{(approve ? $", {ApprovalLine}" : "")}"));
-            return false;
+            return new(path, before, null, $"Left the {Name} MCP server in {path} as it is: {e.Message}"
+                + (command is null ? "" : $". To have Cluewren's there, rename that server and connect again, or set it up there by hand: {lines}"), true);
         }
         catch (FormatException e)
         {
-            say($"Left {path} as it is: {e.Message}. " + (command is null ? $"Remove the {Name} server by hand: codex mcp remove {Name}"
-                : $"Set the {Name} server up there by hand: {CommandLine(command)}, {ArgsLine(command)}{(approve ? $", {ApprovalLine}" : "")}"));
+            return new(path, before, null, $"Left {path} as it is: {e.Message}. "
+                + (command is null ? $"Remove the {Name} server by hand: codex mcp remove {Name}" : $"Set the {Name} server up there by hand: {lines}"), true);
+        }
+    }
+
+    // A file that changed after it was read is left alone: writing what was computed from the old text would lose that change.
+    public bool ApplyCodex(CodexChange change)
+    {
+        if (change.Refused)
+        {
+            say(change.Message);
             return false;
         }
-        if (changed == text)
+        if (change.After is not { } after)
             return true;
-        if (text.Length > 0)
-            File.Copy(path, path + ".before-cluewren", overwrite: true);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, changed, Utf8);
-        say($"{(command is null ? "Removed" : "Set up")} the {Name} MCP server in {path}"
-            + (approve ? ": Codex calls its tools without asking you first" : ""));
+        var path = change.Path;
+        var now = File.Exists(path) ? File.ReadAllBytes(path) : null;
+        if (now is null != change.Before is null || now is not null && !now.AsSpan().SequenceEqual(change.Before))
+        {
+            say($"Left {path} as it is: it changed while connect was reading it. Run connect again");
+            return false;
+        }
+        var folder = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        Directory.CreateDirectory(folder);
+        var temp = Path.Combine(folder, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.WriteAllBytes(temp, after);
+            if (now is null)
+                File.Move(temp, path);
+            else
+                File.Replace(temp, path, path + ".before-cluewren");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            try
+            {
+                File.Delete(temp);
+            }
+            catch (Exception left) when (left is IOException or UnauthorizedAccessException)
+            {
+            }
+            say($"Left {path} as it is: {e.Message}");
+            return false;
+        }
+        say(change.Message);
         return true;
     }
+
+    bool EditCodexConfig(string[]? command, bool approve) => ApplyCodex(PlanCodex(Path.Combine(CodexHome(), "config.toml"), command, approve));
 
     static bool Ours(string path)
     {
@@ -634,30 +703,24 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
             Directory.Delete(folder);
     }
 
-    sealed record ClaudeEntry(string Scope, string Type, string Command, string Args, string[]? Env);
+    sealed record ClaudeEntry(string Scope, string Type, string Command, string Args, bool NoEnvironment);
 
-    // Env is null when `claude mcp get` doesn't show the settings so that they can be read back exactly: a value it alters, or
-    // anything after them but the closing hint.
+    enum Found { Exists, Absent, Unknown }
+
+    // `claude mcp get` is a display: it joins args with spaces and doesn't show every setting, so connect only ever reads it to
+    // decide, never to rebuild an entry from it.
     static ClaudeEntry? Entry(string output)
     {
         var lines = output.Split('\n').Select(line => line.TrimEnd('\r')).ToArray();
         var labels = new Dictionary<string, string>();
-        string[]? env = null;
+        bool? noEnvironment = null;
         for (var i = 0; i < lines.Length; i++)
         {
             if (lines[i] == "  Environment:")
             {
-                if (!labels.TryAdd("Environment", ""))
+                if (noEnvironment is not null)
                     return null;
-                var settings = new List<string>();
-                var readable = true;
-                for (; i + 1 < lines.Length && lines[i + 1].Length > 0; i++)
-                    if (EnvSetting().IsMatch(lines[i + 1]) && ShownExactly().IsMatch(lines[i + 1][(lines[i + 1].IndexOf('=') + 1)..]))
-                        settings.Add(lines[i + 1][4..]);
-                    else
-                        readable = false;
-                if (readable && lines.Skip(i + 1).All(line => line.Length == 0 || line.StartsWith("To remove this server", StringComparison.Ordinal)))
-                    env = [.. settings];
+                noEnvironment = i + 1 == lines.Length || lines[i + 1].Length == 0;
                 continue;
             }
             foreach (var label in (string[])["Scope", "Type", "Command", "Args"])
@@ -666,155 +729,93 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
                     return null;
         }
         return labels.TryGetValue("Scope", out var scope) && labels.TryGetValue("Type", out var type)
-            && labels.TryGetValue("Command", out var command) && labels.TryGetValue("Args", out var args)
-            ? new(scope, type, command, args, env) : null;
+            && labels.TryGetValue("Command", out var command) && labels.TryGetValue("Args", out var args) && noEnvironment is { } none
+            ? new(scope, type, command, args, none) : null;
     }
 
-    // Cluewren's server is one that runs what ServerCommand gives for some install: cluewren(.exe) mcp, or a host with Cluewren.dll mcp.
-    static bool Cluewrens(string command, string[] args) =>
-        args is ["mcp"] && Path.GetFileNameWithoutExtension(command).Equals(Name, StringComparison.OrdinalIgnoreCase)
-        || args is [var dll, "mcp"] && Path.GetFileName(dll).Equals("Cluewren.dll", StringComparison.OrdinalIgnoreCase);
-
-    static string[]? CluewrenCommand(ClaudeEntry entry)
+    (Found State, ClaudeEntry? Entry, string Why) ReadClaude()
     {
-        string[] args = entry.Args == "mcp" ? ["mcp"] : entry.Args.EndsWith(" mcp", StringComparison.Ordinal) ? [entry.Args[..^4], "mcp"] : [];
-        return entry.Type == "stdio" && Cluewrens(entry.Command, args) ? [entry.Command, .. args] : null;
+        string[] get = ["claude", "mcp", "get", Name];
+        var (code, output) = Run(get);
+        if (code is null)
+            return (Found.Unknown, null, output);
+        if (code != 0)
+            return output.TrimStart().StartsWith($"No MCP server named \"{Name}\"", StringComparison.Ordinal) ? (Found.Absent, null, "")
+                : (Found.Unknown, null, $"`{Shown(get)}` exited with {code}");
+        return Entry(output) is { } entry ? (Found.Exists, entry, "") : (Found.Unknown, null, $"`{Shown(get)}` printed something connect doesn't read");
     }
 
-    static string[] Adding(string[] command, string[] env) =>
-        ["claude", "mcp", "add", "--scope", "user", Name, .. env.SelectMany(setting => (string[])["-e", setting]), "--", .. command];
+    static bool InUserScope(ClaudeEntry entry) => entry.Scope.StartsWith("User config", StringComparison.Ordinal);
 
-    static string SavedEntry => Path.Combine(DiscoveryFile.DefaultFolder, "claude-cluewren-entry.json");
+    // Args shown as exactly `mcp` is one argument without spaces, so for this form alone the display can't stand for anything else.
+    static bool Removable(ClaudeEntry entry) =>
+        InUserScope(entry) && entry.NoEnvironment && entry.Type == "stdio" && entry.Args == "mcp" && Cluewrens(entry.Command, ["mcp"]);
 
-    static string Save(string[] command, string[] env)
-    {
-        if (File.Exists(SavedEntry))
-            throw new IOException($"{SavedEntry} holds the settings an earlier connect saved: put them back, then delete it");
-        DiscoveryFile.CreateOwnerOnlyFolder(DiscoveryFile.DefaultFolder);
-        var settings = new JsonObject();
-        foreach (var setting in env)
-            settings[setting[..setting.IndexOf('=')]] = setting[(setting.IndexOf('=') + 1)..];
-        var saved = new JsonObject { ["command"] = command[0], ["args"] = new JsonArray([.. command[1..].Select(arg => (JsonNode?)arg)]), ["env"] = settings };
-        using (var stream = DiscoveryFile.CreateOwnerOnlyFile(SavedEntry))
-            stream.Write(Utf8.GetBytes(saved.ToJsonString()));
-        return SavedEntry;
-    }
-
-    static void Forget(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-        }
-    }
-
-    // Values never go to the terminal: an MCP server's environment often holds a key.
-    static string ByHand(string[] command, string[]? env) =>
-        Shown(["claude", "mcp", "add", "--scope", "user", Name])
-        + (env is null ? " -e NAME=<value> (for each of its environment settings)"
-            : string.Concat(env.Select(setting => $" -e {setting[..setting.IndexOf('=')]}=<value>")))
-        + $" -- {Shown(command)}";
+    static string Unmoved(ClaudeEntry entry) =>
+        !InUserScope(entry) ? $"the one Claude Code shows here is from its {entry.Scope}"
+        : !entry.NoEnvironment ? "it has environment settings, which connect does not move"
+        : Removable(entry) ? $"it runs {Shown([entry.Command, "mcp"])}, another Cluewren"
+        : "connect can't tell that it is Cluewren's";
 
     public bool ClaudeServer(string[]? command)
     {
         string[] remove = ["claude", "mcp", "remove", "--scope", "user", Name];
-        var (code, output) = Run(["claude", "mcp", "get", Name]);
-        if (code is null)
+        var (found, entry, why) = ReadClaude();
+        if (found == Found.Unknown)
         {
-            say($"{output}. " + (command is null ? $"Remove the server by hand: {Shown(remove)}" : $"Add the server by hand: {ByHand(command, [])}"));
+            say($"Couldn't tell whether Claude Code has a {Name} MCP server ({why}), so nothing was changed. Check with `claude mcp get {Name}`"
+                + (command is null ? $", then remove it by hand: {Shown(remove)}" : $"; if there is none, add it by hand: {Shown(Adding(command))}"));
             return false;
         }
-        bool Removed()
+        if (command is null)
+            return found == Found.Absent || RemoveClaude(entry!, remove);
+        if (found == Found.Absent)
         {
-            var (done, said) = Run(remove);
-            if (done != 0)
-                say($"`{Shown(remove)}` failed: {said.Trim()}");
-            return done == 0;
-        }
-        if (code != 0)
-        {
-            if (command is null)
-                return true;
-            (code, output) = Run(Adding(command, []));
+            var (code, output) = Run(Adding(command));
             if (code != 0)
             {
-                say(code is null ? $"{output}. Add the server by hand: {ByHand(command, [])}" : $"`claude mcp add` failed: {output.Trim()}");
+                say(code is null ? $"{output}. Add the server by hand: {Shown(Adding(command))}" : $"`claude mcp add` failed: {output.Trim()}");
                 return false;
             }
             say($"Added the {Name} MCP server to Claude Code (user scope: every project)");
             return true;
         }
-        var entry = Entry(output);
-        if (entry is null || !entry.Scope.StartsWith("User config", StringComparison.Ordinal))
-        {
-            say($"Left Claude Code's {Name} MCP server as it is: "
-                + (entry is null ? $"what `claude mcp get {Name}` shows isn't something this reads" : $"the one Claude Code shows here is from its {entry.Scope}")
-                + $". By hand: {Shown(remove)}" + (command is null ? "" : $" (if there is one in user scope), then {ByHand(command, null)}"));
-            return false;
-        }
-        if (CluewrenCommand(entry) is not { } old)
-        {
-            say($"Left Claude Code's {Name} MCP server as it is: it isn't Cluewren's (it runs {entry.Command})");
-            return false;
-        }
-        if (command is null)
-        {
-            if (!Removed())
-                return false;
-            say($"Removed the {Name} MCP server from Claude Code");
-            return true;
-        }
-        if (entry.Command == command[0] && entry.Args == string.Join(' ', command[1..]))
+        if (InUserScope(entry!) && entry!.NoEnvironment && entry.Type == "stdio" && command is [var program, "mcp"] && entry.Command == program
+            && entry.Args == "mcp")
         {
             say($"Claude Code's {Name} MCP server already runs this Cluewren");
             return true;
         }
-        var env = entry.Env ?? [];
-        var adding = Adding(command, env);
-        var restoring = Adding(old, env);
-        var why = entry.Env is null ? $"`claude mcp get {Name}` doesn't show each of its environment values exactly"
-            : Refusal(remove) ?? Refusal(adding) ?? Refusal(restoring);
-        string? saved = null;
-        if (why is null)
-            try
-            {
-                saved = Save(old, env);
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                why = $"its settings couldn't be saved first ({e.Message})";
-            }
-        if (saved is null)
+        say($"Left Claude Code's {Name} MCP server as it is: {Unmoved(entry!)}. "
+            + (Removable(entry!) ? "To run this Cluewren instead: cluewren connect claude --remove, then cluewren connect claude"
+                : $"If you don't need it, remove it with {Shown(remove)}, then run cluewren connect claude"));
+        return false;
+    }
+
+    static string[] Adding(string[] command) => ["claude", "mcp", "add", "--scope", "user", Name, "--", .. command];
+
+    bool RemoveClaude(ClaudeEntry entry, string[] remove)
+    {
+        if (!Removable(entry))
         {
-            say($"Left Claude Code's {Name} MCP server as it is (it runs {Shown(old)}): {why}. To run this Cluewren instead: {Shown(remove)}, "
-                + $"then {ByHand(command, entry.Env)}");
+            say($"Left Claude Code's {Name} MCP server as it is: {Unmoved(entry)}. If you don't need it, remove it with {Shown(remove)}");
             return false;
         }
-        if (!Removed())
-        {
-            Forget(saved);
-            return false;
-        }
-        (code, output) = Run(adding);
+        var (code, output) = Run(remove);
         if (code == 0)
         {
-            Forget(saved);
-            say($"Claude Code's {Name} MCP server ran {Shown(old)}; it runs this Cluewren now, with the same environment settings");
+            say($"Removed the {Name} MCP server from Claude Code");
             return true;
         }
-        var (back, again) = Run(restoring);
-        if (back == 0)
+        var failed = code is null ? output : $"`{Shown(remove)}` failed: {output.Trim()}";
+        var (now, _, why) = ReadClaude();
+        say(now switch
         {
-            Forget(saved);
-            say($"`claude mcp add` failed: {Hidden(output.Trim(), env)}. Claude Code's {Name} MCP server is back as it was ({Shown(old)})");
-            return false;
-        }
-        say($"`claude mcp add` failed: {Hidden(output.Trim(), env)}. Putting it back failed too: {Hidden(again.Trim(), env)}. Its command and "
-            + $"environment are saved in {saved}: add it back with {ByHand(old, env)}, the values as saved there");
-        return false;
+            Found.Absent => $"{failed}; read again, Claude Code has no {Name} MCP server now",
+            Found.Exists => $"{failed}; read again, Claude Code still has its {Name} MCP server. Remove it by hand: {Shown(remove)}",
+            _ => $"{failed}; read again, connect couldn't tell whether it is still there ({why}). Check with `claude mcp get {Name}`",
+        });
+        return now == Found.Absent;
     }
 
     public int Add(string client, bool approveTools = false)

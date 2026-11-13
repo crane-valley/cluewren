@@ -29,8 +29,10 @@ installed by a `connect` command for Claude Code and for Codex, as upstream's `a
   unfinished work is inconclusive.
 - The brain holds no language model key and never reads the agent's credentials. It makes no model calls.
 - Jev remains the brain's own call, with the user's TypeSafe key.
-- `connect` owns its skill and agent files and one marked entry in shared config such as Codex's config.toml. It changes
-  nothing else, and `connect --remove` takes those out.
+- `connect` owns its skill and agent files, and an entry in shared config (Claude Code's servers, Codex's config.toml)
+  only when that entry runs Cluewren's own command: a file named cluewren or cluewren.exe with the one argument mcp, or,
+  in config.toml, dotnet with Cluewren.dll and mcp. It changes nothing else, leaves any other entry as it is and says
+  what to do by hand, and `connect --remove` takes out only what it owns.
 - Runs start from the user's agent. The editor window shows, steers and stops a run, as it does for upstream's connect
   runs. It does not start one, and the plugin's own run request (-Playtest, hello.run) is removed.
 

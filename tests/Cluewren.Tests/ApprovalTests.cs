@@ -1,4 +1,3 @@
-using System.Text.Json.Nodes;
 using Cluewren.Mcp;
 
 namespace Cluewren.Tests;
@@ -11,10 +10,12 @@ public class CodexApprovalTests
 
     const string Header = "# cluewren connect: Cluewren's MCP server, for the game open in your editor (`cluewren connect codex --remove` takes it out)";
 
+    const string Table = "[mcp_servers.\"cluewren\"]";
+
     // Exactly what `cluewren connect codex` 0.1.0 appended.
     static readonly string Written010 = Lines(
         Header,
-        "[mcp_servers.\"cluewren\"]",
+        Table,
         "command = \"C:/tools/cluewren.exe\"",
         "args = [\"mcp\"]",
         "# (its tools reach only the game open in the editor and the game's memory folder)",
@@ -23,8 +24,7 @@ public class CodexApprovalTests
     [Fact]
     public void Codex_is_told_to_approve_the_tools_only_when_asked()
     {
-        Assert.Equal(Lines(Header, "[mcp_servers.\"cluewren\"]", "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]"),
-            Connect.CodexConfig("", Command));
+        Assert.Equal(Lines(Header, Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]"), Connect.CodexConfig("", Command));
         var approved = Connect.CodexConfig("", Command, approve: true);
         Assert.EndsWith("args = [\"mcp\"]\n# cluewren connect --approve-tools: Codex calls these tools without asking you first\n"
             + "default_tools_approval_mode = \"approve\"\n", approved);
@@ -34,17 +34,18 @@ public class CodexApprovalTests
     [Fact]
     public void A_plain_rerun_takes_back_the_approval_cluewren_wrote_and_nothing_else()
     {
-        Assert.Equal(Lines(Header, "[mcp_servers.\"cluewren\"]", "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]"),
-            Connect.CodexConfig(Written010, Command));
+        Assert.Equal(Lines(Header, Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]"), Connect.CodexConfig(Written010, Command));
         var approved = Connect.CodexConfig("model = \"gpt\"\n", Command, approve: true);
         Assert.Equal(Connect.CodexConfig("model = \"gpt\"\n", Command), Connect.CodexConfig(approved, Command));
+        Assert.Equal(Lines(Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]",
+                "# cluewren connect --approve-tools: Codex calls these tools without asking you first", "default_tools_approval_mode = \"approve\""),
+            Connect.CodexConfig(Lines(Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]"), Command, approve: true));
     }
 
     [Fact]
     public void An_approval_line_cluewren_did_not_write_is_kept()
     {
-        var mine = Lines("[mcp_servers.\"cluewren\"]", "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]",
-            "default_tools_approval_mode = \"approve\"");
+        var mine = Lines(Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]", "default_tools_approval_mode = \"approve\"");
         Assert.Equal(mine, Connect.CodexConfig(mine, Command));
         var edited = Written010.Replace("= \"approve\"", "= \"prompt\"");
         Assert.Equal(edited, Connect.CodexConfig(edited, Command));
@@ -60,7 +61,7 @@ public class CodexApprovalTests
             "model = \"gpt-5\"",
             "",
             Header,
-            "[mcp_servers.\"cluewren\"]",
+            Table,
             $"command = \"{command}\"",
             "args = [\"mcp\"]",
             "cwd = \"C:/Games/Foo\"  # where my game is",
@@ -85,108 +86,198 @@ public class CodexApprovalTests
     }
 
     [Fact]
+    public void A_rewritten_line_keeps_its_key_and_its_comment()
+    {
+        Assert.Equal(Lines(Table, "  \"command\" = \"C:/tools/cluewren.exe\"   # mine", "args=[\"mcp\"] # also mine"),
+            Connect.CodexConfig(Lines(Table, "  \"command\" = 'C:\\old\\cluewren.exe'   # mine", "args=[ 'mcp', ] # also mine"), Command));
+    }
+
+    [Fact]
     public void A_line_inside_a_multi_line_value_is_not_taken_for_a_table()
     {
-        var notes = Lines("notes = \"\"\"", "[mcp_servers.\"cluewren\"]", "command = \"mine\"", "\"\"\"", "list = [", "  [1, 2],", "]");
+        var notes = Lines("notes = \"\"\"", Table, "command = \"mine\"", "\"\"\"", "list = [", "  [1, 2],", "]");
         Assert.Equal(notes + "\n" + Connect.CodexConfig("", Command), Connect.CodexConfig(notes, Command));
         Assert.Equal(notes, Connect.CodexConfig(notes, null));
     }
 
+    // Regression: a spelling of the table the reader skipped was appended to as if there were none, giving Codex two tables.
     [Theory]
+    [InlineData("[mcp_servers.\"clue\\u0077ren\"]\ncommand = \"node\"\n")]
+    [InlineData("[mcp_servers.\"cluewren\\u0020\"]\ncommand = \"x\"\n")]
+    [InlineData("[profiles.\"a\\u0062\"]\nmodel = \"x\"\n")]
     [InlineData("[mcp_servers.cluewren]\ncommand = \"x\"\n[mcp_servers.\"cluewren\"]\nargs = []\n")]
     [InlineData("[mcp_servers]\ncluewren = { command = \"x\" }\n")]
+    [InlineData("[mcp_servers]\nother = { command = \"x\" }\n")]
     [InlineData("mcp_servers = { cluewren = { command = \"x\" } }\n")]
+    [InlineData("mcp_servers.other.command = \"x\"\n")]
     [InlineData("[[mcp_servers.cluewren]]\ncommand = \"x\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\\u0020\"]\ncommand = \"x\"\n")]
+    [InlineData("[[mcp_servers]]\nname = \"x\"\n")]
+    [InlineData("model = \"m\"\nthis line = isn't toml\n")]
     [InlineData("[mcp_servers.cluewren]\ncommand = \"x\"\nnotes = '''\nnever closed\n")]
-    public void A_shape_this_editor_cannot_read_is_left_to_the_user(string text)
+    public void A_file_the_reader_cannot_read_whole_is_not_changed(string text)
     {
         Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command));
         Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command, approve: true));
         Assert.Throws<FormatException>(() => Connect.CodexConfig(text, null));
     }
 
+    // Regression: a wrapper or another host named like Cluewren was taken for it and rewritten or removed.
     [Theory]
-    [InlineData("[mcp_servers.cluewren]\ncommand = \"x\"\nargs = [\n  \"mcp\",\n]\n")]
-    [InlineData("[mcp_servers.cluewren]\ncommand = \"\"\"\nx\"\"\"\n")]
-    [InlineData("[mcp_servers.cluewren]\ncommand = \"x\"\ncommand = \"y\"\n")]
-    [InlineData("[mcp_servers.cluewren]\ncommand = \"x\"\nthis line = isn't toml\n")]
-    [InlineData("[mcp_servers.cluewren]\ncommand.path = \"x\"\n")]
-    public void Command_or_args_this_editor_cannot_rewrite_are_left_to_the_user(string text)
+    [InlineData("command = \"node\"\nargs = [\"C:/srv/cluewren.js\"]")]
+    [InlineData("command = \"C:/tools/cluewren.cmd\"\nargs = [\"mcp\"]")]
+    [InlineData("command = \"C:/tools/cluewren.bat\"\nargs = [\"mcp\"]")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\"serve\"]")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\", \"--x\"]")]
+    [InlineData("command = \"C:/tools/cluewren-helper.exe\"\nargs = [\"mcp\"]")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"")]
+    [InlineData("command = \"C:/tools/Cluewren.exe\"\nargs = [\"C:/tools/Cluewren.dll\", \"mcp\"]")]
+    [InlineData("command = \"dotnet\"\nargs = [\"C:/tools/Other.dll\", \"mcp\"]")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\n  \"mcp\",\n]")]
+    [InlineData("command = \"C:\\q\\cluewren.exe\"\nargs = [\"mcp\"]")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]")]
+    [InlineData("command.path = \"x\"\nargs = [\"mcp\"]")]
+    [InlineData("url = \"https://example.com/mcp\"")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]\nbearer_token_env_var = \"TOKEN\"")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]\nenv_http_headers = { X = \"Y\" }")]
+    [InlineData("command = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]\n[mcp_servers.cluewren.http_headers]\nX = \"y\"")]
+    [InlineData("enabled = false")]
+    public void A_cluewren_table_that_is_not_cluewrens_is_left_as_it_is(string body)
     {
-        Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command));
-        Assert.Throws<FormatException>(() => Connect.CodexConfig(text.Replace("\"x\"", "\"C:/tools/cluewren.exe\""), Command));
-    }
-
-    [Theory]
-    [InlineData("[mcp_servers.\"cluewren\"]\nurl = \"https://example.com/mcp\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"mcp\"]\n[mcp_servers.cluewren.http_headers]\nX = \"y\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"node\"\nargs = [\"C:/srv/cluewren.js\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"serve\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren-helper.exe\"\nargs = [\"mcp\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\n  \"mcp\",\n]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\nenabled = false\n")]
-    [InlineData("[mcp_servers.cluewren.env]\nKEY = \"v\"\n")]
-    public void Remove_leaves_a_server_that_is_not_cluewrens(string text)
-    {
+        var text = Lines(Table, body);
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command));
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command, approve: true));
         Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, null));
     }
 
-    [Theory]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"node\"\nargs = [\"C:/srv/cluewren.js\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = [\"serve\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren-helper.exe\"\nargs = [\"mcp\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/tools/cluewren.exe\"\nargs = ['mcp']\n")]
-    public void Connect_leaves_a_users_own_server_named_cluewren(string text)
+    [Fact]
+    public void Settings_for_cluewren_without_a_table_of_their_own_are_left_as_they_are()
     {
+        var text = Lines("[mcp_servers.cluewren.env]", "KEY = \"v\"");
         Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command));
-        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, Command, approve: true));
+        Assert.Throws<Connect.NotCluewrensException>(() => Connect.CodexConfig(text, null));
+    }
+
+    // Regression: the reason for leaving a server named its command line, which can hold a key of its own.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void What_connect_says_about_another_server_names_none_of_its_settings(bool adding)
+    {
+        var text = Lines(Table, "command = \"C:/secret/tool.exe\"", "args = [\"--token=abc123\"]", "[mcp_servers.cluewren.env]", "KEY = \"s3cret\"");
+        var said = Record.Exception(() => Connect.CodexConfig(text, adding ? Command : null))!.Message;
+        Assert.DoesNotContain("secret", said);
+        Assert.DoesNotContain("abc123", said);
+        Assert.DoesNotContain("s3cret", said);
     }
 
     [Theory]
-    [InlineData("command = \"C:/Program Files/dotnet/dotnet.exe\"\nargs = [\"C:/src/bin/cluewren.dll\", \"mcp\"]\n")]
-    [InlineData("command = 'D:\\Other\\Cluewren.exe'\nargs = [\"mcp\"]\n")]
-    public void Connect_rewrites_cluewrens_own_table_in_either_install_shape(string owned)
+    [InlineData("command = \"C:/Program Files/dotnet/dotnet.exe\"\nargs = [\"C:/src/bin/cluewren.dll\", \"mcp\"]")]
+    [InlineData("command = 'dotnet'\nargs = ['C:\\src\\bin\\Cluewren.DLL', 'mcp']")]
+    [InlineData("command = \"D:/Other/dotnet\"\nargs = [\"cluewren.dll\", \"mcp\"]")]
+    [InlineData("command = 'D:\\Other\\Cluewren.EXE'\nargs = [\"mcp\"]")]
+    [InlineData("command = \"/opt/cluewren/cluewren\"\nargs = [\"mcp\"]")]
+    [InlineData("command = \"C:\\u002Ftools\\u002Fcluewren.exe\"\nargs = [\"\\u006Dcp\"]")]
+    public void Cluewrens_own_table_is_rewritten_in_each_install_form(string owned)
     {
-        Assert.Equal(Lines("[mcp_servers.\"cluewren\"]", "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]", "cwd = \"C:/Games\""),
-            Connect.CodexConfig("[mcp_servers.\"cluewren\"]\n" + owned + "cwd = \"C:/Games\"\n", Command));
+        Assert.Equal(Lines(Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]", "cwd = \"C:/Games\""),
+            Connect.CodexConfig(Lines(Table, owned, "cwd = \"C:/Games\""), Command));
+        Assert.Equal("model = \"m\"\n", Connect.CodexConfig(Lines("model = \"m\"", "", Table, owned, "[mcp_servers.cluewren.env]", "K = \"v\""), null));
     }
 
-    [Theory]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = 'C:\\tools\\Cluewren.exe'\nargs = [\"mcp\"]\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"C:/Program Files/dotnet/dotnet.exe\"\nargs = [\"C:/src/bin/cluewren.dll\", \"mcp\"]\n[mcp_servers.cluewren.env]\nCLUEWREN_SANDBOX = \"required\"\n")]
-    public void Remove_takes_out_cluewrens_server_in_either_install_shape(string text)
+    static string TempConfig(string? text)
     {
-        Assert.Equal("model = \"m\"\n", Connect.CodexConfig("model = \"m\"\n\n" + text, null));
-    }
-
-    [Theory]
-    [InlineData("[mcp_servers.\"cluewren\"]\nurl = \"https://example.com/mcp\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\nbearer_token_env_var = \"TOKEN\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\nenv_http_headers = { X = \"Y\" }\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\ncommand = \"x\"\n[mcp_servers.\"cluewren\".http_headers]\nX = \"y\"\n")]
-    [InlineData("[mcp_servers.cluewren.http_headers]\nX = \"y\"\n")]
-    [InlineData("[mcp_servers.\"cluewren\"]\nenabled = false\n")]
-    public void A_server_that_is_not_a_stdio_server_is_left_to_the_user(string text)
-    {
-        Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command));
-        Assert.Throws<FormatException>(() => Connect.CodexConfig(text, Command, approve: true));
+        var folder = Directory.CreateTempSubdirectory("codex-home").FullName;
+        var path = Path.Combine(folder, "config.toml");
+        if (text is not null)
+            File.WriteAllText(path, text);
+        return path;
     }
 
     [Fact]
-    public void Remove_takes_out_the_table_its_sub_tables_and_its_mark()
+    public void A_change_replaces_the_file_whole_and_keeps_the_old_one_beside_it()
     {
-        var text = Lines("model = \"gpt\"", "") + Written010
-            + Lines("", "[mcp_servers.cluewren.env]", "CLUEWREN_SANDBOX = \"required\"", "", "[mcp_servers.other]", "command = \"x\"");
-        Assert.Equal(Lines("model = \"gpt\"", "", "[mcp_servers.other]", "command = \"x\""), Connect.CodexConfig(text, null));
-        Assert.Equal("model = \"gpt\"\n", Connect.CodexConfig("model = \"gpt\"\n", null));
+        var path = TempConfig("model = \"m\"\n");
+        try
+        {
+            var said = new List<string>();
+            Assert.True(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal("model = \"m\"\n\n" + Connect.CodexConfig("", Command), File.ReadAllText(path));
+            Assert.Equal("model = \"m\"\n", File.ReadAllText(path + ".before-cluewren"));
+            Assert.Equal(["config.toml", "config.toml.before-cluewren"],
+                Directory.GetFiles(Path.GetDirectoryName(path)!).Select(file => Path.GetFileName(file)).Order());
+            Assert.True(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Single(said);
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Fact]
+    public void A_config_that_is_not_there_yet_is_created()
+    {
+        var path = TempConfig(null);
+        try
+        {
+            Assert.True(new Connect(_ => { }).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal(Connect.CodexConfig("", Command), File.ReadAllText(path));
+            Assert.False(File.Exists(path + ".before-cluewren"));
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    // Regression: what was computed from the text first read was written over an edit made in between.
+    [Fact]
+    public void A_config_that_changed_while_connect_read_it_is_not_written()
+    {
+        var path = TempConfig("model = \"m\"\n");
+        try
+        {
+            var said = new List<string>();
+            var change = Connect.PlanCodex(path, Command, false);
+            File.WriteAllText(path, "model = \"edited meanwhile\"\n");
+            Assert.False(new Connect(said.Add).ApplyCodex(change));
+            Assert.Equal("model = \"edited meanwhile\"\n", File.ReadAllText(path));
+            Assert.Contains("changed while connect was reading it", said[^1]);
+            Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!));
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Fact]
+    public void A_config_connect_leaves_is_not_written_and_says_why()
+    {
+        var text = Lines(Table, "command = \"node\"", "args = [\"server.js\"]");
+        var path = TempConfig(text);
+        try
+        {
+            var said = new List<string>();
+            Assert.False(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal(text, File.ReadAllText(path));
+            Assert.Contains("isn't Cluewren's", said[^1]);
+            Assert.Contains("command = \"C:/tools/cluewren.exe\"", said[^1]);
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
     }
 }
 
 public class ClaudeRegistrationTests
 {
     static readonly string[] Command = [@"C:\Users\me\.dotnet\tools\cluewren.exe", "mcp"];
+
+    const string User = "User config (available in all your projects)";
+
+    const string Absent = "No MCP server named \"cluewren\". Run `claude mcp add` to add one.";
 
     static string Get(string scope, string command, string args, params string[] env) =>
         string.Join('\n', new[]
@@ -196,33 +287,25 @@ public class ClaudeRegistrationTests
         }.Concat(env.Select(setting => "    " + setting))
             .Concat(["", $"To remove this server, run: claude mcp remove cluewren -s {(scope.StartsWith("User") ? "user" : "local")}", ""]));
 
-    const string User = "User config (available in all your projects)";
+    static (int?, string) Shows(string scope, string command, string args, params string[] env) => (0, Get(scope, command, args, env));
 
-    internal static readonly string Saved = Path.Combine(Bridge.DiscoveryFile.DefaultFolder, "claude-cluewren-entry.json");
-
-    // The file lives in this machine's real Cluewren folder: one a real connect left there is its user's only copy of those settings.
-    internal sealed class UnlessSavedFactAttribute : FactAttribute
-    {
-        public UnlessSavedFactAttribute()
-        {
-            if (File.Exists(Saved))
-                Skip = $"{Saved} is there already (left by a real connect); this test would write over it";
-        }
-    }
-
-    sealed class Claude(string get, int getCode = 0, Func<string[], int>? add = null, string addSays = "")
+    sealed class Claude(params (int? Code, string Output)[] gets)
     {
         public readonly List<string> Calls = [];
         public readonly List<string> Said = [];
+        public (int? Code, string Output) Removing { get; init; } = (0, "Removed MCP server cluewren from user config");
+        public (int? Code, string Output) Adding { get; init; } = (0, "Added stdio MCP server cluewren");
+        int _read;
 
-        public (int? Code, string Output) Run(string[] command)
+        (int? Code, string Output) Run(string[] command)
         {
             Calls.Add(string.Join('|', command));
             return command[2] switch
             {
-                "get" => (getCode, get),
-                "add" => (add?.Invoke(command) ?? 0, addSays),
-                _ => (0, ""),
+                "get" => gets[Math.Min(_read++, gets.Length - 1)],
+                "remove" => Removing,
+                "add" => Adding,
+                _ => (null, "unexpected"),
             };
         }
 
@@ -231,150 +314,161 @@ public class ClaudeRegistrationTests
 
     const string Getting = "claude|mcp|get|cluewren";
     const string Removing = "claude|mcp|remove|--scope|user|cluewren";
+    static readonly string Adding = $"claude|mcp|add|--scope|user|cluewren|--|{Command[0]}|mcp";
+
+    [Fact]
+    public void A_server_that_is_explicitly_absent_is_added()
+    {
+        var claude = new Claude((1, Absent));
+        Assert.True(claude.Register(Command));
+        Assert.Equal([Getting, Adding], claude.Calls);
+    }
 
     [Fact]
     public void The_same_command_already_registered_is_neither_removed_nor_added()
     {
-        var claude = new Claude(Get(User, Command[0], "mcp", "CLUEWREN_SANDBOX=required"));
+        var claude = new Claude(Shows(User, Command[0], "mcp"));
         Assert.True(claude.Register(Command));
         Assert.Equal([Getting], claude.Calls);
     }
 
-    [UnlessSavedFact]
-    public void An_older_cluewren_is_replaced_with_its_environment_carried_over()
+    public static TheoryData<int?, string> Unknown => new()
     {
-        var claude = new Claude(Get(User, @"C:\Tools\Clue wren\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=required", @"PATHS=C:\x;D:\y", "EQ=x=y"));
-        Assert.True(claude.Register(Command));
-        Assert.Equal([Getting, Removing,
-            $@"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|-e|PATHS=C:\x;D:\y|-e|EQ=x=y|--|{Command[0]}|mcp"], claude.Calls);
-        Assert.DoesNotContain(claude.Said, said => said.Contains("required"));
-        Assert.False(File.Exists(Saved));
-    }
-
-    [UnlessSavedFact]
-    public void A_failed_add_puts_the_old_entry_back()
-    {
-        var claude = new Claude(Get(User, @"C:\Program Files\dotnet\dotnet.exe", @"C:\src\cluewren\bin\cluewren.dll mcp", "CLUEWREN_SANDBOX=required"),
-            add: command => command.Contains(Command[0]) ? 1 : 0);
-        Assert.False(claude.Register(Command));
-        Assert.Equal([Getting, Removing,
-            $"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|--|{Command[0]}|mcp",
-            @"claude|mcp|add|--scope|user|cluewren|-e|CLUEWREN_SANDBOX=required|--|C:\Program Files\dotnet\dotnet.exe|C:\src\cluewren\bin\cluewren.dll|mcp"],
-            claude.Calls);
-        Assert.Contains("back as it was", claude.Said[^1]);
-        Assert.False(File.Exists(Saved));
-    }
-
-    [UnlessSavedFact]
-    public void An_earlier_saved_entry_is_never_written_over()
-    {
-        var there = File.Exists(Saved);
-        try
-        {
-            if (!there)
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(Saved)!);
-                File.WriteAllText(Saved, "earlier");
-            }
-            var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=v"));
-            Assert.False(claude.Register(Command));
-            Assert.Equal([Getting], claude.Calls);
-            Assert.Contains(Saved, claude.Said[^1]);
-            Assert.Equal("earlier", File.ReadAllText(Saved));
-        }
-        finally
-        {
-            if (!there)
-                File.Delete(Saved);
-        }
-    }
-
-    [UnlessSavedFact]
-    public void No_environment_value_is_printed_and_one_that_could_not_be_put_back_is_kept_for_the_user_alone()
-    {
-        var there = File.Exists(Saved);
-        try
-        {
-            var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=s3cret"), add: _ => 1,
-                addSays: "Invalid environment variable format: KEY=s3cret");
-            Assert.False(claude.Register(Command));
-            Assert.Equal(4, claude.Calls.Count);
-            Assert.DoesNotContain(claude.Said, said => said.Contains("s3cret"));
-            Assert.Contains(Saved, claude.Said[^1]);
-            Assert.Contains(@"-e KEY=<value> -- C:\Tools\cluewren.exe mcp", claude.Said[^1]);
-            var saved = JsonNode.Parse(File.ReadAllText(Saved))!;
-            Assert.Equal(@"C:\Tools\cluewren.exe", saved["command"]!.GetValue<string>());
-            Assert.Equal("mcp", saved["args"]![0]!.GetValue<string>());
-            Assert.Equal("s3cret", saved["env"]!["KEY"]!.GetValue<string>());
-            if (OperatingSystem.IsWindows())
-            {
-                var rules = new FileInfo(Saved).GetAccessControl();
-                Assert.True(rules.AreAccessRulesProtected);
-            }
-        }
-        finally
-        {
-            if (!there)
-                File.Delete(Saved);
-        }
-    }
-
-    public static TheoryData<string> Unsafe => new()
-    {
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=required", "TWO LINES=a").Replace("    TWO LINES=a", "b"),
-        Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Environment:\n", ""),
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=a") + "\n  Command: C:\\x.exe\n",
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "KEY=a") + "Warning: something else\n",
-        Get("Local config (private to you in this project)", @"C:\Tools\cluewren.exe", "mcp"),
-        "something this version of claude prints instead\n",
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "CLUEWREN_SANDBOX=${POLICY}"),
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "NOTE=a b"),
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "NAME=\u00fc"),
-        Get(User, @"C:\Tools\cluewren.exe", "mcp", "LONG=" + new string('x', 601)),
+        { null, "Claude Code's `claude` command isn't on PATH" },
+        { 1, "Error: the configuration file is corrupted" },
+        { 0, "something this version of claude prints instead\n" },
+        { 0, Get(User, @"C:\Tools\cluewren.exe", "mcp") + "  Command: C:\\x.exe\n" },
+        { 0, Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Environment:\n", "") },
     };
 
+    // Regression: any failed read was taken for "no entry", and an entry was added or removed on a guess.
     [Theory]
-    [MemberData(nameof(Unsafe))]
-    public void An_entry_that_cannot_be_carried_over_is_not_removed_and_the_commands_are_printed(string get)
+    [MemberData(nameof(Unknown))]
+    public void When_connect_cannot_tell_what_is_there_it_changes_nothing(int? code, string output)
     {
-        var claude = new Claude(get);
+        var adding = new Claude((code, output));
+        Assert.False(adding.Register(Command));
+        Assert.Equal([Getting], adding.Calls);
+        Assert.Contains("Couldn't tell", adding.Said[^1]);
+        var removing = new Claude((code, output));
+        Assert.False(removing.Register(null));
+        Assert.Equal([Getting], removing.Calls);
+    }
+
+    public static TheoryData<string, string, string, string[]> Kept => new()
+    {
+        { User, @"C:\Old Place\cluewren.exe", "mcp", [] },
+        { User, @"C:\Old Place\cluewren.exe", "mcp", ["CLUEWREN_SANDBOX=required"] },
+        { User, Command[0], "mcp", ["CLUEWREN_SANDBOX=required"] },
+        { User, @"C:\Program Files\dotnet\dotnet.exe", @"C:\src\bin\cluewren.dll mcp", [] },
+        { User, @"C:\Windows\System32\cmd.exe", "/c exit 0", [] },
+        { User, @"C:\tools\cluewren.cmd", "mcp", [] },
+        { "Local config (private to you in this project)", Command[0], "mcp", [] },
+    };
+
+    // Regression: an existing entry was removed and added again, losing settings the display doesn't show.
+    [Theory]
+    [MemberData(nameof(Kept))]
+    public void An_existing_entry_that_is_not_this_one_is_never_replaced(string scope, string command, string args, string[] env)
+    {
+        var claude = new Claude(Shows(scope, command, args, env));
         Assert.False(claude.Register(Command));
         Assert.Equal([Getting], claude.Calls);
+        Assert.Contains("Left Claude Code's cluewren MCP server as it is", claude.Said[^1]);
+        Assert.Contains("cluewren connect claude", claude.Said[^1]);
+    }
+
+    [Fact]
+    public void An_older_cluewren_is_named_with_the_way_to_move_to_this_one()
+    {
+        var claude = new Claude(Shows(User, @"C:\Old\cluewren.exe", "mcp"));
+        Assert.False(claude.Register(Command));
+        Assert.Contains(@"it runs C:\Old\cluewren.exe mcp, another Cluewren", claude.Said[^1]);
+        Assert.Contains("cluewren connect claude --remove, then cluewren connect claude", claude.Said[^1]);
+    }
+
+    // Regression: the reason named the other entry's command, which can hold a key of its own; env values were echoed.
+    [Fact]
+    public void Nothing_connect_says_names_another_entrys_command_args_or_environment()
+    {
+        var get = Shows(User, @"C:\secret\tool.exe", "--token=abc123", "KEY=s3cret");
+        var dll = Shows(User, @"C:\secret\dotnet.exe", @"C:\secret\Cluewren.dll mcp");
+        foreach (var shown in new[] { get, dll })
+        {
+            var adding = new Claude(shown);
+            Assert.False(adding.Register(Command));
+            var removing = new Claude(shown);
+            Assert.False(removing.Register(null));
+            Assert.All(adding.Said.Concat(removing.Said), said =>
+            {
+                Assert.DoesNotContain("secret", said);
+                Assert.DoesNotContain("abc123", said);
+                Assert.DoesNotContain("s3cret", said);
+            });
+        }
+    }
+
+    [Fact]
+    public void Remove_takes_out_cluewrens_own_entry()
+    {
+        var claude = new Claude(Shows(User, @"C:\Tools\cluewren.exe", "mcp"));
+        Assert.True(claude.Register(null));
+        Assert.Equal([Getting, Removing], claude.Calls);
+        var bare = new Claude(Shows(User, "cluewren", "mcp"));
+        Assert.True(bare.Register(null));
+        Assert.Equal([Getting, Removing], bare.Calls);
+    }
+
+    [Fact]
+    public void Remove_with_nothing_there_does_nothing()
+    {
+        var claude = new Claude((1, Absent));
+        Assert.True(claude.Register(null));
+        Assert.Equal([Getting], claude.Calls);
+    }
+
+    public static TheoryData<string, string, string, string[]> NotRemovable => new()
+    {
+        { User, @"C:\Tools\cluewren.exe", "mcp", ["CLUEWREN_SANDBOX=required"] },
+        { User, @"C:\Program Files\dotnet\dotnet.exe", @"C:\src\bin\cluewren.dll mcp", [] },
+        { User, @"C:\tools\cluewren.cmd", "mcp", [] },
+        { User, @"C:\tools\cluewren.exe", "serve", [] },
+        { User, @"C:\Windows\System32\cmd.exe", "/c exit 0", [] },
+        { "Local config (private to you in this project)", @"C:\Tools\cluewren.exe", "mcp", [] },
+    };
+
+    // Regression: entries with settings of their own, a .cmd wrapper and the dll form were removed as Cluewren's.
+    [Theory]
+    [MemberData(nameof(NotRemovable))]
+    public void Remove_leaves_an_entry_it_cannot_prove_is_cluewrens_alone(string scope, string command, string args, string[] env)
+    {
+        var claude = new Claude(Shows(scope, command, args, env));
+        Assert.False(claude.Register(null));
+        Assert.Equal([Getting], claude.Calls);
         Assert.Contains("claude mcp remove --scope user cluewren", claude.Said[^1]);
-        Assert.Contains($"claude mcp add --scope user cluewren", claude.Said[^1]);
-        Assert.Contains(Command[0], claude.Said[^1]);
-        Assert.DoesNotContain("required", claude.Said[^1]);
     }
 
     [Theory]
-    [InlineData(@"C:\Windows\System32\cmd.exe", "/c exit 0")]
-    [InlineData(@"C:\tools\cluewren-helper.exe", "mcp")]
-    [InlineData(@"C:\tools\cluewren.exe", "serve")]
-    public void A_users_own_server_named_cluewren_is_left_alone(string command, string args)
+    [InlineData(1, true)]
+    [InlineData(0, false)]
+    [InlineData(null, false)]
+    public void A_remove_that_reports_failure_is_followed_by_one_more_read(int? second, bool gone)
     {
-        var claude = new Claude(Get(User, command, args));
+        (int?, string) after = second switch { 1 => (1, Absent), 0 => Shows(User, @"C:\Tools\cluewren.exe", "mcp"), _ => (null, "timed out") };
+        var claude = new Claude(Shows(User, @"C:\Tools\cluewren.exe", "mcp"), after) { Removing = (1, "boom") };
+        Assert.Equal(gone, claude.Register(null));
+        Assert.Equal([Getting, Removing, Getting], claude.Calls);
+        Assert.Contains(second switch { 1 => "has no cluewren MCP server now", 0 => "still has its cluewren MCP server", _ => "couldn't tell" },
+            claude.Said[^1]);
+    }
+
+    [Fact]
+    public void A_failed_add_is_reported()
+    {
+        var claude = new Claude((1, Absent)) { Adding = (1, "MCP server cluewren already exists in user config") };
         Assert.False(claude.Register(Command));
-        Assert.False(claude.Register(null));
-        Assert.Equal([Getting, Getting], claude.Calls);
-    }
-
-    [Fact]
-    public void Remove_takes_out_only_cluewrens_entry()
-    {
-        var claude = new Claude(Get(User, @"C:\Tools\cluewren.exe", "mcp"));
-        Assert.True(claude.Register(null));
-        Assert.Equal([Getting, Removing], claude.Calls);
-        var none = new Claude("No MCP server named \"cluewren\". Configured servers: other", getCode: 1);
-        Assert.True(none.Register(null));
-        Assert.Equal([Getting], none.Calls);
-    }
-
-    [Fact]
-    public void A_server_not_registered_yet_is_added()
-    {
-        var claude = new Claude("No MCP server named \"cluewren\". Run `claude mcp add` to add one.", getCode: 1);
-        Assert.True(claude.Register(Command));
-        Assert.Equal([Getting, $"claude|mcp|add|--scope|user|cluewren|--|{Command[0]}|mcp"], claude.Calls);
+        Assert.Equal([Getting, Adding], claude.Calls);
+        Assert.Contains("already exists", claude.Said[^1]);
     }
 }
 

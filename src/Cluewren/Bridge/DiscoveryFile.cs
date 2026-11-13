@@ -56,7 +56,7 @@ public static class DiscoveryFile
         }
     }
 
-    internal static void CreateOwnerOnlyFolder(string folder)
+    static void CreateOwnerOnlyFolder(string folder)
     {
         if (OperatingSystem.IsWindows())
         {
@@ -70,7 +70,7 @@ public static class DiscoveryFile
         }
     }
 
-    internal static FileStream CreateOwnerOnlyFile(string path)
+    static FileStream CreateOwnerOnlyFile(string path)
     {
         if (OperatingSystem.IsWindows())
         {
