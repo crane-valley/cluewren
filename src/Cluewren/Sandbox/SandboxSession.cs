@@ -21,6 +21,8 @@ public sealed class SandboxSession : IDisposable
     const int MaxLine = 4 << 20;
     const int MaxHeldItems = 512;
     const long MaxHeldBytes = 16 << 20;
+    // Task.WaitAsync takes no longer timeout.
+    const double MaxCallSeconds = (uint.MaxValue - 1) / 1000.0;
 
     sealed class Line(JsonDocument document, byte[] rented, int length) : IDisposable
     {
@@ -53,8 +55,10 @@ public sealed class SandboxSession : IDisposable
     // Orders call registration, reply delivery, accepting what the child forwards, and the end of the session.
     readonly Lock _gate = new();
     readonly Lock _ending = new();
+    readonly Queue<(string Text, int Bytes)> _statuses = new();
     long _ids;
     bool _ended;
+    bool _saying;
     int _disposed;
     string? _failure;
 
@@ -186,6 +190,8 @@ public sealed class SandboxSession : IDisposable
         {
             _ended = true;
             _held.End();
+            while (_statuses.TryDequeue(out var status))
+                _held.Release(status.Bytes);
             var calls = _calls.Values.ToList();
             _calls.Clear();
             return calls;
@@ -288,10 +294,17 @@ public sealed class SandboxSession : IDisposable
             case "status":
             {
                 var text = root.GetProperty("text").GetString() ?? "";
+                bool start;
                 lock (_gate)
-                    if (!_ended)
-                        using (_held.Charge())
-                            _say(text);
+                {
+                    if (_ended || !Reserve(line.Length))
+                        break;
+                    _statuses.Enqueue((text, line.Length));
+                    start = !_saying;
+                    _saying = true;
+                }
+                if (start)
+                    _ = Task.Run(SayQueued);
                 break;
             }
             case "jev":
@@ -307,6 +320,37 @@ public sealed class SandboxSession : IDisposable
                 break;
         }
         line.Dispose();
+    }
+
+    // The host's callback is arbitrary code (the CLI's writes to a console nobody may be reading): it never runs under the
+    // gate, so a callback that blocks cannot keep Fail from killing the child.
+    void SayQueued()
+    {
+        while (true)
+        {
+            (string Text, int Bytes) status;
+            lock (_gate)
+            {
+                if (!_statuses.TryDequeue(out status))
+                {
+                    _saying = false;
+                    return;
+                }
+            }
+            try
+            {
+                using (_held.Charge())
+                    _say(status.Text);
+            }
+            catch (Exception e)
+            {
+                Fail($"the brain couldn't show the child's status ({e.GetType().Name}: {e.Message})");
+            }
+            finally
+            {
+                _held.Release(status.Bytes);
+            }
+        }
     }
 
     async Task Serve(Task handler, Line line)
@@ -439,6 +483,8 @@ public sealed class SandboxSession : IDisposable
 
     public async Task<JsonElement> Call(string method, object? args, double timeoutSeconds, CancellationToken ct)
     {
+        if (!(timeoutSeconds is >= 0 and <= MaxCallSeconds))
+            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds), timeoutSeconds, "not a call timeout");
         var waiter = new TaskCompletionSource<Line?>(TaskCreationOptions.RunContinuationsAsynchronously);
         long id;
         lock (_gate)
@@ -448,20 +494,20 @@ public sealed class SandboxSession : IDisposable
             id = ++_ids;
             _calls[id] = waiter;
         }
-        _out.Write((id, method, args), static (json, s) =>
-        {
-            json.WriteString("type", "call");
-            json.WriteNumber("id", s.id);
-            json.WriteString("method", s.method);
-            json.WritePropertyName("args");
-            Jsonable.Write(json, s.args ?? new Dictionary<string, object?>(), 0, round: false);
-        });
         Line? line;
         try
         {
+            _out.Write((id, method, args), static (json, s) =>
+            {
+                json.WriteString("type", "call");
+                json.WriteNumber("id", s.id);
+                json.WriteString("method", s.method);
+                json.WritePropertyName("args");
+                Jsonable.Write(json, s.args ?? new Dictionary<string, object?>(), 0, round: false);
+            });
             line = await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds), ct).ConfigureAwait(false);
         }
-        catch (Exception e) when (e is TimeoutException or OperationCanceledException)
+        catch (Exception e)
         {
             Line? late = null;
             lock (_gate)

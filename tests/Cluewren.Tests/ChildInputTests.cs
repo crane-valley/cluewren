@@ -549,6 +549,52 @@ public sealed class ChildInputTests : IDisposable
         }
         Assert.Equal(["brain", "brain"], replayed);
     }
+
+    // Before, the status callback ran under the gate on the reader: a callback that blocked kept the failure from ever
+    // reaching Kill, and Dispose waited on the same gate.
+    [Fact]
+    public async Task A_status_callback_that_blocks_keeps_neither_a_failure_nor_dispose_from_ending_the_child()
+    {
+        var child = new ScriptedChild();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var session = new SandboxSession(child, new RecordingLink(), null, () => true, null, _ =>
+        {
+            entered.Set();
+            release.Wait(Patience);
+        }, _log);
+        try
+        {
+            child.Out.Write("""{"type":"status","text":"hello"}""" + "\n");
+            Assert.True(entered.Wait(Patience));
+            child.Out.Write(Broken);
+            await child.KillStarted.Task.WaitAsync(Patience);
+            var refused = await Assert.ThrowsAsync<SandboxException>(
+                () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
+            Assert.Contains("broke the protocol", refused.Message);
+            await Task.Run(session.Dispose).WaitAsync(Patience);
+            Assert.Contains("dispose", child.Events);
+        }
+        finally
+        {
+            release.Set();
+            session.Dispose();
+        }
+    }
+
+    // Before, a timeout no TimeSpan or WaitAsync takes threw only after the call was registered and written: the child
+    // answered a call nobody waits for, and that reply was handed to the abandoned waiter instead of being freed.
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(-1.0)]
+    [InlineData(double.PositiveInfinity)]
+    public async Task A_call_with_a_timeout_that_cannot_be_waited_is_refused_before_it_reaches_the_child(double seconds)
+    {
+        var child = new ScriptedChild();
+        using var session = Start(child, new RecordingLink());
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => session.Call("ping", null, seconds, CancellationToken.None));
+        Assert.Equal("pong", await Ping(session, child));
+    }
 }
 
 public class LinkRetentionTests

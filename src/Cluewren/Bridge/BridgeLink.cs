@@ -35,8 +35,11 @@ public sealed class BridgeLink : IGameLink
     readonly LinkedList<Outgoing> _replay = new();
     readonly LinkedList<Outgoing> _unsent = new();
     readonly List<Outgoing> _writing = new(1);
+    static readonly object BrainFrames = new();
+
+    // Per owner, so that a failed child's frames, which nobody replays, never make a resume look incomplete.
+    readonly Dictionary<object, long> _lostThrough = new();
     long _sentBytes;
-    long _lostThrough = long.MinValue;
     long _nextId;
     long _gameTime = BitConverter.DoubleToInt64Bits(double.NaN);
     volatile string? _closed;
@@ -201,7 +204,8 @@ public sealed class BridgeLink : IGameLink
     {
         _sent.Remove(kept);
         _sentBytes -= kept.Value.Frame.Length;
-        _lostThrough = Math.Max(_lostThrough, kept.Value.Id);
+        var key = (object?)kept.Value.Owner ?? BrainFrames;
+        _lostThrough[key] = _lostThrough.TryGetValue(key, out var lost) ? Math.Max(lost, kept.Value.Id) : kept.Value.Id;
         kept.Value.Release();
     }
 
@@ -215,6 +219,7 @@ public sealed class BridgeLink : IGameLink
             Remove(_replay, owner);
             Remove(_unsent, owner);
             _sentBytes -= Remove(_sent, owner);
+            _lostThrough.Remove(owner);
             foreach (var frame in _writing)
                 if (frame.Owner == owner)
                     frame.Dropped = true;
@@ -287,6 +292,8 @@ public sealed class BridgeLink : IGameLink
             while (true)
             {
                 Outgoing? frame = null;
+                ValueTask write = default;
+                // Taken and begun in one step: a Drop finds the frame either still queued or with its write begun.
                 lock (_queues)
                 {
                     if ((_replay.First ?? _outgoing.First) is { } next)
@@ -294,6 +301,7 @@ public sealed class BridgeLink : IGameLink
                         next.List!.Remove(next);
                         frame = next.Value;
                         _writing.Add(frame);
+                        write = Begin(socket, frame.Frame, ct);
                     }
                 }
                 if (frame is null)
@@ -306,7 +314,7 @@ public sealed class BridgeLink : IGameLink
                 var sent = false;
                 try
                 {
-                    await socket.SendAsync(frame.Frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+                    await write.ConfigureAwait(false);
                     sent = true;
                 }
                 finally
@@ -331,6 +339,18 @@ public sealed class BridgeLink : IGameLink
         }
     }
 
+    static ValueTask Begin(WebSocket socket, byte[] frame, CancellationToken ct)
+    {
+        try
+        {
+            return socket.SendAsync(frame.AsMemory(), WebSocketMessageType.Text, true, ct);
+        }
+        catch (Exception e)
+        {
+            return ValueTask.FromException(e);
+        }
+    }
+
     void Keep(Outgoing frame)
     {
         _sent.AddLast(frame);
@@ -343,7 +363,7 @@ public sealed class BridgeLink : IGameLink
     internal bool CanResume(long received)
     {
         lock (_queues)
-            return _lostThrough <= received;
+            return _lostThrough.Values.All(lost => lost <= received);
     }
 
     // A send can succeed after the plugin's 1012 close left it, while the socket still reads Open, so only the plugin
@@ -364,6 +384,9 @@ public sealed class BridgeLink : IGameLink
             foreach (var frame in _unsent)
                 _replay.AddLast(frame);
             _unsent.Clear();
+            foreach (var (key, lost) in _lostThrough.ToList())
+                if (lost <= received)
+                    _lostThrough.Remove(key);
         }
     }
 
@@ -403,6 +426,7 @@ public sealed class BridgeLink : IGameLink
             Remove(_unsent, null);
             Remove(_sent, null);
             _sentBytes = 0;
+            _lostThrough.Clear();
             foreach (var frame in _writing)
                 frame.Dropped = true;
         }
