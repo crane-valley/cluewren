@@ -206,8 +206,17 @@ public sealed class WindowsContainer : ISandboxProcess
         if (!CreatePipe(out var read, out var write, ref attributes, PipeBytes))
             throw new Win32Exception();
         var (parent, child) = parentWrites ? (write, read) : (read, write);
-        SetHandleInformation(parent, HandleFlagInherit, 0);
-        return (new SafeFileHandle(parent, true), child);
+        try
+        {
+            SetHandleInformation(parent, HandleFlagInherit, 0);
+            return (new SafeFileHandle(parent, true), child);
+        }
+        catch
+        {
+            CloseHandle(parent);
+            CloseHandle(child);
+            throw;
+        }
     }
 
     static IntPtr EnvironmentBlock(Dictionary<string, string> environment)
@@ -224,6 +233,7 @@ public sealed class WindowsContainer : ISandboxProcess
     {
         var sid = IntPtr.Zero;
         var job = IntPtr.Zero;
+        var process = IntPtr.Zero;
         var children = new IntPtr[3];
         var parents = new SafeFileHandle?[3];
         var streams = new FileStream?[3];
@@ -278,8 +288,9 @@ public sealed class WindowsContainer : ISandboxProcess
                     ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment, environment, spec.RunFolder,
                     ref startup, out var created))
                 throw new Win32Exception();
+            process = created.hProcess;
             CloseHandle(created.hThread);
-            return new WindowsContainer(job, created.hProcess, streams[0]!, streams[1]!, streams[2]!,
+            return new WindowsContainer(job, process, streams[0]!, streams[1]!, streams[2]!,
                 contained ? "appcontainer" : "process", uncapped);
         }
         catch
@@ -288,6 +299,8 @@ public sealed class WindowsContainer : ISandboxProcess
                 stream?.Dispose();
             foreach (var parent in parents)
                 parent?.Dispose();
+            if (process != IntPtr.Zero)
+                CloseHandle(process);
             if (job != IntPtr.Zero)
                 CloseJob(job);
             throw;
