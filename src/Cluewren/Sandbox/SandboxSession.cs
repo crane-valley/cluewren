@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Text.Json;
 using Cluewren.Jev;
 using Cluewren.Kit;
@@ -16,6 +15,30 @@ public interface IEpisodeRecorder
 public sealed class SandboxSession : IDisposable
 {
     const long MaxLog = 16 << 20;
+    // The kit's own messages stay under 4 KB; what a probe prints is the open-ended part, and the host keeps 12000
+    // characters of it.
+    const int MaxLine = 4 << 20;
+    const int MaxHeldItems = 512;
+    const long MaxHeldBytes = 16 << 20;
+    // Task.WaitAsync takes no longer timeout.
+    const double MaxCallSeconds = (uint.MaxValue - 1) / 1000.0;
+
+    sealed class Line(JsonDocument document, byte[] rented, int length) : IDisposable
+    {
+        int _disposed;
+
+        public JsonElement Root => document.RootElement;
+
+        public int Length => length;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            document.Dispose();
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
 
     readonly ISandboxProcess _process;
     readonly IGameLink _link;
@@ -24,11 +47,19 @@ public sealed class SandboxSession : IDisposable
     readonly IEpisodeRecorder? _recorder;
     readonly Action<string> _say;
     readonly LineWriter _out;
-    readonly ConcurrentDictionary<long, TaskCompletionSource<JsonDocument?>> _calls = new();
+    readonly Dictionary<long, TaskCompletionSource<Line?>> _calls = new();
     readonly CancellationTokenSource _closing = new();
     readonly Action<JsonElement> _forward;
+    // Orders call registration, reply delivery, accepting what the child forwards, and the end of the session.
+    readonly Lock _gate = new();
     readonly Lock _ending = new();
+    readonly Queue<(string Text, int Bytes)> _statuses = new();
     long _ids;
+    int _heldItems;
+    long _heldBytes;
+    bool _ended;
+    bool _saying;
+    bool _overrun;
     int _disposed;
     string? _failure;
 
@@ -103,32 +134,41 @@ public sealed class SandboxSession : IDisposable
 
     void ReadLoop()
     {
-        var reader = new LineReader(_process.Output);
+        var reader = new LineReader(_process.Output, MaxLine);
         try
         {
-            while (reader.Next() is { } line)
+            while (reader.Next() is { } next)
             {
-                JsonDocument document;
+                if (Volatile.Read(ref _ended))
+                {
+                    ArrayPool<byte>.Shared.Return(next.Rented);
+                    return;
+                }
+                Line line;
                 try
                 {
-                    document = JsonDocument.Parse(line.Rented.AsMemory(0, line.Length));
+                    line = new Line(JsonDocument.Parse(next.Rented.AsMemory(0, next.Length)), next.Rented, next.Length);
                 }
-                catch (JsonException)
+                catch (JsonException e)
                 {
-                    ArrayPool<byte>.Shared.Return(line.Rented);
-                    continue;
+                    ArrayPool<byte>.Shared.Return(next.Rented);
+                    Fail($"the child broke the protocol ({e.Message})");
+                    return;
                 }
                 try
                 {
-                    Dispatch(document, line.Rented);
+                    Dispatch(line);
                 }
                 // Harness code can write JSON of any shape to the child's stdout: it ends the session, never this process.
-                catch (Exception e) when (e is KeyNotFoundException or FormatException
-                                              or InvalidOperationException and not ObjectDisposedException)
+                catch (Exception e)
                 {
-                    document.Dispose();
-                    ArrayPool<byte>.Shared.Return(line.Rented);
+                    line.Dispose();
                     Fail($"the child broke the protocol ({e.GetType().Name}: {e.Message})");
+                    return;
+                }
+                if (_overrun)
+                {
+                    Fail($"the child had the brain hold more than {MaxHeldItems} messages or {MaxHeldBytes >> 20} MB for it");
                     return;
                 }
             }
@@ -141,64 +181,183 @@ public sealed class SandboxSession : IDisposable
         catch (Exception e) when (e is IOException or ObjectDisposedException)
         {
         }
-        foreach (var call in _calls.Values)
+        foreach (var call in End())
             call.TrySetResult(null);
+    }
+
+    List<TaskCompletionSource<Line?>> End()
+    {
+        lock (_gate)
+        {
+            _ended = true;
+            while (_statuses.TryDequeue(out var status))
+            {
+                _heldItems--;
+                _heldBytes -= status.Bytes;
+            }
+            var calls = _calls.Values.ToList();
+            _calls.Clear();
+            return calls;
+        }
     }
 
     void Fail(string why)
     {
         Interlocked.CompareExchange(ref _failure, why, null);
+        var calls = End();
         // Under the lock Dispose takes: a job handle closed and reused by the next child must never be killed from here.
         lock (_ending)
             if (_disposed == 0)
                 _process.Kill();
-        foreach (var call in _calls.Values)
+        try
+        {
+            _closing.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        foreach (var call in calls)
             call.TrySetResult(null);
+    }
+
+    bool Admit(Line line)
+    {
+        lock (_gate)
+            return !_ended && Hold(line.Length);
+    }
+
+    // Under the gate. What the session holds for the child: requests being served and statuses waiting to be shown.
+    bool Hold(int bytes)
+    {
+        if (_heldItems >= MaxHeldItems || _heldBytes + bytes > MaxHeldBytes)
+        {
+            _overrun = true;
+            return false;
+        }
+        _heldItems++;
+        _heldBytes += bytes;
+        return true;
+    }
+
+    void Let(int bytes)
+    {
+        lock (_gate)
+        {
+            _heldItems--;
+            _heldBytes -= bytes;
+        }
     }
 
     static string Text(JsonElement root, string name) =>
         root.GetProperty(name).GetString() ?? throw new FormatException($"{name} is null");
 
     // Every field is read before anything is handed on, so a line that throws here has handed nothing on.
-    void Dispatch(JsonDocument document, byte[] rented)
+    void Dispatch(Line line)
     {
-        var root = document.RootElement;
+        var root = line.Root;
         switch (Text(root, "type"))
         {
             case "reply":
-                if (_calls.TryRemove(root.GetProperty("id").GetInt64(), out var call))
+            {
+                var id = root.GetProperty("id").GetInt64();
+                if (root.TryGetProperty("error", out var error)
+                        ? error.ValueKind != JsonValueKind.String
+                        : !root.TryGetProperty("value", out _))
+                    throw new FormatException("a reply without a value or an error");
+                lock (_gate)
                 {
-                    call.TrySetResult(document);
-                    return;
+                    if (_calls.Remove(id, out var call))
+                    {
+                        call.TrySetResult(line);
+                        return;
+                    }
                 }
                 break;
+            }
             case "req":
-                _ = Serve(ServeRequest(root.GetProperty("rid").GetInt64(), Text(root, "op"), root), document, rented);
+            {
+                var rid = root.GetProperty("rid").GetInt64();
+                var op = Text(root, "op");
+                if (!Admit(line))
+                    break;
+                _ = Serve(ServeRequest(rid, op, root), line);
                 return;
+            }
             case "post":
+            {
                 var op = Text(root, "op");
                 var args = root.TryGetProperty("args", out var posted) ? posted : default;
-                _link.Post(op, json => WriteFields(json, args));
+                lock (_gate)
+                    if (!_ended)
+                        _link.Post(op, json => WriteFields(json, args));
                 break;
+            }
+            // Only the brain writes raw frames to the plugin: one from the child could pass for any of them, a request
+            // included, and no kit path sends one.
             case "send":
-                var frame = root.GetProperty("frame");
-                _link.Send(json => WriteFields(json, frame));
-                break;
+                throw new FormatException("the child may not send raw frames to the game");
             case "status":
-                _say(root.GetProperty("text").GetString() ?? "");
+            {
+                var text = root.GetProperty("text").GetString() ?? "";
+                bool start;
+                lock (_gate)
+                {
+                    if (_ended || !Hold(line.Length))
+                        break;
+                    _statuses.Enqueue((text, line.Length));
+                    start = !_saying;
+                    _saying = true;
+                }
+                if (start)
+                    _ = Task.Run(SayQueued);
                 break;
+            }
             case "jev":
-                _ = Serve(ServeJev(root.GetProperty("rid").GetInt64(), root), document, rented);
+            {
+                var rid = root.GetProperty("rid").GetInt64();
+                if (!Admit(line))
+                    break;
+                _ = Serve(ServeJev(rid, root), line);
                 return;
+            }
             case "episode":
                 ServeEpisode(root.GetProperty("rid").GetInt64(), Text(root, "mark"), root.GetProperty("n").GetInt32());
                 break;
         }
-        document.Dispose();
-        ArrayPool<byte>.Shared.Return(rented);
+        line.Dispose();
     }
 
-    async Task Serve(Task handler, JsonDocument document, byte[] rented)
+    // The host's callback is arbitrary code (the CLI's writes to a console nobody may be reading): it never runs under the
+    // gate, so a callback that blocks cannot keep Fail from killing the child.
+    void SayQueued()
+    {
+        while (true)
+        {
+            (string Text, int Bytes) status;
+            lock (_gate)
+            {
+                if (!_statuses.TryDequeue(out status))
+                {
+                    _saying = false;
+                    return;
+                }
+            }
+            try
+            {
+                _say(status.Text);
+            }
+            catch (Exception e)
+            {
+                Fail($"the brain couldn't show the child's status ({e.GetType().Name}: {e.Message})");
+            }
+            finally
+            {
+                Let(status.Bytes);
+            }
+        }
+    }
+
+    async Task Serve(Task handler, Line line)
     {
         try
         {
@@ -210,8 +369,8 @@ public sealed class SandboxSession : IDisposable
         }
         finally
         {
-            document.Dispose();
-            ArrayPool<byte>.Shared.Return(rented);
+            Let(line.Length);
+            line.Dispose();
         }
     }
 
@@ -328,33 +487,49 @@ public sealed class SandboxSession : IDisposable
 
     public async Task<JsonElement> Call(string method, object? args, double timeoutSeconds, CancellationToken ct)
     {
-        var id = Interlocked.Increment(ref _ids);
-        var waiter = new TaskCompletionSource<JsonDocument?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _calls[id] = waiter;
-        _out.Write((id, method, args), static (json, s) =>
+        if (!(timeoutSeconds is >= 0 and <= MaxCallSeconds))
+            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds), timeoutSeconds, "not a call timeout");
+        var waiter = new TaskCompletionSource<Line?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        long id;
+        lock (_gate)
         {
-            json.WriteString("type", "call");
-            json.WriteNumber("id", s.id);
-            json.WriteString("method", s.method);
-            json.WritePropertyName("args");
-            Jsonable.Write(json, s.args ?? new Dictionary<string, object?>(), 0, round: false);
-        });
+            if (_ended)
+                throw new SandboxException(Volatile.Read(ref _failure) ?? "the child ended before it answered");
+            id = ++_ids;
+            _calls[id] = waiter;
+        }
+        Line? line;
         try
         {
-            using var document = await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds), ct).ConfigureAwait(false)
-                                 ?? throw new SandboxException(Volatile.Read(ref _failure) ?? "the child ended before it answered");
-            var root = document.RootElement;
+            _out.Write((id, method, args), static (json, s) =>
+            {
+                json.WriteString("type", "call");
+                json.WriteNumber("id", s.id);
+                json.WriteString("method", s.method);
+                json.WritePropertyName("args");
+                Jsonable.Write(json, s.args ?? new Dictionary<string, object?>(), 0, round: false);
+            });
+            line = await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds), ct).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            Line? late = null;
+            lock (_gate)
+                if (!_calls.Remove(id) && waiter.Task.IsCompletedSuccessfully)
+                    late = waiter.Task.Result;
+            late?.Dispose();
+            if (e is TimeoutException)
+                throw new SandboxException($"the sandbox didn't answer {method} in time");
+            throw;
+        }
+        using (line)
+        {
+            if (line is null)
+                throw new SandboxException(Volatile.Read(ref _failure) ?? "the child ended before it answered");
+            var root = line.Root;
             if (root.TryGetProperty("error", out var error))
                 throw new SandboxException(error.GetString() ?? "the child failed");
             return root.GetProperty("value").Clone();
-        }
-        catch (TimeoutException)
-        {
-            throw new SandboxException($"the sandbox didn't answer {method} in time");
-        }
-        finally
-        {
-            _calls.TryRemove(id, out _);
         }
     }
 
@@ -368,9 +543,12 @@ public sealed class SandboxSession : IDisposable
                 return;
             _disposed = 1;
         }
+        var calls = End();
         _link.Event -= _forward;
         _closing.Cancel();
         _process.Dispose();
         _closing.Dispose();
+        foreach (var call in calls)
+            call.TrySetResult(null);
     }
 }
