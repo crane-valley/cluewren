@@ -94,7 +94,9 @@ public static class ChildRuntime
         foreach (var name in Files)
             hash.AppendData(File.ReadAllBytes(Path.Combine(source, name)));
         var version = Convert.ToHexStringLower(hash.GetHashAndReset())[..16];
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Cluewren-child");
+        // Apart from Cluewren-child\<hash>, where a 0.1.0 brain copies in place and holds nothing: it is never read,
+        // written or pruned from here.
+        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Cluewren-child", "v2");
         var folder = Path.Combine(root, version);
         lock (Gate)
         {
@@ -122,16 +124,17 @@ public static class ChildRuntime
     {
         var folder = Path.Combine(root, version);
         var deadline = Stopwatch.GetTimestamp() + 60 * Stopwatch.Frequency;
+        string? lost = null;
         while (true)
         {
             if (TryLease(folder) is { } lease)
                 return lease;
             if (!Directory.Exists(folder))
-                Build(source, root, version);
+                lost = Build(source, root, version);
             else if (!AwaitComplete(folder))
                 Bury(root, folder);
             if (Stopwatch.GetTimestamp() > deadline)
-                throw new SandboxException($"the child's program folder {folder} couldn't be prepared");
+                throw new SandboxException($"the child's program folder {folder} couldn't be prepared" + (lost is null ? "" : $" ({lost})"));
         }
     }
 
@@ -157,7 +160,6 @@ public static class ChildRuntime
         return null;
     }
 
-    // Long enough for a 0.1.0 brain, which copies into the version folder itself, to finish.
     static bool AwaitComplete(string folder)
     {
         var until = Stopwatch.GetTimestamp() + 10 * Stopwatch.Frequency;
@@ -191,30 +193,36 @@ public static class ChildRuntime
         Delete(tomb);
     }
 
-    static void Build(string source, string root, string version)
+    // Null when this brain published the version; otherwise why not. Either way the Lease loop looks again, so losing a race
+    // with another brain's publish or prune only costs a round.
+    static string? Build(string source, string root, string version)
     {
         var folder = Path.Combine(root, version);
         var staging = Path.Combine(root, version + ".new-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(staging);
         try
         {
-            // Open until the copy is whole, so another brain's pruning cannot take the staging folder halfway.
-            using (var held = new FileStream(Path.Combine(staging, Files[0]), FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            try
             {
-                using (var from = File.OpenRead(Path.Combine(source, Files[0])))
-                    from.CopyTo(held);
-                foreach (var name in Files.Skip(1))
+                foreach (var name in Files)
                     File.Copy(Path.Combine(source, name), Path.Combine(staging, name));
                 if (OperatingSystem.IsWindows())
                     GrantAllAppContainers(staging);
                 File.WriteAllText(Path.Combine(staging, Ready), "");
             }
+            catch (IOException e) when (!Directory.Exists(staging))
+            {
+                return e.Message;
+            }
             try
             {
                 Directory.Move(staging, folder);
+                return null;
             }
-            catch (IOException) when (Directory.Exists(folder) || !Directory.Exists(staging))
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
+                Thread.Sleep(50);
+                return e.Message;
             }
         }
         finally
@@ -231,6 +239,10 @@ public static class ChildRuntime
             {
                 var name = Path.GetFileName(entry);
                 if (name == version || !Leftover.IsMatch(name))
+                    continue;
+                // Nothing marks a staging folder or a tombstone as in use: one created ten minutes ago, far past any build or
+                // delete, is abandoned.
+                if (name.Length > 16 && DateTime.UtcNow - Directory.GetCreationTimeUtc(entry) < TimeSpan.FromMinutes(10))
                     continue;
                 var tomb = name.Contains(".old-", StringComparison.Ordinal) ? entry
                     : Path.Combine(root, name[..16] + ".old-" + Guid.NewGuid().ToString("N"));

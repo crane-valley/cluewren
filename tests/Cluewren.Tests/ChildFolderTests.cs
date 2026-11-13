@@ -20,7 +20,9 @@ public sealed class ChildFolderTests : IDisposable
 
     string Local => Path.Combine(_profile, "AppData", "Local");
 
-    string Root => Path.Combine(Local, "Cluewren-child");
+    string Legacy => Path.Combine(Local, "Cluewren-child");
+
+    string Root => Path.Combine(Legacy, "v2");
 
     string Current => Path.Combine(Root, Version);
 
@@ -157,28 +159,63 @@ public sealed class ChildFolderTests : IDisposable
     }
 
     // Catches old versions piling up: before 0.1.1 nothing ever removed them.
+    // Also catches pruning that takes a staging folder or a tombstone too young to be known abandoned: another brain may be
+    // building in it right now.
     [InconclusiveFact]
-    public async Task Other_versions_and_leftovers_are_removed_and_other_folders_kept()
+    public async Task Other_versions_and_abandoned_leftovers_are_removed_and_young_leftovers_and_other_folders_kept()
     {
         Copy(Path.Combine(Root, "0123456789abcdef"), Files);
         File.WriteAllText(Path.Combine(Root, "0123456789abcdef", ".ready"), "");
-        Copy(Path.Combine(Root, Version + ".new-" + Guid.NewGuid().ToString("N")), Files.Take(2));
-        Copy(Path.Combine(Root, "0123456789abcdef.old-" + Guid.NewGuid().ToString("N")), Files.Take(1));
+        string Leftover(string name, int files, bool abandoned)
+        {
+            var folder = Path.Combine(Root, name + Guid.NewGuid().ToString("N"));
+            Copy(folder, Files.Take(files));
+            if (abandoned)
+                Directory.SetCreationTimeUtc(folder, DateTime.UtcNow.AddHours(-1));
+            return Path.GetFileName(folder);
+        }
+        Leftover(Version + ".new-", 2, abandoned: true);
+        Leftover("0123456789abcdef.old-", 1, abandoned: true);
+        var building = Leftover(Version + ".new-", 2, abandoned: false);
+        var deleting = Leftover("0123456789abcdef.old-", 1, abandoned: false);
         Directory.CreateDirectory(Path.Combine(Root, "notes"));
         await AssertGets(Brain(), Current);
-        Assert.Equal([Version, "notes"], Entries());
+        Assert.Equal(new[] { Version, building, deleting, "notes" }.Order(StringComparer.Ordinal), Entries());
     }
 
     // Catches pruning that deletes file by file: a version another brain holds would keep its marker and lose the rest.
     [InconclusiveFact]
-    public async Task Another_version_that_a_brain_holds_is_left_whole()
+    public async Task Of_two_other_versions_the_one_a_brain_holds_is_left_whole_and_the_other_removed()
     {
-        var other = Path.Combine(Root, "fedcba9876543210");
+        var held = Path.Combine(Root, "fedcba9876543210");
+        var free = Path.Combine(Root, "0123456789abcdef");
+        foreach (var other in new[] { held, free })
+        {
+            Copy(other, Files);
+            File.WriteAllText(Path.Combine(other, ".ready"), "");
+        }
+        using (new FileStream(Path.Combine(held, ".ready"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            await AssertGets(Brain(), Current);
+        AssertComplete(held);
+        Assert.Equal(new[] { Version, "fedcba9876543210" }.Order(StringComparer.Ordinal), Entries());
+    }
+
+    // Catches the new scheme reaching into the 0.1.0 layout, where a 0.1.0 brain copies in place and holds nothing: its
+    // folder pruned between its check and its child, or rewritten under it for the same hash.
+    [InconclusiveFact]
+    public async Task Folders_of_the_0_1_0_layout_are_neither_used_nor_pruned()
+    {
+        var other = Path.Combine(Legacy, "0123456789abcdef");
         Copy(other, Files);
         File.WriteAllText(Path.Combine(other, ".ready"), "");
-        using (new FileStream(Path.Combine(other, ".ready"), FileMode.Open, FileAccess.Read, FileShare.Read))
-            await AssertGets(Brain(), Current);
+        var copying = Path.Combine(Legacy, Version);
+        Copy(copying, Files.Take(2));
+        await AssertGets(Brain(), Current);
         AssertComplete(other);
+        Assert.Equal(Files.Take(2).Order(StringComparer.Ordinal),
+            new DirectoryInfo(copying).GetFiles().Select(file => file.Name).Order(StringComparer.Ordinal));
+        Assert.Equal(new[] { "0123456789abcdef", Version, "v2" }.Order(StringComparer.Ordinal),
+            new DirectoryInfo(Legacy).GetDirectories().Select(entry => entry.Name).Order(StringComparer.Ordinal));
     }
 
     // Catches a brain that holds nothing on its folder between choosing it and starting a child: another version's

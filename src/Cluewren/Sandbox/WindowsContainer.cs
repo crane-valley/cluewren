@@ -84,6 +84,8 @@ public sealed class WindowsContainer : ISandboxProcess
     static string? CapCpu(IntPtr job)
     {
         var processors = GetActiveProcessorCount(AllProcessorGroups);
+        if (processors == 0)
+            return new Win32Exception().Message;
         if (processors <= CeilingProcessors)
             return null;
         var rate = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
@@ -199,13 +201,13 @@ public sealed class WindowsContainer : ISandboxProcess
         return DeleteAppContainerProfile(name) == 0 && purged;
     }
 
-    static (IntPtr Parent, IntPtr Child) Pipe(ref SECURITY_ATTRIBUTES attributes, bool parentWrites)
+    static (SafeFileHandle Parent, IntPtr Child) Pipe(ref SECURITY_ATTRIBUTES attributes, bool parentWrites)
     {
         if (!CreatePipe(out var read, out var write, ref attributes, PipeBytes))
             throw new Win32Exception();
         var (parent, child) = parentWrites ? (write, read) : (read, write);
         SetHandleInformation(parent, HandleFlagInherit, 0);
-        return (parent, child);
+        return (new SafeFileHandle(parent, true), child);
     }
 
     static IntPtr EnvironmentBlock(Dictionary<string, string> environment)
@@ -220,43 +222,36 @@ public sealed class WindowsContainer : ISandboxProcess
     // The plain child comes through here too, so that it starts inside its job rather than being put there once it runs.
     public static WindowsContainer Start(ChildSpec spec, bool contained, bool requireCpuCeiling)
     {
-        var sid = contained ? Profile(spec.ContainerName) : IntPtr.Zero;
-        IntPtr job;
-        string? uncapped;
+        var sid = IntPtr.Zero;
+        var job = IntPtr.Zero;
+        var children = new IntPtr[3];
+        var parents = new SafeFileHandle?[3];
+        var streams = new FileStream?[3];
+        IntPtr capabilities = IntPtr.Zero, handles = IntPtr.Zero, jobs = IntPtr.Zero, environment = IntPtr.Zero, list = IntPtr.Zero;
+        var listMade = false;
         try
         {
             if (contained)
-                Grant(spec.RunFolder, SidOf(sid));
-            job = NewJob(spec.MemoryLimitBytes, processes: 1);
-            uncapped = CapCpu(job);
-            if (uncapped is not null && requireCpuCeiling)
             {
-                CloseJob(job);
-                throw new SandboxException($"the CPU ceiling couldn't be set ({uncapped})");
+                sid = Profile(spec.ContainerName);
+                Grant(spec.RunFolder, SidOf(sid));
             }
-        }
-        catch
-        {
-            if (sid != IntPtr.Zero)
-                FreeSid(sid);
-            throw;
-        }
-        var attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(), bInheritHandle = 1 };
-        var (inParent, inChild) = Pipe(ref attributes, parentWrites: true);
-        var (outParent, outChild) = Pipe(ref attributes, parentWrites: false);
-        var (errParent, errChild) = Pipe(ref attributes, parentWrites: false);
-        var capabilities = Marshal.AllocHGlobal(Marshal.SizeOf<SECURITY_CAPABILITIES>());
-        var handles = Marshal.AllocHGlobal(3 * IntPtr.Size);
-        var jobs = Marshal.AllocHGlobal(IntPtr.Size);
-        var environment = EnvironmentBlock(spec.Environment());
-        var list = IntPtr.Zero;
-        var process = IntPtr.Zero;
-        try
-        {
+            job = NewJob(spec.MemoryLimitBytes, processes: 1);
+            var uncapped = CapCpu(job);
+            if (uncapped is not null && requireCpuCeiling)
+                throw new SandboxException($"the CPU ceiling couldn't be set ({uncapped})");
+            var attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(), bInheritHandle = 1 };
+            for (var i = 0; i < 3; i++)
+                (parents[i], children[i]) = Pipe(ref attributes, parentWrites: i == 0);
+            for (var i = 0; i < 3; i++)
+                streams[i] = new FileStream(parents[i]!, i == 0 ? FileAccess.Write : FileAccess.Read, 1, false);
+            capabilities = Marshal.AllocHGlobal(Marshal.SizeOf<SECURITY_CAPABILITIES>());
+            handles = Marshal.AllocHGlobal(3 * IntPtr.Size);
+            jobs = Marshal.AllocHGlobal(IntPtr.Size);
+            environment = EnvironmentBlock(spec.Environment());
             Marshal.StructureToPtr(new SECURITY_CAPABILITIES { AppContainerSid = sid }, capabilities, false);
-            Marshal.WriteIntPtr(handles, 0, inChild);
-            Marshal.WriteIntPtr(handles, IntPtr.Size, outChild);
-            Marshal.WriteIntPtr(handles, 2 * IntPtr.Size, errChild);
+            for (var i = 0; i < 3; i++)
+                Marshal.WriteIntPtr(handles, i * IntPtr.Size, children[i]);
             Marshal.WriteIntPtr(jobs, job);
             var count = contained ? 3 : 2;
             nint size = 0;
@@ -264,6 +259,7 @@ public sealed class WindowsContainer : ISandboxProcess
             list = Marshal.AllocHGlobal(size);
             if (!InitializeProcThreadAttributeList(list, count, 0, ref size))
                 throw new Win32Exception();
+            listMade = true;
             if (contained)
                 Attribute(list, AttributeSecurityCapabilities, capabilities, Marshal.SizeOf<SECURITY_CAPABILITIES>());
             // Only these three cross: the default inherits every inheritable handle in the brain.
@@ -273,8 +269,8 @@ public sealed class WindowsContainer : ISandboxProcess
             {
                 StartupInfo = new STARTUPINFO
                 {
-                    cb = Marshal.SizeOf<STARTUPINFOEX>(), dwFlags = UseStdHandles, hStdInput = inChild, hStdOutput = outChild,
-                    hStdError = errChild,
+                    cb = Marshal.SizeOf<STARTUPINFOEX>(), dwFlags = UseStdHandles, hStdInput = children[0], hStdOutput = children[1],
+                    hStdError = children[2],
                 },
                 lpAttributeList = list,
             };
@@ -282,34 +278,28 @@ public sealed class WindowsContainer : ISandboxProcess
                     ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment, environment, spec.RunFolder,
                     ref startup, out var created))
                 throw new Win32Exception();
-            process = created.hProcess;
             CloseHandle(created.hThread);
-            return new WindowsContainer(job, process,
-                new FileStream(new SafeFileHandle(inParent, true), FileAccess.Write, 1, false),
-                new FileStream(new SafeFileHandle(outParent, true), FileAccess.Read, 1, false),
-                new FileStream(new SafeFileHandle(errParent, true), FileAccess.Read, 1, false),
+            return new WindowsContainer(job, created.hProcess, streams[0]!, streams[1]!, streams[2]!,
                 contained ? "appcontainer" : "process", uncapped);
         }
         catch
         {
-            CloseJob(job);
-            if (process != IntPtr.Zero)
-                CloseHandle(process);
-            CloseHandle(inParent);
-            CloseHandle(outParent);
-            CloseHandle(errParent);
+            foreach (var stream in streams)
+                stream?.Dispose();
+            foreach (var parent in parents)
+                parent?.Dispose();
+            if (job != IntPtr.Zero)
+                CloseJob(job);
             throw;
         }
         finally
         {
-            CloseHandle(inChild);
-            CloseHandle(outChild);
-            CloseHandle(errChild);
-            if (list != IntPtr.Zero)
-            {
+            foreach (var child in children)
+                if (child != IntPtr.Zero)
+                    CloseHandle(child);
+            if (listMade)
                 DeleteProcThreadAttributeList(list);
-                Marshal.FreeHGlobal(list);
-            }
+            Marshal.FreeHGlobal(list);
             Marshal.FreeHGlobal(capabilities);
             Marshal.FreeHGlobal(handles);
             Marshal.FreeHGlobal(jobs);
@@ -455,7 +445,7 @@ public sealed class WindowsContainer : ISandboxProcess
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetInformationJobObject(IntPtr job, int kind, ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION information, int size);
 
-    [DllImport("kernel32.dll")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern int GetActiveProcessorCount(ushort group);
 
     [DllImport("kernel32.dll", SetLastError = true)]

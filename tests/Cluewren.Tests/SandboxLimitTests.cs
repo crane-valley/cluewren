@@ -86,6 +86,23 @@ public sealed class SandboxLimitTests(ITestOutputHelper output) : IDisposable
         Assert.Empty(left);
     }
 
+    // Catches a start that fails once the job and the pipes exist (here because the child's tmp folder is a file) and
+    // leaves them open in the brain.
+    [Fact]
+    public async Task A_start_that_fails_part_way_leaves_no_handle_open()
+    {
+        var run = Directory.CreateDirectory(Path.Combine(_root, "run")).FullName;
+        File.WriteAllText(Path.Combine(run, "tmp"), "");
+        await using var host = Host(SandboxMode.Contained);
+        await Assert.ThrowsAsync<IOException>(() => host.ProbeAsync("1"));
+        using var self = Process.GetCurrentProcess();
+        var before = self.HandleCount;
+        for (var i = 0; i < 20; i++)
+            await Assert.ThrowsAsync<IOException>(() => host.ProbeAsync("1"));
+        self.Refresh();
+        Assert.True(self.HandleCount - before < 40, $"{self.HandleCount - before} more handles after 20 failed starts");
+    }
+
     // Catches the plain child losing the job's limits now that it is created natively: it must stay one process.
     [Fact]
     public async Task A_plain_child_is_in_its_job()
