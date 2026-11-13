@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using Cluewren.Bridge;
 using Cluewren.Jev;
+using Cluewren.Kit;
 using Cluewren.Mcp;
 using Cluewren.Sandbox;
 
@@ -126,22 +127,28 @@ namespace Cluewren
         {
             try
             {
-                try
-                {
-                    await PlaytestRun.StartGameAsync(link, null, ct).ConfigureAwait(false);
-                }
-                catch (InvalidOperationException e)
-                {
-                    Console.Error.WriteLine($"The run didn't start: {e.Message}");
-                    return 1;
-                }
-                link.Send(json => json.WriteString("type", "run_started"));
                 var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
                 await using var jev = key is null ? null : new JevClient(new JevOptions(key));
                 await using var host = new HarnessHost(new HostOptions(link, runFolder)
                 {
                     Jev = jev, Say = Console.WriteLine, Mode = sandbox,
                 });
+                var (map, problem) = await host.StartMapAsync(ct).ConfigureAwait(false);
+                if (problem is not null)
+                {
+                    Console.WriteLine(problem);
+                    return 1;
+                }
+                try
+                {
+                    await PlaytestRun.StartGameAsync(link, map, ct).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is InvalidOperationException or GameException or GameDisconnectedException)
+                {
+                    Console.Error.WriteLine($"The run didn't start: {e.Message}");
+                    return 1;
+                }
+                link.Send(json => json.WriteString("type", "run_started"));
                 var result = await host.RunHarnessAsync(seconds, ct: ct).ConfigureAwait(false);
                 Console.WriteLine($"sandbox: {result.Sandbox}");
                 Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");

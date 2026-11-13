@@ -68,9 +68,10 @@ sealed class Runner
                 "probe" => await Probe(args).ConfigureAwait(false),
                 "run_harness" => await RunHarness(args).ConfigureAwait(false),
                 "check" => await CheckHarness(args).ConfigureAwait(false),
+                "start_map" => StartMap(args),
                 _ => throw new InvalidOperationException($"unknown call {method}"),
             };
-            if (method != "ping")
+            if (method is not ("ping" or "start_map"))
                 Carry.Save(_game, _carry);
         }
         catch (Exception e)
@@ -95,6 +96,21 @@ sealed class Runner
         var type = Load(args.GetProperty("assembly").GetString()!).GetType(args.GetProperty("type").GetString()!)
                    ?? throw new TypeLoadException("the compiled assembly doesn't hold the harness class");
         return (Harness)Activator.CreateInstance(type)!;
+    }
+
+    static Dictionary<string, object?> StartMap(JsonElement args)
+    {
+        try
+        {
+            return new() { ["start_map"] = NewHarness(args).StartMap };
+        }
+        catch (Exception e)
+        {
+            return new()
+            {
+                ["problem"] = "The harness doesn't load:\n" + (e is TargetInvocationException { InnerException: { } inner } ? inner : e),
+            };
+        }
     }
 
     void Mark(int from, string flag)

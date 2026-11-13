@@ -330,6 +330,40 @@ public sealed class HarnessHost : IAsyncDisposable
         }
     }
 
+    // StartMap is the harness's own code: it is read in the child, and the harness is never made in this process.
+    public async Task<(string? StartMap, string? Problem)> StartMapAsync(CancellationToken ct = default)
+    {
+        await _one.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(_harness))
+                return (null, "harness.cs doesn't exist yet: write it first.");
+            var compiled = _compiler.CompileHarness(_harness, _lib);
+            if (!compiled.Ok)
+                return (null, "The harness doesn't load:\n" + compiled.ProblemText);
+            var session = await StartChild(ct).ConfigureAwait(false);
+            try
+            {
+                var value = await session.Call("start_map", new Dictionary<string, object?>
+                {
+                    ["assembly"] = compiled.Assembly, ["type"] = compiled.Type,
+                }, 60, ct).ConfigureAwait(false);
+                if (value.TryGetProperty("problem", out var problem) && problem.GetString() is { } text)
+                    return (null, text);
+                return (value.TryGetProperty("start_map", out var map) && map.ValueKind == JsonValueKind.String
+                    ? map.GetString() : null, null);
+            }
+            finally
+            {
+                session.Dispose();
+            }
+        }
+        finally
+        {
+            _one.Release();
+        }
+    }
+
     public void EndEpisode() => _running?.Stop();
 
     public async Task<string> SnapshotAsync(CancellationToken ct = default)

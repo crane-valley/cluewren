@@ -4,14 +4,17 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Cluewren.Bridge;
 
-public sealed class VerifiedFolder
+// The open handle keeps the file id valid: Windows may give a deleted folder's id to another one once no handle is open.
+public sealed class VerifiedFolder : IDisposable
 {
     readonly string _key;
+    readonly SafeFileHandle? _handle;
 
-    internal VerifiedFolder(string path, string key)
+    internal VerifiedFolder(string path, string key, SafeFileHandle? handle)
     {
         Path = path;
         _key = key;
+        _handle = handle;
     }
 
     public string Path { get; }
@@ -19,12 +22,14 @@ public sealed class VerifiedFolder
     public bool Holds(string path) => ProjectScope.KeyOf(path) == _key;
 
     public bool Is(VerifiedFolder other) => other._key == _key;
+
+    public void Dispose() => _handle?.Dispose();
 }
 
-public sealed class ProjectScope
+public sealed class ProjectScope : IDisposable
 {
-    // Taken once: a later look at the path could find another folder behind a re-pointed junction.
-    readonly (string Key, string Final)? _run;
+    // Taken once and held open: a later look at the path could find another folder behind a re-pointed junction.
+    readonly Opened? _run;
 
     ProjectScope(string folder, bool exact)
     {
@@ -78,21 +83,33 @@ public sealed class ProjectScope
     {
         if (_run is not { } run || Identify(project) is not { } editor)
             return null;
-        var admitted = run.Key == editor.Key
-            || (!Exact && (Within(editor.Final, run.Key) || Within(run.Final, editor.Key)));
-        return admitted ? new VerifiedFolder(Normal(project), editor.Key) : null;
+        if (run.Key == editor.Key || (!Exact && (Within(editor.Final, run.Key) || Within(run.Final, editor.Key))))
+            return new VerifiedFolder(Normal(project), editor.Key, editor.Handle);
+        editor.Dispose();
+        return null;
     }
 
-    internal static string? KeyOf(string path) => Identify(path)?.Key;
+    public void Dispose() => _run?.Dispose();
+
+    internal static string? KeyOf(string path)
+    {
+        using var opened = Identify(path);
+        return opened?.Key;
+    }
 
     static bool Within(string final, string outer)
     {
         for (var parent = Path.GetDirectoryName(final); parent is not null; parent = Path.GetDirectoryName(parent))
         {
-            if (Identify(parent)?.Key == outer)
+            if (KeyOf(parent) == outer)
                 return true;
         }
         return false;
+    }
+
+    sealed record Opened(string Key, string Final, SafeFileHandle? Handle) : IDisposable
+    {
+        public void Dispose() => Handle?.Dispose();
     }
 
     static string WithoutPrefix(string final) =>
@@ -100,7 +117,7 @@ public sealed class ProjectScope
         : final.StartsWith(@"\\?\", StringComparison.Ordinal) ? final[4..]
         : final;
 
-    static (string Key, string Final)? Identify(string path)
+    static Opened? Identify(string path)
     {
         try
         {
@@ -113,20 +130,29 @@ public sealed class ProjectScope
         }
     }
 
-    static (string Key, string Final)? IdentifyElsewhere(string path)
+    static Opened? IdentifyElsewhere(string path)
     {
         if (!Directory.Exists(path))
             return null;
         var resolved = new DirectoryInfo(path).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? path;
         var final = Normal(resolved);
-        return (final, final);
+        return new Opened(final, final, null);
     }
 
     [SupportedOSPlatform("windows")]
-    static (string Key, string Final)? IdentifyOnWindows(string path)
+    static Opened? IdentifyOnWindows(string path)
     {
-        using var handle = CreateFile(path, FileReadAttributes, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero,
+        var handle = CreateFile(path, FileReadAttributes, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero,
             FileMode.Open, BackupSemantics, IntPtr.Zero);
+        if (Describe(handle) is { } described)
+            return new Opened(described.Key, described.Final, handle);
+        handle.Dispose();
+        return null;
+    }
+
+    [SupportedOSPlatform("windows")]
+    static (string Key, string Final)? Describe(SafeFileHandle handle)
+    {
         if (handle.IsInvalid)
             return null;
         if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, out FILE_ATTRIBUTE_TAG_INFO tag,

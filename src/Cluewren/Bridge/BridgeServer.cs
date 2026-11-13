@@ -136,7 +136,7 @@ public sealed class BridgeServer : IAsyncDisposable
                 return;
             }
             _sessions.TryRemove(link.Session, out _);
-            link.Close($"the plugin disconnected ({socket.CloseStatusDescription})");
+            End(link, $"the plugin disconnected ({socket.CloseStatusDescription})");
         }
     }
 
@@ -152,8 +152,14 @@ public sealed class BridgeServer : IAsyncDisposable
         if (Volatile.Read(ref link.Generation) == generation && link.Suspended)
         {
             _sessions.TryRemove(link.Session, out _);
-            link.Close("the plugin didn't come back after reloading");
+            End(link, "the plugin didn't come back after reloading");
         }
+    }
+
+    static void End(BridgeLink link, string why)
+    {
+        link.Close(why);
+        link.Project?.Dispose();
     }
 
     async Task<(BridgeLink Link, JsonDocument Hello)?> AuthenticateAsync(WebSocket socket)
@@ -161,6 +167,8 @@ public sealed class BridgeServer : IAsyncDisposable
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
         deadline.CancelAfter(TimeSpan.FromSeconds(10));
         JsonDocument? hello = null;
+        VerifiedFolder? opened = null;
+        var kept = false;
         try
         {
             var (first, tooLarge) = await ReceiveHelloAsync(socket, deadline.Token).ConfigureAwait(false);
@@ -205,7 +213,7 @@ public sealed class BridgeServer : IAsyncDisposable
                 hello.Dispose();
                 return null;
             }
-            if (Scope.Admit(project) is not { } verified)
+            if ((opened = Scope.Admit(project)) is not { } verified)
             {
                 await RefuseAsync(socket, $"this agent's run is for another project: {Scope.Described}", deadline.Token,
                     $"{Shown(project)}: another project").ConfigureAwait(false);
@@ -245,6 +253,7 @@ public sealed class BridgeServer : IAsyncDisposable
                 return (resumable, hello);
             }
             var link = new BridgeLink(session, root) { Project = verified };
+            kept = true;
             _sessions[session] = link;
             await _connected.Writer.WriteAsync(link, deadline.Token).ConfigureAwait(false);
             return (link, hello);
@@ -254,6 +263,11 @@ public sealed class BridgeServer : IAsyncDisposable
         {
             hello?.Dispose();
             return null;
+        }
+        finally
+        {
+            if (!kept)
+                opened?.Dispose();
         }
     }
 
@@ -354,9 +368,10 @@ public sealed class BridgeServer : IAsyncDisposable
     {
         await _stopping.CancelAsync().ConfigureAwait(false);
         foreach (var link in _sessions.Values)
-            link.Close("the agent service stopped");
+            End(link, "the agent service stopped");
         await _app.StopAsync().ConfigureAwait(false);
         await _app.DisposeAsync().ConfigureAwait(false);
+        Scope.Dispose();
         _stopping.Dispose();
     }
 }

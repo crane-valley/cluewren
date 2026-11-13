@@ -282,7 +282,8 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         }
         var upper = Folder(@"Sensitive\Foo");
         var lower = Folder(@"Sensitive\foo");
-        Assert.Null(ProjectScope.ExactlyAt(upper).Admit(lower));
+        using (var scope = ProjectScope.ExactlyAt(upper))
+            Assert.Null(scope.Admit(lower));
         await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(upper));
         await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), lower));
         await AssertNoLinkAsync(server);
@@ -292,28 +293,36 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
     public void The_announced_folders_are_full_paths_without_a_trailing_separator_or_prefix()
     {
         var foo = Folder(@"Games\Foo");
-        Assert.Equal([foo], ProjectScope.Related(foo + @"\").Folders);
-        Assert.Equal([foo], ProjectScope.Related(foo.Replace('\\', '/')).Folders);
-        Assert.Equal("exact", ProjectScope.ExactlyAt(foo).Match);
-        Assert.Equal("related", ProjectScope.Related(foo).Match);
+        Assert.Equal([foo], Announced(foo + @"\"));
+        Assert.Equal([foo], Announced(foo.Replace('\\', '/')));
+        using (var exact = ProjectScope.ExactlyAt(foo))
+            Assert.Equal("exact", exact.Match);
+        using (var related = ProjectScope.Related(foo))
+            Assert.Equal("related", related.Match);
         var root = Path.GetPathRoot(foo)!;
-        Assert.Equal([root], ProjectScope.Related(root).Folders);
+        Assert.Equal([root], Announced(root));
         if (OperatingSystem.IsWindows() && ShortName(Folder("A long folder name")) is { } shortName
             && !shortName.EndsWith("A long folder name", StringComparison.Ordinal))
         {
-            var announced = ProjectScope.Related(shortName).Folders;
+            var announced = Announced(shortName);
             Assert.Equal([shortName, Path.Combine(_root, "A long folder name")], announced, StringComparer.OrdinalIgnoreCase);
         }
         else
             output.WriteLine("8.3 names are off on this volume: the short-name announcement was not checked.");
-        Assert.All(ProjectScope.Related(foo).Folders, folder => Assert.False(folder.StartsWith(@"\\?\", StringComparison.Ordinal)));
+        Assert.All(Announced(foo), folder => Assert.False(folder.StartsWith(@"\\?\", StringComparison.Ordinal)));
+    }
+
+    static string[] Announced(string folder)
+    {
+        using var scope = ProjectScope.Related(folder);
+        return [.. scope.Folders];
     }
 
     [Fact]
     public void Brain_json_carries_the_folders_and_match()
     {
         var foo = Folder("Foo");
-        var scope = ProjectScope.ExactlyAt(foo);
+        using var scope = ProjectScope.ExactlyAt(foo);
         var announced = new Discovery("ws://127.0.0.1:1/v1/bridge", "c2VjcmV0", 7, DateTimeOffset.UnixEpoch, scope.Folders,
             scope.Match);
         var path = DiscoveryFile.Write(announced, Folder("discovery"));
@@ -473,24 +482,74 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         await AssertNothingMoreAsync(plugin);
     }
 
-    // Regression: `cluewren run` started the harness straight from the link, with no project check at all.
+    // Regression: `cluewren run` started the harness straight from the link, with no project check at all; then it started
+    // the default scene, where the harness's StartMap had been played before.
     [Fact]
-    public async Task Cluewren_run_stops_when_the_started_game_names_another_project()
+    public async Task Cluewren_run_starts_the_harness_start_map_and_stops_when_that_game_names_another_project()
     {
         var foo = Folder("Foo");
         var bar = Folder("Bar");
-        var runFolder = Path.Combine(_root, "run");
+        var runFolder = Folder("run");
+        await File.WriteAllTextAsync(Path.Combine(runFolder, "harness.cs"),
+            "class A : Harness { public override string? StartMap => \"res://levels/start.tscn\"; }\n");
         await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
         await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
         var link = await server.NextLinkAsync();
-        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         var playing = RunCommand.PlayAsync(link, runFolder, 1, SandboxMode.Auto, limit.Token);
         await plugin.AnswerNextAsync(new { project_dir = foo });
-        await plugin.AnswerNextAsync(new { running = true });
+        using (var start = await plugin.ReceiveAsync())
+        {
+            Assert.Equal("session", start.RootElement.GetProperty("op").GetString());
+            Assert.Equal("res://levels/start.tscn", start.RootElement.GetProperty("args").GetProperty("map").GetString());
+            await AnswerAsync(plugin, start, new { running = true });
+        }
         await plugin.AnswerNextAsync(new { project_dir = bar });
         Assert.Equal(1, await playing);
-        Assert.False(Directory.Exists(runFolder));
+        Assert.Empty(Directory.EnumerateFiles(runFolder, "trace*"));
         await AssertNothingMoreAsync(plugin);
+    }
+
+    // Regression: a plugin's start error or a disconnect in the new start step escaped `cluewren run` as an exception.
+    [Fact]
+    public async Task Cluewren_run_reports_a_start_error_or_a_disconnect_as_a_run_that_did_not_start()
+    {
+        var foo = Folder("Foo");
+        var runFolder = Folder("run");
+        await File.WriteAllTextAsync(Path.Combine(runFolder, "harness.cs"), "class A : Harness { }\n");
+        var said = new StringWriter();
+        var error = Console.Error;
+        Console.SetError(said);
+        try
+        {
+            foreach (var disconnect in new[] { false, true })
+            {
+                await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+                await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+                var link = await server.NextLinkAsync();
+                using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                var playing = RunCommand.PlayAsync(link, runFolder, 1, SandboxMode.Auto, limit.Token);
+                await plugin.AnswerNextAsync(new { project_dir = foo });
+                if (disconnect)
+                    await plugin.Socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", default);
+                else
+                {
+                    using var start = await plugin.ReceiveAsync();
+                    await plugin.SendAsync(new Dictionary<string, object?>
+                    {
+                        ["type"] = "response", ["id"] = start.RootElement.GetProperty("id").GetInt64(), ["ok"] = false,
+                        ["status"] = 500, ["error"] = "no main scene",
+                    });
+                }
+                Assert.Equal(1, await playing);
+            }
+        }
+        finally
+        {
+            Console.SetError(error);
+        }
+        Assert.Contains("The run didn't start: session: no main scene", said.ToString());
+        Assert.Equal(2, said.ToString().Split("The run didn't start").Length - 1);
     }
 
     // Regression: a hello of exactly 64 KiB was refused when its last fragment was empty.
@@ -553,6 +612,92 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
             $"{foo}: failed the proof"], server.Refused);
         Assert.Contains("failed the proof", McpServer.NoEditorText(server, 60));
     }
+
+    // Regression: the stored file id was kept without its folder held open, and Windows may give a deleted folder's id to
+    // another one. An open handle shows as a parent that can't be renamed; the id reuse itself can't be provoked here.
+    [Fact]
+    public async Task The_run_folder_is_held_open_for_the_server_and_let_go_after()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var games = Folder("Games");
+        var foo = Folder(@"Games\Foo");
+        var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        try
+        {
+            Assert.Throws<IOException>(() => Directory.Move(games, games + "2"));
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+        Directory.Move(games, games + "2");
+    }
+
+    [Fact]
+    public async Task A_link_holds_its_folder_until_it_ends_and_a_refused_hello_holds_nothing()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var games = Folder("Games");
+        var foo = Folder(@"Games\Foo");
+        var sub = Folder(@"Games\Foo\Sub");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(games),
+            TimeSpan.FromSeconds(1));
+
+        var nonce = Handshake.NewNonce();
+        using (var socket = new ClientWebSocket())
+        {
+            await socket.ConnectAsync(new Uri(server.Url), default);
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(FakePlugin.Hello(Secret, nonce, sub)),
+                WebSocketMessageType.Text, true, default);
+            using var welcome = await ReceiveAsync(socket);
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "proof", proof = "AAAA" }),
+                WebSocketMessageType.Text, true, default);
+            using var refusal = await ReceiveAsync(socket);
+        }
+        await MovesAsync(foo);
+
+        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, sub);
+        await server.NextLinkAsync();
+        Assert.Throws<IOException>(() => Directory.Move(foo, foo + "2"));
+        await plugin.Socket.CloseOutputAsync((WebSocketCloseStatus)1012, "reload", default);
+        await DrainAsync(plugin.Socket);
+        await plugin.DisposeAsync();
+        Assert.Throws<IOException>(() => Directory.Move(foo, foo + "2"));
+        await MovesAsync(foo);
+
+        await using var again = await FakePlugin.ConnectAsync(server.Url, Secret, sub);
+        await server.NextLinkAsync();
+        await again.Socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", default);
+        await DrainAsync(again.Socket);
+        await MovesAsync(foo);
+    }
+
+    // Each move is undone, so the folder is where the next step expects it.
+    static async Task MovesAsync(string folder)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                Directory.Move(folder, folder + "2");
+                Directory.Move(folder + "2", folder);
+                return;
+            }
+            catch (IOException) when (attempt < 250)
+            {
+                await Task.Delay(20);
+            }
+        }
+    }
+
+    static Task AnswerAsync(FakePlugin plugin, JsonDocument request, object result) =>
+        plugin.SendAsync(new Dictionary<string, object?>
+        {
+            ["type"] = "response", ["id"] = request.RootElement.GetProperty("id").GetInt64(), ["ok"] = true,
+            ["result"] = result, ["t"] = 1.5,
+        });
 
     static byte[] HelloOfSize(string project, int size)
     {
