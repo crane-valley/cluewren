@@ -50,6 +50,8 @@ public sealed class HarnessHost : IAsyncDisposable
     SandboxSession? _running;
     FileStream? _claim;
     string? _downgrade;
+    // Apart from _downgrade, which sends every later child to a plain process: a missing CPU ceiling is no reason to.
+    string? _uncapped;
     string? _progress;
     int _episodes, _played, _mostDecisions, _decisions, _writesAfterPlay;
     bool _pawnSeen;
@@ -117,8 +119,9 @@ public sealed class HarnessHost : IAsyncDisposable
         var mode = _downgrade is not null ? SandboxMode.Process : _options.Mode;
         if (OperatingSystem.IsWindows() && mode != SandboxMode.Process)
             _claim ??= WindowsContainer.Claim(_runFolder);
-        var (process, note) = SandboxStarter.Start(spec, mode);
+        var (process, note, uncapped) = SandboxStarter.Start(spec, mode);
         _downgrade ??= note;
+        _uncapped = uncapped;
         SandboxSession session;
         try
         {
@@ -127,14 +130,15 @@ public sealed class HarnessHost : IAsyncDisposable
         catch (SandboxException e) when (_options.Mode == SandboxMode.Auto && process.Kind != "process")
         {
             _downgrade = SandboxStarter.Downgraded(e.Message);
-            var (plain, _) = SandboxStarter.Start(spec, SandboxMode.Process);
+            (var plain, _, _uncapped) = SandboxStarter.Start(spec, SandboxMode.Process);
             session = await Attach(plain, ct).ConfigureAwait(false);
         }
         Sandbox = session.Kind;
         return session;
     }
 
-    string WithNote(string text) => _downgrade is null ? text : $"Note: {_downgrade}\n{text}";
+    string WithNote(string text) =>
+        string.Concat(new[] { _downgrade, _uncapped }.OfType<string>().Select(note => $"Note: {note}\n")) + text;
 
     static string Cut(string text, int length) =>
         text.Length <= length ? text
