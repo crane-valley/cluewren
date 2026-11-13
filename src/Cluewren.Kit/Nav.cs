@@ -336,6 +336,12 @@ public sealed class NavMap
             var (bI, bJ) = Ij(goal.X + _reach, goal.Y + _reach, c);
             (aI, aJ, bI, bJ) = (aI - 1, aJ - 1, bI + 1, bJ + 1);
             _arrivalsInside = aI >= _loI && aJ >= _loJ && bI <= _hiI && bJ <= _hiJ;
+            // Seeding costs no steps, so a fill seeded from more cells than it may pop is skipped and A* decides alone.
+            if ((long)(Math.Min(bI, _hiI) - Math.Max(aI, _loI) + 1) * (Math.Min(bJ, _hiJ) - Math.Max(aJ, _loJ) + 1) > FillLimit)
+            {
+                _fill = null;
+                return;
+            }
             for (var i = Math.Max(aI, _loI); i <= Math.Min(bI, _hiI); i++)
                 for (var j = Math.Max(aJ, _loJ); j <= Math.Min(bJ, _hiJ); j++)
                     if (Arrived(i, j) && !IsBlocked(i, j))

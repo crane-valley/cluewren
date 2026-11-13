@@ -105,6 +105,48 @@ public class NavTests
     }
 
     [Fact]
+    public async Task A_way_planned_over_ticks_is_checked_against_what_was_seen_meanwhile()
+    {
+        var world = new World(new WorldSetup());
+        var game = world.Game();
+        var nav = await NavMap.Of(game);
+        var k = NavMap.K(Z);
+        // A stale wall across the whole map: the first plan runs over many ticks and fails, and the retry, with the wall
+        // forgotten, searches the copy of the map taken before the obstacle below was seen.
+        for (var j = -1200; j <= 1200; j++)
+            nav.Hits[(100, j, k)] = -100.0;
+        (int, int, int)[] obstacle = [(16, -1, k), (16, 0, k)];
+        var stepper = new Stepper(game, ct => Control.WalkTo(game, new Vec(5000, 0, Z), within: 100, timeout: 40, ct: ct));
+        var crossed = false;
+        for (var tick = 0; tick < 45 * 30 && !stepper.Done; tick++)
+        {
+            await stepper.Step();
+            if (tick == 2)
+            {
+                foreach (var cell in obstacle)
+                    nav.Hits[cell] = 1e9;
+                nav.Version++;
+            }
+            world.Step();
+            crossed |= world.Pos.X is >= 400 and < 425 && world.Pos.Y is >= -25 and < 25;
+        }
+        Assert.True(stepper.Done, "the walk didn't end");
+        var result = await stepper.Task!;
+        Assert.True(result.Ok, result.ToString());
+        Assert.False(crossed, "walked through a cell known to be blocked");
+    }
+
+    [Fact]
+    public void A_wide_arrival_circle_is_not_gone_through_cell_by_cell()
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var way = new NavMap().Plan(new Vec(0, 0, Z), new Vec(30000, 0, Z), 25000, Z);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.NotNull(way);
+        Assert.True(allocated < 20_000_000, $"{allocated} bytes");
+    }
+
+    [Fact]
     public void Walk_to_gives_up_on_a_target_it_cant_get_to()
     {
         var (_, setup, target, within) = Levels.All.First(level => level.Name == "closed room");

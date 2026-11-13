@@ -640,10 +640,12 @@ public static partial class Control
                     if (done && going.Planning.Way is null && !going.Forgot)
                     {
                         nav.Forget(going.Since - 5.0);
-                        plannedVersion = nav.Version;
                         var map = going.Planning.Map;
                         if (map != nav)
                             map.Forget(going.Since - 5.0);
+                        // The version of the map the retry searches: when that is an older copy, what sonar saw since
+                        // gets the way checked on the next tick.
+                        plannedVersion = map.Version;
                         going = going with { Planning = map.StartPlan(going.At, going.Goal, within, going.Feet), Forgot = true };
                         done = going.Planning.Advance(ref steps);
                     }
