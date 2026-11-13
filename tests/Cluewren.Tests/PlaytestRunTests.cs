@@ -39,8 +39,8 @@ sealed class FakeEditor : IAsyncDisposable
         var project = Directory.CreateTempSubdirectory("cluewren-project").FullName;
         Directory.CreateDirectory(Path.Combine(project, "Library", "CluewrenCodex"));
         await File.WriteAllTextAsync(Path.Combine(project, "Library", "CluewrenCodex", "summary.txt"), "");
-        var server = await BridgeServer.StartAsync(Secret);
-        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(project));
+        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, project);
         var link = await server.NextLinkAsync();
         return new FakeEditor(server, plugin, link, project);
     }
