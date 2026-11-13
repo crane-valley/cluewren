@@ -30,15 +30,15 @@ public abstract class TempTests : IDisposable
 
     public static async Task<Result> Drive(Game game, Func<CancellationToken, Task<Result>> controller, double seconds = 20)
     {
-        var watch = Stopwatch.StartNew();
+        var t0 = game.Clock.Monotonic();
         var stepper = new Stepper(game, controller);
-        while (watch.Elapsed.TotalSeconds < seconds)
+        while (game.Clock.Monotonic() - t0 < seconds)
         {
             game.Renew();
             await stepper.Step();
             if (stepper.Done)
                 return await stepper.Task!;
-            await Task.Delay(TimeSpan.FromSeconds(1.0 / 30));
+            await game.Clock.Delay(1.0 / 30);
         }
         await stepper.Stop();
         throw new Xunit.Sdk.XunitException("the controller didn't finish");
@@ -59,7 +59,7 @@ public abstract class TempTests : IDisposable
 }
 
 // time.sleep is good to a millisecond on Windows; Task.Delay rounds up to the 15.6 ms timer tick, which makes Control.Run's
-// 15 Hz about 13 Hz. The wolf's bite is phased against those ticks, so the tactic tests need upstream's real rate.
+// 15 Hz about 13 Hz.
 public sealed class PreciseClock : IClock
 {
     public static readonly PreciseClock Instance = new();
@@ -106,6 +106,7 @@ public class FakeLink : SimLink
 
     protected readonly Lock Gate = new();
     long _wall = Stopwatch.GetTimestamp();
+    double _clockAt;
 
     public FakeLink() => GameTime = 0;
 
@@ -125,8 +126,18 @@ public class FakeLink : SimLink
 
     public List<Input> Inputs { get; } = [];
 
+    // The game's time, when this is the kit's clock too: the game then moves only as far as the kit's ticks take it,
+    // however slow the machine, where the wall clock lets a loaded one move it further between two reads.
+    public VirtualClock? Clock { get; set; }
+
     protected double Elapse()
     {
+        if (Clock is { } clock)
+        {
+            var passed = clock.T - _clockAt;
+            _clockAt = clock.T;
+            return passed;
+        }
         var now = Stopwatch.GetTimestamp();
         var dt = Stopwatch.GetElapsedTime(_wall, now).TotalSeconds;
         _wall = now;
@@ -400,7 +411,9 @@ public sealed class SlowFrameLink : FakeLink
     public override async ValueTask<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args = null,
         TimeSpan? timeout = null, CancellationToken ct = default)
     {
-        if (op != "key")
+        if (op != "key" && Clock is { } clock)
+            clock.T += Frame;
+        else if (op != "key")
             await Task.Delay(TimeSpan.FromSeconds(Frame), ct);
         return await base.RequestAsync(op, args, timeout, ct);
     }
@@ -785,8 +798,8 @@ public class KitRuntimeTests : TempTests
     [Fact]
     public async Task Look_at_and_walk_to_work_when_every_read_takes_a_frame()
     {
-        var link = new SlowFrameLink();
-        var game = Looking(link);
+        var link = new SlowFrameLink { Clock = new VirtualClock() };
+        var game = new Game(link, link.Clock) { Look = new LookScale { X = 0.1, Y = 0.1 } };
         var r = await Drive(game, ct => Control.LookAt(game, new Vec(0, 3000, 100), tolerance: 1.5, timeout: 0.6, ct: ct));
         Assert.True(r.Ok, r.ToString());
         var target = new Vec(1200, 3000, 100);
@@ -954,12 +967,14 @@ public class KitRuntimeTests : TempTests
         link.Paused = true;
         var watch = Stopwatch.StartNew();
         await Drive(game, ct => Control.Wait(game, 1.0, ct), 10);
-        Assert.True(watch.Elapsed.TotalSeconds is > 0.9 and < 1.8, $"{watch.Elapsed.TotalSeconds}");
+        // The upper bounds only tell a wait that ends from one held by the stopped game clock, which Drive cuts at 10 s:
+        // closer ones fail on a loaded machine.
+        Assert.True(watch.Elapsed.TotalSeconds is > 0.9 and < 5, $"{watch.Elapsed.TotalSeconds}");
         link.Paused = false;
         await game.Context(fresh: true);
         var g0 = game.T;
         watch.Restart();
         await Drive(game, ct => Control.Wait(game, 1.0, ct), 10);
-        Assert.True(game.T - g0 >= 0.95 && watch.Elapsed.TotalSeconds < 1.6, $"{game.T - g0}, {watch.Elapsed.TotalSeconds}");
+        Assert.True(game.T - g0 >= 0.95 && watch.Elapsed.TotalSeconds < 5, $"{game.T - g0}, {watch.Elapsed.TotalSeconds}");
     }
 }

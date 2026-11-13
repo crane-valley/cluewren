@@ -84,9 +84,12 @@ public class JevClientTests
         ],
         new NowDoing("b", 1.26), [new RecentOption("a", 2.04, false, "stuck")]);
 
+    // Not the decision deadline: a machine busy with other work has stalled a first call past it.
+    static readonly TimeSpan Patience = TimeSpan.FromMinutes(1);
+
     static JevClient Client(FakeJev fake, Func<JevOptions, JevOptions>? change = null)
     {
-        var options = new JevOptions("test-key") { BaseUrl = fake.Url };
+        var options = new JevOptions("test-key") { BaseUrl = fake.Url, AttemptTimeout = Patience, TotalTimeout = Patience };
         return new JevClient(change?.Invoke(options) ?? options);
     }
 
@@ -139,12 +142,7 @@ public class JevClientTests
     {
         await using var fake = await FakeJev.StartAsync();
         var dualStackName = new UriBuilder(fake.Url) { Host = "localhost" }.Uri;
-        // Not the decision deadline: a runner busy starting the other tests has stalled this first call past it.
-        var patience = TimeSpan.FromMinutes(1);
-        await using var client = Client(fake, options => options with
-        {
-            BaseUrl = dualStackName, AttemptTimeout = patience, TotalTimeout = patience,
-        });
+        await using var client = Client(fake, options => options with { BaseUrl = dualStackName });
         var decision = await client.DecideAsync(Request, default);
         Assert.Equal(0.9, decision.Probabilities["a"]);
     }

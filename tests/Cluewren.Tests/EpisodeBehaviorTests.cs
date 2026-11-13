@@ -58,9 +58,12 @@ public class EpisodeBehaviorTests : TempTests
             TickHz = 500;
         }
 
+        public int Observations { get; private set; }
+
         public override async Task<Obs> Observe(Game game)
         {
             await game.Pose();
+            Observations++;
             return new Obs();
         }
 
@@ -111,7 +114,8 @@ public class EpisodeBehaviorTests : TempTests
     }
 
     const double Limit = 10;
-    const double Short = 0.4;
+    // Long enough for a second decision on a loaded machine: the tests that use it count decisions, not time.
+    const double Short = 2.0;
 
     Task<EpisodeResult> Play(Harness harness, IGameLink link, double seconds, IDecider? client = null) =>
         new Runtime(new Game(link), harness, Tmp("t.jsonl"), client, seconds).Run();
@@ -192,8 +196,10 @@ public class EpisodeBehaviorTests : TempTests
     {
         var steps = 0;
         var harness = new ScriptedHarness(_ => new Status(), () => [Counts("a", () => steps++)]);
-        await Play(harness, new FakeGame(TimeSpan.FromMilliseconds(100)), 0.3);
-        Assert.True(steps > 10, $"only {steps} steps ran");
+        await Play(harness, new FakeGame(TimeSpan.FromMilliseconds(100)), 1.5);
+        // Against the observations, not the clock: a loaded machine slows the steps, but a stalled controller steps
+        // once an observation.
+        Assert.True(steps > 2 * harness.Observations, $"{steps} steps over {harness.Observations} observations");
     }
 
     [Fact]
@@ -270,20 +276,26 @@ public class EpisodeBehaviorTests : TempTests
         var option = Counts("a", () => steps++);
         var harness = new TempoHarness(() => [option, Runs("b")]);
         var decider = new FakeDecider(_ => new Dictionary<string, double> { ["a"] = 1 }, TimeSpan.FromMilliseconds(60));
-        await Play(harness, new FakeGame(), Short, decider);
-        Assert.True(steps >= 15, $"only {steps} steps ran");
+        await Play(harness, new FakeGame(), 2.0, decider);
+        int asked;
+        lock (decider.Requests)
+            asked = decider.Requests.Count;
+        Assert.True(steps > 2 * asked, $"{steps} steps over {asked} decisions");
     }
 
     [Fact]
     public async Task An_option_failing_at_once_is_held_back()
     {
-        var starts = 0;
-        var failing = Fails("a", () => starts++);
-        var harness = new TempoHarness(() => [failing]);
+        var harness = new TempoHarness(() => [Fails("a")]);
         var result = await Play(harness, new FakeGame(), 0.3);
-        Assert.Equal(1, starts);
-        Assert.Equal(1, result.Options["a"].Get("failed"));
-        Assert.Equal(1, result.Options["a"].Get("held_back"));
+        // A loaded machine can carry the episode past the first hold, so later starts are judged by the hold, not counted.
+        var starts = OfKind(Tmp("t.jsonl"), "option_start").Select(e => e.GetProperty("t").GetDouble()).ToList();
+        var ends = OfKind(Tmp("t.jsonl"), "option_end").Select(e => e.GetProperty("t").GetDouble()).ToList();
+        Assert.NotEmpty(starts);
+        for (var i = 1; i < starts.Count; i++)
+            Assert.True(starts[i] >= ends[i - 1] + 0.5 * Math.Pow(2, i - 1) - 0.01, $"start {starts[i]} after an end at {ends[i - 1]}");
+        Assert.Equal(starts.Count, result.Options["a"].Get("failed"));
+        Assert.Equal(starts.Count, result.Options["a"].Get("held_back"));
     }
 
     [Fact]

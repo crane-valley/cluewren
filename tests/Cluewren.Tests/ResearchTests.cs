@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 using Cluewren.Kit;
 using Cluewren.Tests.Sim;
@@ -15,7 +14,7 @@ public sealed class ArenaLink : SimLink
     public const string Crate = "Arena:/Crate_C_0";
 
     readonly Lock _gate = new();
-    long _wall = Stopwatch.GetTimestamp();
+    double _clockAt;
     double _bitAt = -1e9;
 
     public ArenaLink() => GameTime = 0;
@@ -41,9 +40,9 @@ public sealed class ArenaLink : SimLink
 
     public Enemy? Enemy { get; set; }
 
-    // Game time passing with each pose read, a tick's, instead of the wall clock's: a loaded machine then can't let the
+    // The game's time is the kit's clock, not the wall clock: a loaded machine would otherwise let the player and the
     // enemy cover more ground between two reads than an idle one does.
-    public double? SecondsPerPose { get; set; }
+    public VirtualClock Clock { get; } = new();
 
     public double Ground(double x) => Slope * (x - 600);
 
@@ -55,11 +54,10 @@ public sealed class ArenaLink : SimLink
         return Math.Abs(Mod(Yaw - want + 180, 360) - 180) < 10;
     }
 
-    void Advance(string op)
+    void Advance()
     {
-        var now = Stopwatch.GetTimestamp();
-        var dt = SecondsPerPose is { } frame ? (op == "pose" ? frame : 0) : Stopwatch.GetElapsedTime(_wall, now).TotalSeconds;
-        _wall = now;
+        var dt = Clock.T - _clockAt;
+        _clockAt = Clock.T;
         GameTime = (GameTime ?? 0) + dt;
         var me = Pos[Hero];
         if (Held.Contains("W") && Health[Hero] > 0)
@@ -96,7 +94,7 @@ public sealed class ArenaLink : SimLink
     {
         lock (_gate)
         {
-            Advance(op);
+            Advance();
             switch (op)
             {
                 case "context":
@@ -239,7 +237,7 @@ public class ResearchTests
 
     public ResearchTests() => _game = Looking(_link);
 
-    static Game Looking(ArenaLink link) => new(link) { Look = new LookScale { X = 0.1, Y = 0.1 } };
+    static Game Looking(ArenaLink link) => new(link, link.Clock) { Look = new LookScale { X = 0.1, Y = 0.1 } };
 
     static long Stat(Dictionary<string, object?> r, string which, string field) =>
         (long)((Dictionary<string, object?>)r[which]!)[field]!;
@@ -515,7 +513,6 @@ public class ResearchTests
     {
         _link.Enemy = new Enemy(Gob1, 400, 110, 0.3, 25, 2.0, 30);
         _link.Health[Gob1] = 20;
-        _link.SecondsPerPose = 1.0 / 15;
         var r = await Research.EnemyProfile(_game, "/Game/BP_Goblin.BP_Goblin_C", seconds: 6, safeDistance: 600);
         Assert.Equal(Gob1, r["target"]);
         Assert.True(r["comes"] is true, Fmt.Json(r));
