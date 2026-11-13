@@ -62,6 +62,16 @@ public class McpServerTests
     }
 
     [Fact]
+    public async Task A_call_that_reaches_a_stopped_server_is_told_so()
+    {
+        var server = new McpServer(new StringWriter());
+        await server.DisposeAsync();
+        var result = await server.CallAsync("probe", new JsonObject { ["code"] = "1" });
+        Assert.True(result.Error);
+        Assert.Contains("the server is stopping", result.Text);
+    }
+
+    [Fact]
     public async Task Wait_with_nothing_going_is_no_error()
     {
         await using var server = new McpServer(new StringWriter());
@@ -110,6 +120,47 @@ public class McpServerTests
         {
             if (!brain.HasExited)
                 brain.Kill();
+        }
+    }
+
+    [Theory]
+    [InlineData("--version", 0, null)]
+    [InlineData("--help", 0, null)]
+    [InlineData("-h", 0, null)]
+    [InlineData("", 2, null)]
+    [InlineData("serve", 2, null)]
+    [InlineData("connect", 2, null)]
+    [InlineData("run", 2, null)]
+    [InlineData("run|folder", 2, "nope")]
+    public async Task The_command_line_answers_what_it_knows_and_refuses_the_rest(string line, int code, string? sandbox)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "Cluewren.exe"))
+        {
+            UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (var arg in line.Split('|', StringSplitOptions.RemoveEmptyEntries))
+            start.ArgumentList.Add(arg);
+        if (sandbox is not null)
+            start.Environment["CLUEWREN_SANDBOX"] = sandbox;
+        using var cli = System.Diagnostics.Process.Start(start)!;
+        cli.StandardInput.Close();
+        var (output, error) = (cli.StandardOutput.ReadToEndAsync(), cli.StandardError.ReadToEndAsync());
+        try
+        {
+            using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await cli.WaitForExitAsync(limit.Token);
+            Assert.Equal(code, cli.ExitCode);
+            if (line == "--version")
+                Assert.Equal($"cluewren {McpServer.Version}", (await output).Trim());
+            else if (code == 0)
+                Assert.Contains("usage:", await output);
+            else
+                Assert.Contains(sandbox is null ? "usage:" : "CLUEWREN_SANDBOX", await error);
+        }
+        finally
+        {
+            if (!cli.HasExited)
+                cli.Kill();
         }
     }
 
@@ -237,6 +288,53 @@ public class ConnectTests
         var text = Connect.ClaudeDescriberText();
         Assert.Contains("tools: mcp__cluewren__frames\n", text);
         Assert.Contains("Never judge", text);
+    }
+
+    [Fact]
+    public void Connect_claude_sets_up_its_own_server_and_files_and_leaves_the_users_alone()
+    {
+        var home = Directory.CreateTempSubdirectory("claude-home").FullName;
+        var was = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+        try
+        {
+            Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", home);
+            var skill = Path.Combine(home, "skills", "cluewren", "SKILL.md");
+            var describer = Path.Combine(home, "agents", "frame-describer.md");
+            var commands = new List<string[]>();
+            string? server = null;
+            var connect = new Connect(_ => { }, command =>
+            {
+                commands.Add(command);
+                if (command[2] == "get")
+                    return server is null ? (1, "No MCP server found") : (0, $"Command: {server}");
+                if (command[2] == "remove")
+                    server = null;
+                return (0, "");
+            });
+
+            Assert.Equal(0, connect.Add("claude"));
+            Assert.Equal((string[])["claude", "mcp", "add", "--scope", "user", "cluewren", "--", .. Connect.ServerCommand()], commands[^1]);
+            Assert.Contains("cluewren connect", File.ReadAllText(skill));
+            Assert.Contains("cluewren connect", File.ReadAllText(describer));
+
+            server = "C:/tools/cluewren.exe mcp";
+            Assert.Equal(0, connect.Remove("claude"));
+            Assert.Null(server);
+            Assert.False(File.Exists(skill) || File.Exists(describer));
+
+            server = "npx someone-elses-server";
+            Directory.CreateDirectory(Path.GetDirectoryName(describer)!);
+            File.WriteAllText(describer, "mine");
+            commands.Clear();
+            Assert.Equal(3, connect.Add("claude"));
+            Assert.DoesNotContain(commands, command => command[2] is "add" or "remove");
+            Assert.Equal("mine", File.ReadAllText(describer));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", was);
+            Directory.Delete(home, true);
+        }
     }
 
     [Fact]

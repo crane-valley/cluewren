@@ -1,6 +1,6 @@
-using System.Diagnostics;
 using System.Text.Json;
 using Cluewren.Kit;
+using Cluewren.Tests.Sim;
 
 namespace Cluewren.Tests;
 
@@ -112,7 +112,8 @@ public class TacticsTests
 
     (WolfLink, Game) Make(WolfLink link)
     {
-        var game = new Game(link, PreciseClock.Instance) { Look = new LookScale { X = 0.1, Y = 0.1 } };
+        link.Clock = new VirtualClock();
+        var game = new Game(link, link.Clock) { Look = new LookScale { X = 0.1, Y = 0.1 } };
         game.Log = (kind, fields) =>
         {
             if (kind == "tactic")
@@ -223,13 +224,13 @@ public class TacticsTests
     public async Task Shoot_fires_at_its_rate_until_the_target_is_down()
     {
         (_link.InSight, _link.OnCrosshair, _link.WolfAt) = (true, true, new Vec(140, 0, 100));
-        var clock = Stopwatch.StartNew();
+        var t0 = _game.Clock.Monotonic();
         var r = await Control.Run(_game, ct => Control.Shoot(_game, Wolf, every: 0.2, timeout: 5, ct: ct), 8);
         Assert.True(r.Ok, r.ToString());
         Assert.Equal("target down", r.Why);
         Assert.Equal(3, r.Data["shots"]);
         Assert.Equal(3, _link.Strikes);
-        Assert.True(clock.Elapsed.TotalSeconds >= 0.4, $"{clock.Elapsed.TotalSeconds}");
+        Assert.True(_game.Clock.Monotonic() - t0 >= 0.4, $"{_game.Clock.Monotonic() - t0}");
     }
 
     [Fact]
@@ -266,11 +267,11 @@ public class TacticsTests
     public async Task Shoot_gives_up_on_a_target_it_cannot_see_from_beside_it()
     {
         _link.WolfAt = new Vec(100, 0, 100);
-        var clock = Stopwatch.StartNew();
+        var t0 = _game.Clock.Monotonic();
         var r = await Control.Run(_game, ct => Control.Shoot(_game, Wolf, timeout: 4, ct: ct), 8);
         Assert.False(r.Ok);
         Assert.Equal("no line of sight", r.Why);
-        Assert.True(clock.Elapsed.TotalSeconds < 3, $"{clock.Elapsed.TotalSeconds}");
+        Assert.True(_game.Clock.Monotonic() - t0 < 3, $"{_game.Clock.Monotonic() - t0}");
     }
 
     [Fact]

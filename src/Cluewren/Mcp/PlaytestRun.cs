@@ -480,11 +480,11 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     public async Task<ToolResult> CallAsync(string tool, JsonObject args, CancellationToken ct = default)
     {
-        if (Ended is not null)
-            return ToolResult.Say($"This run has ended ({Ended}). Tell the user its outcome; start_run starts another.", true);
         await _one.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (Ended is not null)
+                return ToolResult.Say($"This run has ended ({Ended}). Tell the user its outcome; start_run starts another.", true);
             _busy = true;
             _lastCall = DateTimeOffset.UtcNow;
             var result = await DispatchAsync(tool, args, ct).ConfigureAwait(false);

@@ -21,6 +21,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
 
     static readonly HashSet<string> ReadOnly = ["wait", "snapshot", "frames"];
 
+    static readonly TimeSpan StopPatience = TimeSpan.FromSeconds(15);
+
     static readonly (string Name, string Description, string Schema)[] Tools =
     [
         ("start_run",
@@ -119,7 +121,14 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     {
         message["jsonrpc"] = "2.0";
         var text = message.ToJsonString();
-        await _send.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await _send.WaitAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
         try
         {
             await output.WriteLineAsync(text).ConfigureAwait(false);
@@ -249,7 +258,15 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
 
     async Task<ToolResult> DoAsync(string tool, JsonObject args)
     {
-        await _runLock.WaitAsync(_stopping.Token).ConfigureAwait(false);
+        try
+        {
+            await _runLock.WaitAsync(_stopping.Token).ConfigureAwait(false);
+        }
+        // A call queued behind another reaches here after DisposeAsync has cancelled these, or disposed them.
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException)
+        {
+            return ToolResult.Say("Not run: the server is stopping.", true);
+        }
         try
         {
             if (tool == "start_run")
@@ -368,11 +385,24 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     public async ValueTask DisposeAsync()
     {
         await _stopping.CancelAsync().ConfigureAwait(false);
-        if (_watch is not null)
-            await _watch.ConfigureAwait(false);
-        await CloseRunAsync().ConfigureAwait(false);
-        _stopping.Dispose();
+        // A run_harness whose child doesn't stop holds the lock for minutes, and with it the editor and brain.json.
+        var locked = await _runLock.WaitAsync(StopPatience).ConfigureAwait(false);
+        try
+        {
+            if (_watch is not null)
+                await _watch.ConfigureAwait(false);
+            await CloseRunAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            if (locked)
+                _runLock.Release();
+        }
         _send.Dispose();
+        // The call still holding the lock goes on to use these.
+        if (!locked)
+            return;
+        _stopping.Dispose();
         _runLock.Dispose();
     }
 }
