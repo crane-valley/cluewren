@@ -48,12 +48,19 @@ brain.json.
   final link. No match is refused with a text naming the run's folder, since the peer is authenticated by then.
 - A refusal by the brain uses the existing path, an error frame and a close, so each engine shows it as it shows a
   refused brain today. A refused editor is not attached and runs none of its on-welcome effects.
-- Binding. A welcomed link carries its verified project. The run's memory folder is made under it, and the game's
-  `context.project_dir` must be the same folder by identity or the run does not start. A hello with `resume` must carry
-  the project and the engine of the session it resumes, or it is refused.
-- Limits: at most 8 handshakes in progress, further connections are answered 503 before the upgrade. Refusals kept for
-  the agent are capped at 8 distinct entries, a folder at 260 characters; an unauthenticated refusal is kept only as a
-  fixed text, so nothing such a peer sends reaches the agent.
+- Binding. The identity (volume serial and file id) is taken once: of the run's folder when the run starts, of the
+  editor's folder when its hello is verified. A welcomed link carries its folder and that identity, and every later
+  look compares a newly opened folder with the stored identity, never with a path opened again, so a junction re-pointed
+  meanwhile does not carry a session or a run to another folder. A hello with `resume` must carry the project and the
+  engine of the session it resumes, or it is refused.
+- The game is started and its project confirmed before anything else. The game's `context.project_dir` must be the
+  verified folder before the game starts and again once it runs (Godot answers from the editor until then), and the
+  verified path must still lead to it. Only then is the memory folder made, recording started and run_started sent.
+  start_run and `cluewren run` share this step, and `cluewren run` takes it before any harness starts.
+- Limits: at most 8 handshakes in progress, further connections are answered 503 before the upgrade. A hello of exactly
+  64 KiB is taken however it is fragmented. Every explicit refusal at the handshake is kept for the agent, capped at 8
+  distinct entries and a folder at 260 characters; a refusal before the mac is verified (too large, not a hello of
+  protocol 1, no mac, a wrong mac) is kept only as a fixed text, so nothing such a peer sends reaches the agent.
 - When no editor connects, start_run's error names the run's folder, each refusal at the handshake, and says that an
   editor of another project does not connect and shows the reason in its own Cluewren window. `cluewren run` prints one
   line for each new refusal.
@@ -101,7 +108,10 @@ the identity comparison behind them.
 - A process started with the connect flag on its command line prepares itself before brain.json is read: a Unity batch
   start, a Godot game's logger and UI tracking, Unreal's log device. That is the user's own command, and this decision
   does not cover it.
-- macOS and Linux keep working as before and stay unsupported: their comparison is tested only by review.
+- An editor whose own project is at a drive root (`C:\`) is supported, and each engine's tests cover it.
+- Platforms: the brain and the Unity plugin keep working on macOS and Linux as before, unsupported, with the comparison
+  above tested by review only. The Godot plugin refuses every platform but Windows (it can't check brain.json's owner
+  there, lib/discovery.gd) and the Unreal plugin is Win64 only (ADR 0010); this decision does not change that.
 - Tests: tests/Cluewren.Tests/ProjectBindingTests.cs for the brain over real loopback sockets; each engine's plugin tests
   for the vector table and for a "for another project" verdict that leaves no socket and, on Unity, no input change.
 

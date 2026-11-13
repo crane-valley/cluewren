@@ -33,7 +33,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         {
             await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, project);
             var link = await server.NextLinkAsync();
-            Assert.True(ProjectScope.SameFolder(project, link.Project), project);
+            Assert.True(link.Project!.Holds(project), project);
         }
         Assert.Empty(server.Refused);
     }
@@ -65,7 +65,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         foreach (var other in new[] { games, assets })
             await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), other));
         await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo + @"\");
-        Assert.True(ProjectScope.SameFolder(foo, (await server.NextLinkAsync()).Project));
+        Assert.True((await server.NextLinkAsync()).Project!.Holds(foo));
     }
 
     // Regression: a 0.1.0 plugin, whose hello carries no project, was welcomed.
@@ -198,7 +198,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
         await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), bar));
         await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
-        Assert.True(ProjectScope.SameFolder(foo, (await server.NextLinkAsync()).Project));
+        Assert.True((await server.NextLinkAsync()).Project!.Holds(foo));
         Assert.Equal([$"{bar}: another project"], server.Refused);
     }
 
@@ -282,7 +282,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         }
         var upper = Folder(@"Sensitive\Foo");
         var lower = Folder(@"Sensitive\foo");
-        Assert.False(ProjectScope.SameFolder(upper, lower));
+        Assert.Null(ProjectScope.ExactlyAt(upper).Admit(lower));
         await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(upper));
         await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), lower));
         await AssertNoLinkAsync(server);
@@ -367,6 +367,229 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
             if (!cluewren.HasExited)
                 cluewren.Kill();
         }
+    }
+
+    // Regression: a resume compared a re-opened path, so a junction re-pointed while the link was down passed.
+    [Fact]
+    public async Task A_resume_through_a_re_pointed_junction_is_another_project()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var foo = Folder(@"Games\Foo");
+        var bar = Folder(@"Games\Bar");
+        var link = await JunctionAsync("Link", foo);
+        try
+        {
+            await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(_root));
+            var first = await FakePlugin.ConnectAsync(server.Url, Secret, link, engine: "godot");
+            await server.NextLinkAsync();
+            await first.Socket.CloseOutputAsync((WebSocketCloseStatus)1012, "reload", default);
+            await DrainAsync(first.Socket);
+            await first.DisposeAsync();
+            await RepointAsync(link, bar);
+
+            Assert.Contains("another project or engine",
+                await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), link, first.Session, "godot")));
+            await using var second = await FakePlugin.ConnectAsync(server.Url, Secret, foo, first.Session, "godot");
+            Assert.Equal(first.Session, second.Session);
+        }
+        finally
+        {
+            Directory.Delete(link);
+        }
+    }
+
+    // Regression: the game's project was compared with a re-opened path, not with the folder verified at the handshake.
+    [Fact]
+    public async Task A_context_through_a_re_pointed_junction_stops_the_run()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var foo = Folder(@"Games\Foo");
+        var bar = Folder(@"Games\Bar");
+        var link = await JunctionAsync("Link", foo);
+        try
+        {
+            await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(_root));
+            await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, link);
+            var connected = await server.NextLinkAsync();
+            await RepointAsync(link, bar);
+            using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var opening = PlaytestRun.OpenAsync(connected, new RunRequest("x", "goal"), null!, "test", SandboxMode.Auto,
+                limit.Token);
+            await plugin.AnswerNextAsync(new { project_dir = link });
+            await Assert.ThrowsAsync<InvalidOperationException>(() => opening);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(foo));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(bar));
+        }
+        finally
+        {
+            Directory.Delete(link);
+        }
+    }
+
+    // Regression: the run's own folder was opened again at each hello, so its junction re-pointed after start_run moved
+    // the run to another project.
+    [Fact]
+    public async Task The_run_keeps_the_folder_its_junction_named_at_the_start()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var foo = Folder(@"Games\Foo");
+        var bar = Folder(@"Games\Bar");
+        var link = await JunctionAsync("Link", foo);
+        try
+        {
+            var scope = ProjectScope.Related(link);
+            await RepointAsync(link, bar);
+            await using var server = await BridgeServer.StartAsync(Secret, scope);
+            await RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), bar));
+            await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+            await server.NextLinkAsync();
+        }
+        finally
+        {
+            Directory.Delete(link);
+        }
+    }
+
+    // Regression: the project was checked only before the game started, when Godot's editor answers for it.
+    [Fact]
+    public async Task A_game_that_names_another_project_once_started_stops_the_run_before_anything_is_written()
+    {
+        var foo = Folder("Foo");
+        var bar = Folder("Bar");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+        var link = await server.NextLinkAsync();
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var opening = PlaytestRun.OpenAsync(link, new RunRequest("x", "goal"), null!, "test", SandboxMode.Auto, limit.Token);
+        await plugin.AnswerNextAsync(new { project_dir = foo });
+        await plugin.AnswerNextAsync(new { running = true });
+        await plugin.AnswerNextAsync(new { project_dir = bar });
+        var stopped = await Assert.ThrowsAsync<InvalidOperationException>(() => opening);
+        Assert.Contains(bar, stopped.Message);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(foo));
+        await AssertNothingMoreAsync(plugin);
+    }
+
+    // Regression: `cluewren run` started the harness straight from the link, with no project check at all.
+    [Fact]
+    public async Task Cluewren_run_stops_when_the_started_game_names_another_project()
+    {
+        var foo = Folder("Foo");
+        var bar = Folder("Bar");
+        var runFolder = Path.Combine(_root, "run");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+        var link = await server.NextLinkAsync();
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var playing = RunCommand.PlayAsync(link, runFolder, 1, SandboxMode.Auto, limit.Token);
+        await plugin.AnswerNextAsync(new { project_dir = foo });
+        await plugin.AnswerNextAsync(new { running = true });
+        await plugin.AnswerNextAsync(new { project_dir = bar });
+        Assert.Equal(1, await playing);
+        Assert.False(Directory.Exists(runFolder));
+        await AssertNothingMoreAsync(plugin);
+    }
+
+    // Regression: a hello of exactly 64 KiB was refused when its last fragment was empty.
+    [Fact]
+    public async Task A_hello_of_exactly_the_limit_is_taken_however_it_is_fragmented()
+    {
+        var foo = Folder("Foo");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        var exact = HelloOfSize(foo, 64 * 1024);
+        foreach (var parts in new[] { new[] { exact.Length }, new[] { 1000, exact.Length - 1000, 0 }, new[] { exact.Length, 0 } })
+        {
+            using var socket = new ClientWebSocket();
+            await socket.ConnectAsync(new Uri(server.Url), default);
+            var sent = 0;
+            for (var i = 0; i < parts.Length; i++)
+            {
+                await socket.SendAsync(exact.AsMemory(sent, parts[i]), WebSocketMessageType.Text, i == parts.Length - 1, default);
+                sent += parts[i];
+            }
+            using var reply = await ReceiveAsync(socket);
+            Assert.Equal("welcome", reply.RootElement.GetProperty("type").GetString());
+        }
+        using var over = new ClientWebSocket();
+        await over.ConnectAsync(new Uri(server.Url), default);
+        var larger = HelloOfSize(foo, 64 * 1024 + 1);
+        await over.SendAsync(larger.AsMemory(0, 64 * 1024), WebSocketMessageType.Text, false, default);
+        await over.SendAsync(larger.AsMemory(64 * 1024), WebSocketMessageType.Text, true, default);
+        using var refusal = await ReceiveAsync(over);
+        Assert.Equal("hello too large", refusal.RootElement.GetProperty("message").GetString());
+    }
+
+    // Regression: an oversized hello, a hello of another protocol and a failed proof were refused without a word for the
+    // agent.
+    [Fact]
+    public async Task Every_refusal_at_the_handshake_is_recorded_for_the_agent()
+    {
+        var foo = Folder("Foo");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        var oversized = FakePlugin.Hello(Secret, Handshake.NewNonce(), foo);
+        oversized["padding"] = new string('x', 64 * 1024);
+        await RefusedAsync(server.Url, oversized);
+        var otherProtocol = FakePlugin.Hello(Secret, Handshake.NewNonce(), foo);
+        otherProtocol["protocol"] = 2;
+        await RefusedAsync(server.Url, otherProtocol);
+        using (var socket = new ClientWebSocket())
+        {
+            await socket.ConnectAsync(new Uri(server.Url), default);
+            var nonce = Handshake.NewNonce();
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(FakePlugin.Hello(Secret, nonce, foo)),
+                WebSocketMessageType.Text, true, default);
+            using var welcome = await ReceiveAsync(socket);
+            var wrong = Handshake.Prove(Handshake.NewSecret(), Handshake.PluginRole, nonce,
+                welcome.RootElement.GetProperty("nonce").GetBytesFromBase64());
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "proof", proof = Convert.ToBase64String(wrong) }),
+                WebSocketMessageType.Text, true, default);
+            using var refusal = await ReceiveAsync(socket);
+            Assert.Equal("error", refusal.RootElement.GetProperty("type").GetString());
+        }
+        Assert.Equal(["an editor whose hello was too large", "an editor whose hello isn't one of protocol 1",
+            $"{foo}: failed the proof"], server.Refused);
+        Assert.Contains("failed the proof", McpServer.NoEditorText(server, 60));
+    }
+
+    static byte[] HelloOfSize(string project, int size)
+    {
+        var hello = FakePlugin.Hello(Secret, Handshake.NewNonce(), project);
+        hello["padding"] = "";
+        var bare = JsonSerializer.SerializeToUtf8Bytes(hello).Length;
+        hello["padding"] = new string('x', size - bare);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(hello);
+        Assert.Equal(size, bytes.Length);
+        return bytes;
+    }
+
+    static async Task<JsonDocument> ReceiveAsync(ClientWebSocket socket)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var buffer = new byte[64 * 1024];
+        var result = await socket.ReceiveAsync(buffer, timeout.Token);
+        return JsonDocument.Parse(Encoding.UTF8.GetString(buffer, 0, result.Count));
+    }
+
+    static async Task AssertNothingMoreAsync(FakePlugin plugin)
+    {
+        using var quiet = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => plugin.Socket.ReceiveAsync(new byte[1024], quiet.Token));
+    }
+
+    async Task<string> JunctionAsync(string name, string target)
+    {
+        var link = Path.Combine(_root, name);
+        Assert.Equal(0, await RunAsync("cmd.exe", "/c", "mklink", "/J", link, target));
+        return link;
+    }
+
+    static async Task RepointAsync(string link, string target)
+    {
+        Directory.Delete(link);
+        Assert.Equal(0, await RunAsync("cmd.exe", "/c", "mklink", "/J", link, target));
     }
 
     // The brain marks the session suspended before it lets go of the socket.

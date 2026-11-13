@@ -42,6 +42,16 @@ static func run(t) -> void:
 	hello_mac(t)
 	the_link_opens_no_socket_for_another_project(t)
 	the_editor_attaches_only_for_a_proved_brain(t)
+	a_project_at_a_drive_root(t)
+
+
+static func a_project_at_a_drive_root(t) -> void:
+	var root := Discovery._dir_of("C:/")
+	t.expect("binding", "a drive root keeps its separator", root == "C:/", root)
+	t.expect("binding", "a folder loses its trailing separator", Discovery._dir_of("C:/Games/Foo/") == "C:/Games/Foo")
+	for mode in ["related", "exact"]:
+		var why := Discovery.for_another_project({"folders": ["C:\\"], "match": mode}, root)
+		t.expect("binding", "a project at C:\\ takes a run for C:\\ (%s)" % mode, why == "", why)
 
 
 class FakeDebugger extends RefCounted:

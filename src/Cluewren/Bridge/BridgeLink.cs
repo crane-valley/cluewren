@@ -36,7 +36,7 @@ public sealed class BridgeLink : IGameLink
 
     public string Session { get; }
 
-    public string Project { get; internal init; } = "";
+    public VerifiedFolder? Project { get; internal init; }
 
     public JsonElement Hello
     {

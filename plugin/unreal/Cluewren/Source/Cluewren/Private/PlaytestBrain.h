@@ -28,6 +28,8 @@ namespace PlaytestBrain
 
 	FString ProjectDir();
 
+	FString ProjectDirOf(const FString& Dir);
+
 	/** Why a run announced in brain.json isn't this project's, or "". The same rule and words as the Unity and Godot
 	 *  plugins: no `folders` (a brain before 0.1.1) is no filter; an unknown `match` is never a match. */
 	FString ForAnotherProject(const FJsonObject& Said, const FString& ProjectDir);

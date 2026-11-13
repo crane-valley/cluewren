@@ -268,7 +268,9 @@ namespace Cluewren.Editor
 
         public string HostName => "editor";
 
-        public string ProjectDir => Directory.GetParent(Application.dataPath).FullName;
+        public string ProjectDir => ProjectDirOf(Application.dataPath);
+
+        public static string ProjectDirOf(string dataPath) => Directory.GetParent(dataPath).FullName;
 
         public string ProjectId => PlayerSettings.productGUID.ToString();
 

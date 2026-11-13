@@ -4,14 +4,35 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Cluewren.Bridge;
 
+public sealed class VerifiedFolder
+{
+    readonly string _key;
+
+    internal VerifiedFolder(string path, string key)
+    {
+        Path = path;
+        _key = key;
+    }
+
+    public string Path { get; }
+
+    public bool Holds(string path) => ProjectScope.KeyOf(path) == _key;
+
+    public bool Is(VerifiedFolder other) => other._key == _key;
+}
+
 public sealed class ProjectScope
 {
+    // Taken once: a later look at the path could find another folder behind a re-pointed junction.
+    readonly (string Key, string Final)? _run;
+
     ProjectScope(string folder, bool exact)
     {
         // Not GetFullPath: it expands 8.3 names, and an editor that shows the short form matches only if that is announced.
         Folder = AsGiven(Path.IsPathFullyQualified(folder) ? folder : Path.GetFullPath(folder));
         Exact = exact;
-        var final = Identify(Folder)?.Final is { } raw ? AsGiven(WithoutPrefix(raw)) : null;
+        _run = Identify(Folder);
+        var final = _run?.Final is { } raw ? AsGiven(WithoutPrefix(raw)) : null;
         Folders = final is not null && !string.Equals(final, Folder, TextComparison) ? [Folder, final] : [Folder];
     }
 
@@ -53,19 +74,16 @@ public sealed class ProjectScope
         return text[..end];
     }
 
-    public bool Admits(string project)
+    public VerifiedFolder? Admit(string project)
     {
-        var run = Identify(Folder);
-        var editor = Identify(project);
-        if (run is null || editor is null)
-            return false;
-        if (run.Value.Key == editor.Value.Key)
-            return true;
-        return !Exact && (Within(editor.Value.Final, run.Value.Key) || Within(run.Value.Final, editor.Value.Key));
+        if (_run is not { } run || Identify(project) is not { } editor)
+            return null;
+        var admitted = run.Key == editor.Key
+            || (!Exact && (Within(editor.Final, run.Key) || Within(run.Final, editor.Key)));
+        return admitted ? new VerifiedFolder(Normal(project), editor.Key) : null;
     }
 
-    public static bool SameFolder(string a, string b) =>
-        Identify(a) is { } first && Identify(b) is { } second && first.Key == second.Key;
+    internal static string? KeyOf(string path) => Identify(path)?.Key;
 
     static bool Within(string final, string outer)
     {

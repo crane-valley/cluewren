@@ -33,7 +33,7 @@ namespace Cluewren.Editor
             var go = new GameObject("CluewrenBuildInfo") { hideFlags = HideFlags.HideInHierarchy };
             var info = go.AddComponent<PlaytestBuildInfo>();
             info.productGuid = PlayerSettings.productGUID.ToString();
-            info.projectDir = System.IO.Directory.GetParent(Application.dataPath).FullName;
+            info.projectDir = EditorHost.ProjectDirOf(Application.dataPath);
             info.legacyAxes = Json.Write(LegacyAxes.Read());
             SceneManager.MoveGameObjectToScene(go, scene);
         }

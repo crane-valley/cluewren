@@ -105,28 +105,59 @@ async Task<int> RunHarness()
     {
         Console.WriteLine($"Waiting on {server.Url} for an editor whose project is {scope.Described}");
         var link = await server.NextLinkAsync(cancel.Token);
-        link.Send(json => json.WriteString("type", "run_started"));
-        var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
-        await using var jev = key is null ? null : new JevClient(new JevOptions(key));
-        await using var host = new HarnessHost(new HostOptions(link, positional[0]) { Jev = jev, Say = Console.WriteLine, Mode = sandbox });
-        var result = await host.RunHarnessAsync(seconds, ct: cancel.Token);
-        Console.WriteLine($"sandbox: {result.Sandbox}");
-        Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");
-        Console.WriteLine(result.Text);
-        Console.WriteLine(result.Stats?.GetRawText());
-        return result.Played ? 0 : 1;
+        return await Cluewren.RunCommand.PlayAsync(link, positional[0], seconds, sandbox, cancel.Token);
     }
     catch (OperationCanceledException)
     {
         return 130;
     }
-    catch (SandboxException e)
-    {
-        Console.Error.WriteLine($"The sandbox failed: {e.Message}");
-        return 1;
-    }
     finally
     {
         DiscoveryFile.Withdraw(path, announced);
+    }
+}
+
+namespace Cluewren
+{
+    public static class RunCommand
+    {
+        public static async Task<int> PlayAsync(BridgeLink link, string runFolder, double seconds, SandboxMode sandbox,
+            CancellationToken ct)
+        {
+            try
+            {
+                try
+                {
+                    await PlaytestRun.StartGameAsync(link, null, ct).ConfigureAwait(false);
+                }
+                catch (InvalidOperationException e)
+                {
+                    Console.Error.WriteLine($"The run didn't start: {e.Message}");
+                    return 1;
+                }
+                link.Send(json => json.WriteString("type", "run_started"));
+                var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
+                await using var jev = key is null ? null : new JevClient(new JevOptions(key));
+                await using var host = new HarnessHost(new HostOptions(link, runFolder)
+                {
+                    Jev = jev, Say = Console.WriteLine, Mode = sandbox,
+                });
+                var result = await host.RunHarnessAsync(seconds, ct: ct).ConfigureAwait(false);
+                Console.WriteLine($"sandbox: {result.Sandbox}");
+                Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");
+                Console.WriteLine(result.Text);
+                Console.WriteLine(result.Stats?.GetRawText());
+                return result.Played ? 0 : 1;
+            }
+            catch (OperationCanceledException)
+            {
+                return 130;
+            }
+            catch (SandboxException e)
+            {
+                Console.Error.WriteLine($"The sandbox failed: {e.Message}");
+                return 1;
+            }
+        }
     }
 }

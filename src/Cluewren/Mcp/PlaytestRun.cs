@@ -95,14 +95,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IJevRelay jev, string client,
         SandboxMode sandbox, CancellationToken ct = default)
     {
-        var project = link.Project;
-        if (string.IsNullOrEmpty(project))
-            throw new InvalidOperationException("the editor connected without a verified project");
-        var probe = new Game(link);
-        var said = (await probe.Context(fresh: true, ct).ConfigureAwait(false))["project_dir"].Text;
-        if (string.IsNullOrEmpty(said) || !ProjectScope.SameFolder(said, project))
-            throw new InvalidOperationException($"the editor connected for {project}, but its game says its project is "
-                + $"{(string.IsNullOrEmpty(said) ? "none" : said)}");
+        var project = await StartGameAsync(link, request.Level, ct).ConfigureAwait(false);
         var memory = MemoryFolder(project);
         var id = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
         var runFolder = Path.Combine(memory, "runs", id);
@@ -114,6 +107,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         {
             Jev = jev, ProjectFolder = memory, Recorder = recorder, Mode = sandbox,
         });
+        if (!string.IsNullOrEmpty(request.Level))
+            host.Game.Level = request.Level;
         var run = new PlaytestRun(link, request, host, recorder, project, memory, runFolder, id, client);
         try
         {
@@ -128,16 +123,35 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         return run;
     }
 
-    async Task PrepareAsync(CancellationToken ct)
+    // Godot answers context from the editor until its game runs, so the project is asked again once the game is up.
+    // Nothing is written, filmed or announced before both answers name the folder the editor connected for.
+    public static async Task<string> StartGameAsync(BridgeLink link, string? level, CancellationToken ct)
     {
-        await _host.Game.Request("session", json =>
+        var project = link.Project ?? throw new InvalidOperationException("the editor connected without a verified project");
+        var game = new Game(link);
+        await ConfirmProjectAsync(game, project, ct).ConfigureAwait(false);
+        await game.Request("session", json =>
         {
             json.WriteString("action", "start");
-            if (!string.IsNullOrEmpty(_request.Level))
-                json.WriteString("map", _request.Level);
+            if (!string.IsNullOrEmpty(level))
+                json.WriteString("map", level);
         }, 120, ct).ConfigureAwait(false);
-        if (!string.IsNullOrEmpty(_request.Level))
-            _host.Game.Level = _request.Level;
+        await ConfirmProjectAsync(game, project, ct).ConfigureAwait(false);
+        return project.Path;
+    }
+
+    static async Task ConfirmProjectAsync(Game game, VerifiedFolder project, CancellationToken ct)
+    {
+        var said = (await game.Context(fresh: true, ct).ConfigureAwait(false))["project_dir"].Text;
+        if (string.IsNullOrEmpty(said) || !project.Holds(said))
+            throw new InvalidOperationException($"the editor connected for {project.Path}, but the game says its project is "
+                + $"{(string.IsNullOrEmpty(said) ? "none" : said)}");
+        if (!project.Holds(project.Path))
+            throw new InvalidOperationException($"{project.Path} is no longer the folder the editor connected for");
+    }
+
+    async Task PrepareAsync(CancellationToken ct)
+    {
         await WaitForExportAsync(Path.Combine(_project, EngineTexts[_link.Engine].Export), ExportPatience, ct).ConfigureAwait(false);
         _link.Send(json => json.WriteString("type", "run_started"));
         await _recorder.FilmAsync(ct: ct).ConfigureAwait(false);

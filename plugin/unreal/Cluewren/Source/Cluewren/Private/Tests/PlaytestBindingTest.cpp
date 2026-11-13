@@ -115,6 +115,22 @@ bool FCluewrenBindingHelloMacTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCluewrenBindingDriveRootTest, "Cluewren.Binding.DriveRoot",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCluewrenBindingDriveRootTest::RunTest(const FString& Parameters)
+{
+	const FString Root = PlaytestBrain::ProjectDirOf(TEXT("C:/"));
+	TestEqual(TEXT("a drive root keeps its separator"), Root, FString(TEXT("C:/")));
+	TestEqual(TEXT("a folder loses its trailing separator"), PlaytestBrain::ProjectDirOf(TEXT("C:/Games/Foo/")), FString(TEXT("C:/Games/Foo")));
+	for (const TCHAR* Match : {TEXT("related"), TEXT("exact")})
+	{
+		TestEqual(*FString::Printf(TEXT("a project at C:\\ takes a run for C:\\ (%s)"), Match),
+			PlaytestBrain::ForAnotherProject(*Said(Match, {TEXT("C:\\")}, false), Root), FString());
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCluewrenBindingReadTest, "Cluewren.Binding.Read",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 

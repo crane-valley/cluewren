@@ -128,9 +128,14 @@ FString Read(const FString& Path, const FString& ProjectDir, FAddress& Out)
 
 FString ProjectDir()
 {
-	FString Dir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
-	FPaths::NormalizeDirectoryName(Dir);
-	return Dir;
+	return ProjectDirOf(FPaths::ProjectDir());
+}
+
+FString ProjectDirOf(const FString& Dir)
+{
+	FString Full = FPaths::ConvertRelativePathToFull(Dir);
+	FPaths::NormalizeDirectoryName(Full);
+	return Full;
 }
 
 FString ForAnotherProject(const FJsonObject& Said, const FString& ProjectDir)

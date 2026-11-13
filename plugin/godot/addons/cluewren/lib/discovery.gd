@@ -102,7 +102,13 @@ static func read(path: String, project: String) -> Dictionary:
 
 
 static func project_dir() -> String:
-	return ProjectSettings.globalize_path("res://").trim_suffix("/")
+	return _dir_of(ProjectSettings.globalize_path("res://"))
+
+
+## A drive root keeps its separator: "C:" alone is no folder, and both this filter and the brain refuse it.
+static func _dir_of(globalized: String) -> String:
+	var trimmed := globalized.trim_suffix("/")
+	return globalized if trimmed == "" or trimmed.ends_with(":") else trimmed
 
 
 ## Why a run announced in brain.json isn't this project's, or "". The same rule and words as the Unity and Unreal

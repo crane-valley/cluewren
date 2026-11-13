@@ -77,6 +77,16 @@ namespace Cluewren.Tests
             Assert.AreEqual(taken, why == null, $"vector {vector}: {why}");
         }
 
+        [TestCase("related")]
+        [TestCase("exact")]
+        public void AProjectAtADriveRootTakesARunForIt(string match)
+        {
+            var root = Cluewren.Editor.EditorHost.ProjectDirOf("C:/Assets");
+            Assert.AreEqual(@"C:\", root);
+            Assert.AreEqual(@"C:\Games\Foo", Cluewren.Editor.EditorHost.ProjectDirOf("C:/Games/Foo/Assets"));
+            Assert.IsNull(Discovery.ForAnotherProject(Said(match, new[] { @"C:\" }), root, true));
+        }
+
         [Test]
         public void APosixPathNeverMatchesOnWindows()
         {

@@ -166,7 +166,8 @@ public sealed class BridgeServer : IAsyncDisposable
             var (first, tooLarge) = await ReceiveHelloAsync(socket, deadline.Token).ConfigureAwait(false);
             if (tooLarge)
             {
-                await RefuseAsync(socket, "hello too large", deadline.Token).ConfigureAwait(false);
+                await RefuseAsync(socket, "hello too large", deadline.Token, "an editor whose hello was too large")
+                    .ConfigureAwait(false);
                 return null;
             }
             hello = first;
@@ -175,7 +176,8 @@ public sealed class BridgeServer : IAsyncDisposable
             var root = hello.RootElement;
             if (!IsHello(root) || !TryNonce(root, "nonce", out var pluginNonce))
             {
-                await RefuseAsync(socket, $"expected hello with protocol {Protocol}", deadline.Token).ConfigureAwait(false);
+                await RefuseAsync(socket, $"expected hello with protocol {Protocol}", deadline.Token,
+                    $"an editor whose hello isn't one of protocol {Protocol}").ConfigureAwait(false);
                 hello.Dispose();
                 return null;
             }
@@ -203,7 +205,7 @@ public sealed class BridgeServer : IAsyncDisposable
                 hello.Dispose();
                 return null;
             }
-            if (!Scope.Admits(project))
+            if (Scope.Admit(project) is not { } verified)
             {
                 await RefuseAsync(socket, $"this agent's run is for another project: {Scope.Described}", deadline.Token,
                     $"{Shown(project)}: another project").ConfigureAwait(false);
@@ -214,7 +216,7 @@ public sealed class BridgeServer : IAsyncDisposable
             var resumable = root.TryGetProperty("resume", out var resume) && resume.GetString() is { } id
                 && _sessions.TryGetValue(id, out var found) && found.Suspended ? found : null;
             if (resumable is not null
-                && (EngineOf(root) != resumable.Engine || !ProjectScope.SameFolder(resumable.Project, project)))
+                && (EngineOf(root) != resumable.Engine || resumable.Project is not { } held || !held.Is(verified)))
             {
                 await RefuseAsync(socket, "the session it resumes is of another project or engine", deadline.Token,
                     $"{Shown(project)}: resumed a session of another project or engine").ConfigureAwait(false);
@@ -229,7 +231,8 @@ public sealed class BridgeServer : IAsyncDisposable
             using var answer = await BridgeLink.ReceiveAsync(socket, deadline.Token).ConfigureAwait(false);
             if (answer is null || !IsProof(answer.RootElement, pluginNonce, brainNonce))
             {
-                await RefuseAsync(socket, "bad proof", deadline.Token).ConfigureAwait(false);
+                await RefuseAsync(socket, "bad proof", deadline.Token, $"{Shown(project)}: failed the proof")
+                    .ConfigureAwait(false);
                 hello.Dispose();
                 return null;
             }
@@ -241,7 +244,7 @@ public sealed class BridgeServer : IAsyncDisposable
                     ? seen : long.MaxValue);
                 return (resumable, hello);
             }
-            var link = new BridgeLink(session, root) { Project = ProjectScope.Normal(project) };
+            var link = new BridgeLink(session, root) { Project = verified };
             _sessions[session] = link;
             await _connected.Writer.WriteAsync(link, deadline.Token).ConfigureAwait(false);
             return (link, hello);
@@ -307,16 +310,17 @@ public sealed class BridgeServer : IAsyncDisposable
 
     static async Task<(JsonDocument? Hello, bool TooLarge)> ReceiveHelloAsync(WebSocket socket, CancellationToken ct)
     {
-        var buffer = new byte[MaxHelloBytes];
+        // One byte past the limit, so that a hello of exactly the limit whose last fragment is empty still fits.
+        var buffer = new byte[MaxHelloBytes + 1];
         var used = 0;
         while (true)
         {
-            if (used == buffer.Length)
-                return (null, true);
             var result = await socket.ReceiveAsync(buffer.AsMemory(used), ct).ConfigureAwait(false);
             if (result.MessageType == WebSocketMessageType.Close)
                 return (null, false);
             used += result.Count;
+            if (used > MaxHelloBytes)
+                return (null, true);
             if (result.EndOfMessage)
                 return (JsonDocument.Parse(buffer.AsMemory(0, used)), false);
         }
@@ -325,7 +329,14 @@ public sealed class BridgeServer : IAsyncDisposable
     async Task RefuseAsync(WebSocket socket, string message, CancellationToken ct, string noted)
     {
         Note(noted);
-        await RefuseAsync(socket, message, ct).ConfigureAwait(false);
+        var frame = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, string>
+        {
+            ["type"] = "error",
+            ["message"] = message,
+        });
+        await socket.SendAsync(frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+        var reason = Encoding.UTF8.GetByteCount(message) <= MaxCloseBytes ? message : "refused";
+        await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation, reason, ct).ConfigureAwait(false);
     }
 
     void Note(string refusal)
@@ -337,18 +348,6 @@ public sealed class BridgeServer : IAsyncDisposable
             _refused.Add(refusal);
         }
         Refusing?.Invoke(refusal);
-    }
-
-    static async Task RefuseAsync(WebSocket socket, string message, CancellationToken ct)
-    {
-        var frame = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, string>
-        {
-            ["type"] = "error",
-            ["message"] = message,
-        });
-        await socket.SendAsync(frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
-        var reason = Encoding.UTF8.GetByteCount(message) <= MaxCloseBytes ? message : "refused";
-        await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation, reason, ct).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
