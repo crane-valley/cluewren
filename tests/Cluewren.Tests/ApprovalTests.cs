@@ -181,7 +181,47 @@ public class CodexApprovalTests
     {
         Assert.Equal(Lines(Table, "command = \"C:/tools/cluewren.exe\"", "args = [\"mcp\"]", "cwd = \"C:/Games\""),
             Connect.CodexConfig(Lines(Table, owned, "cwd = \"C:/Games\""), Command));
-        Assert.Equal("model = \"m\"\n", Connect.CodexConfig(Lines("model = \"m\"", "", Table, owned, "[mcp_servers.cluewren.env]", "K = \"v\""), null));
+        Assert.Equal("model = \"m\"\n\n", Connect.CodexConfig(Lines("model = \"m\"", "", Table, owned, "[mcp_servers.cluewren.env]", "K = \"v\""), null));
+    }
+
+    // Regression: a line of a multi-line string that read like connect's marker was deleted with the table, leaving the string open.
+    [Fact]
+    public void Remove_deletes_no_line_of_a_string_that_reads_like_the_marker()
+    {
+        var instructions = Lines("developer_instructions = \"\"\"", "# cluewren connect\"\"\"");
+        Assert.Equal(instructions, Connect.CodexConfig(instructions + Lines("[mcp_servers.cluewren]", "command = \"cluewren\"", "args = [\"mcp\"]"), null));
+        var notes = Lines("notes = \"\"\"", Header, "\"\"\"");
+        Assert.Equal(notes, Connect.CodexConfig(notes + Lines(Table, "command = \"cluewren\"", "args = [\"mcp\"]"), null));
+    }
+
+    // Regression: appending trimmed the file's own trailing line breaks, and removing normalized the blank lines that were left.
+    [Theory]
+    [InlineData("model = \"x\"\n")]
+    [InlineData("model = \"x\"\r\n")]
+    [InlineData("model = \"x\"")]
+    [InlineData("a = 1\r\nb = 2")]
+    [InlineData("model = \"x\"\n\n")]
+    [InlineData("a = 1\r\n\r\n")]
+    [InlineData("\n")]
+    [InlineData("")]
+    [InlineData("# a comment\n[profiles.a]\nmodel = \"b\"\n\n\n")]
+    public void Add_then_remove_gives_back_the_same_bytes(string text)
+    {
+        foreach (var approve in new[] { false, true })
+        {
+            var added = Connect.CodexConfig(text, Command, approve);
+            Assert.StartsWith(text, added);
+            if (text.Contains("\r\n"))
+                Assert.DoesNotContain("\n", added.Replace("\r\n", ""));
+            Assert.Equal(text, Connect.CodexConfig(added, null));
+        }
+    }
+
+    [Fact]
+    public void Remove_leaves_what_was_written_after_the_table()
+    {
+        var added = Connect.CodexConfig("model = \"x\"\n", Command) + "\n# mine\n[profiles.a]\nx = 1\n";
+        Assert.Equal("model = \"x\"\n\n# mine\n[profiles.a]\nx = 1\n", Connect.CodexConfig(added, null));
     }
 
     static string TempConfig(string? text)
@@ -338,8 +378,50 @@ public class ClaudeRegistrationTests
         { 1, "Error: the configuration file is corrupted" },
         { 0, "something this version of claude prints instead\n" },
         { 0, Get(User, @"C:\Tools\cluewren.exe", "mcp") + "  Command: C:\\x.exe\n" },
-        { 0, Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Environment:\n", "") },
     };
+
+    // As claude 2.1.322 printed them: a server whose check passed (no Issue line), and one whose entry has no env key.
+    const string Connected = "cluewren:\n  Scope: User config (available in all your projects)\n  Status: \u2714 Connected\n  Type: stdio\n"
+        + "  Command: C:\\Users\\me\\.dotnet\\tools\\cluewren.exe\n  Args: mcp\n  Environment:\n\nTo remove this server, run: claude mcp remove cluewren -s user\n";
+    const string NoEnvKey = "cluewren:\n  Scope: User config (available in all your projects)\n  Status: \u2718 Failed to connect\n"
+        + "  Issue: CONNECTION_CLOSED: Connection closed\n  Type: stdio\n  Command: C:\\Tools\\cluewren.exe\n  Args: mcp\n\n"
+        + "To remove this server, run: claude mcp remove cluewren -s user\n";
+
+    [Fact]
+    public void The_displays_the_cli_prints_are_read()
+    {
+        var connected = new Claude((0, Connected));
+        Assert.True(connected.Register(Command));
+        Assert.Equal([Getting], connected.Calls);
+        var bare = new Claude((0, NoEnvKey));
+        Assert.True(bare.Register(null));
+        Assert.Equal([Getting, Removing], bare.Calls);
+    }
+
+    public static TheoryData<string> Misshapen => new()
+    {
+        Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Command: C:\\Tools\\cluewren.exe\n", "  Command: C:\\Tools\\cluewren.exe\nextra\n"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Args: mcp\n", "  Args: mcp\nextra\n"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp", "K=v").Replace("    K=v\n", "    K=v\nextra\n"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("  Type: stdio\n", "  Type: stdio\n  Tools: 3\n"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp").Replace("\n\nTo remove", "\nTo remove"),
+        Get(User, @"C:\Tools\cluewren.exe", "mcp") + "Warning: something else\n",
+    };
+
+    // Regression: lines outside the labels were skipped, so a value that ran onto a next line read as exactly `mcp`.
+    [Theory]
+    [MemberData(nameof(Misshapen))]
+    public void A_display_with_a_line_out_of_its_shape_is_not_read(string output)
+    {
+        var removing = new Claude((0, output));
+        Assert.False(removing.Register(null));
+        Assert.Equal([Getting], removing.Calls);
+        Assert.Contains("Couldn't tell", removing.Said[^1]);
+        var adding = new Claude((0, output));
+        Assert.False(adding.Register(Command));
+        Assert.Equal([Getting], adding.Calls);
+        Assert.Contains("Couldn't tell", adding.Said[^1]);
+    }
 
     // Regression: any failed read was taken for "no entry", and an entry was added or removed on a guess.
     [Theory]

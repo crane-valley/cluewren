@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Cluewren.Mcp;
 
@@ -167,9 +168,12 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
 
     static string ArgsLine(string[] command) => $"args = {JsonSerializer.Serialize(command[1..])}";
 
+    const string TableMark = $"# {Mark}: Cluewren's MCP server, for the game open in your editor (`cluewren connect codex --remove` takes it out)";
+
     static string CodexTable(string[] command, bool approve) =>
-        $"# {Mark}: Cluewren's MCP server, for the game open in your editor (`cluewren connect codex --remove` takes it out)\n"
-        + $"[mcp_servers.\"{Name}\"]\n{CommandLine(command)}\n{ArgsLine(command)}\n" + (approve ? $"{ApprovalMark}\n{ApprovalLine}\n" : "");
+        $"{TableMark}\n[mcp_servers.\"{Name}\"]\n{CommandLine(command)}\n{ArgsLine(command)}\n" + (approve ? $"{ApprovalMark}\n{ApprovalLine}\n" : "");
+
+    static string NewLine(string text) => text.IndexOf('\n') is > 0 and var at && text[at - 1] == '\r' ? "\r\n" : "\n";
 
     enum Kind { Blank, Comment, Header, Key, Inside, Unread }
 
@@ -519,23 +523,52 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         return new(command, commandStart, commandEnd, args, argsStart, argsEnd, found[2]);
     }
 
-    static string Without(List<TomlLine> lines)
+    // Removes what connect owns and no other byte: each cluewren table up to its last key or value line (with blank and comment
+    // lines between two of them), the marker comment directly above the server's table, and above that marker the line break
+    // the append added: the blank line when the file ended with one, otherwise the break that ended the file's last line.
+    static string Without(List<TomlLine> lines, int header)
     {
-        var kept = new List<string>();
-        var skipping = false;
-        foreach (var line in lines)
+        var final = lines[^1].Text.Length == 0;
+        var count = final ? lines.Count - 1 : lines.Count;
+        var owned = new bool[count];
+        for (var i = 0; i < count; i++)
         {
-            if (line.Kind == Kind.Header)
-            {
-                skipping = line.Path is { } path && InTable(path);
-                while (skipping && kept.Count > 0 && kept[^1].TrimStart().StartsWith('#') && kept[^1].Contains(Mark, StringComparison.Ordinal))
-                    kept.RemoveAt(kept.Count - 1);
-            }
-            if (!skipping)
-                kept.Add(line.Text);
+            if (lines[i].Kind != Kind.Header || lines[i].Path is not { } path || !InTable(path))
+                continue;
+            var last = i;
+            for (var j = i + 1; j < count && lines[j].Kind != Kind.Header; j++)
+                if (lines[j].Kind is not (Kind.Blank or Kind.Comment))
+                    last = j;
+            Array.Fill(owned, true, i, last - i + 1);
         }
-        var text = string.Join('\n', kept).TrimEnd('\n', '\r');
-        return text.Length > 0 ? text + "\n" : "";
+        for (var i = 1; i < count; i++)
+        {
+            if (owned[i] || !owned[i - 1])
+                continue;
+            var j = i;
+            while (j < count && !owned[j] && lines[j].Kind is Kind.Blank or Kind.Comment)
+                j++;
+            if (j < count && owned[j])
+                Array.Fill(owned, true, i, j - i);
+        }
+        var marked = header > 0 && lines[header - 1].Kind == Kind.Comment && Plain(lines[header - 1]) == TableMark;
+        var separated = marked && header > 1 && lines[header - 2].Kind == Kind.Blank && Plain(lines[header - 2]).Length == 0;
+        if (marked)
+            owned[header - 1] = true;
+        if (separated)
+            owned[header - 2] = true;
+        var kept = Enumerable.Range(0, count).Where(i => !owned[i]).Select(i => lines[i].Text).ToList();
+        if (kept.Count == 0)
+            return "";
+        var lastKept = Enumerable.Range(0, count).Last(i => !owned[i]);
+        var terminated = lastKept < count - 1 || final;
+        if (marked && !separated && lastKept == header - 2)
+        {
+            terminated = false;
+            if (kept[^1].EndsWith('\r'))
+                kept[^1] = kept[^1][..^1];
+        }
+        return string.Join('\n', kept) + (terminated ? "\n" : "");
     }
 
     public static string CodexConfig(string text, string[]? command, bool approve = false)
@@ -548,14 +581,14 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
                 throw new NotCluewrensException("it has settings there but no table of its own");
             if (command is null)
                 return text;
-            var kept = text.TrimEnd('\n', '\r');
-            return (kept.Length > 0 ? kept + "\n\n" : "") + CodexTable(command, approve);
+            var newLine = NewLine(text);
+            return (text.Length > 0 ? text + newLine : "") + CodexTable(command, approve).Replace("\n", newLine);
         }
         var owned = OwnedLines(lines, header);
         if (command is null)
-            return Without(lines);
+            return Without(lines, header);
         var approval = owned.Approval;
-        var markedAbove = approval is { } a && Plain(lines[a - 1]) is ApprovalMark or OldApprovalMark;
+        var markedAbove = approval is { } a && lines[a - 1].Kind == Kind.Comment && Plain(lines[a - 1]) is ApprovalMark or OldApprovalMark;
         var cluewrens = markedAbove && Plain(lines[approval!.Value]) == ApprovalLine;
         var output = new List<string>();
         for (var i = 0; i < lines.Count; i++)
@@ -709,29 +742,36 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
 
     // `claude mcp get` is a display: it joins args with spaces and doesn't show every setting, so connect only ever reads it to
     // decide, never to rebuild an entry from it.
+    // The display is read line for line in the shape claude 2.1.322 prints (Issue only when the check failed, no Environment label
+    // for an entry without env); any other line, one a value ran onto included, makes it unread.
     static ClaudeEntry? Entry(string output)
     {
         var lines = output.Split('\n').Select(line => line.TrimEnd('\r')).ToArray();
-        var labels = new Dictionary<string, string>();
-        bool? noEnvironment = null;
-        for (var i = 0; i < lines.Length; i++)
+        var at = 0;
+        string? Next(string label)
         {
-            if (lines[i] == "  Environment:")
-            {
-                if (noEnvironment is not null)
-                    return null;
-                noEnvironment = i + 1 == lines.Length || lines[i + 1].Length == 0;
-                continue;
-            }
-            foreach (var label in (string[])["Scope", "Type", "Command", "Args"])
-                if ((lines[i] == $"  {label}:" || lines[i].StartsWith($"  {label}: ", StringComparison.Ordinal))
-                    && !labels.TryAdd(label, lines[i].Length > label.Length + 4 ? lines[i][(label.Length + 4)..] : ""))
-                    return null;
+            if (at == lines.Length || lines[at] != $"  {label}:" && !lines[at].StartsWith($"  {label}: ", StringComparison.Ordinal))
+                return null;
+            var line = lines[at++];
+            return line.Length > label.Length + 4 ? line[(label.Length + 4)..] : "";
         }
-        return labels.TryGetValue("Scope", out var scope) && labels.TryGetValue("Type", out var type)
-            && labels.TryGetValue("Command", out var command) && labels.TryGetValue("Args", out var args) && noEnvironment is { } none
-            ? new(scope, type, command, args, none) : null;
+        if (lines[at++] != $"{Name}:" || Next("Scope") is not { } scope || Next("Status") is null)
+            return null;
+        Next("Issue");
+        if (Next("Type") is not { } type || Next("Command") is not { } command || Next("Args") is not { } args)
+            return null;
+        var noEnvironment = true;
+        if (at < lines.Length && lines[at] == "  Environment:")
+            for (at++; at < lines.Length && EnvSetting().IsMatch(lines[at]); at++)
+                noEnvironment = false;
+        return at + 3 == lines.Length && lines[at] == "" && lines[at + 2] == ""
+            && lines[at + 1].StartsWith($"To remove this server, run: claude mcp remove {Name} -s ", StringComparison.Ordinal)
+            && lines[at + 1][$"To remove this server, run: claude mcp remove {Name} -s ".Length..] is { Length: > 0 } word && word.All(char.IsAsciiLetterLower)
+            ? new(scope, type, command, args, noEnvironment) : null;
     }
+
+    [GeneratedRegex("^    [A-Za-z_][A-Za-z0-9_]*=")]
+    private static partial Regex EnvSetting();
 
     (Found State, ClaudeEntry? Entry, string Why) ReadClaude()
     {
