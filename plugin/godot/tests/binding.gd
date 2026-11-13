@@ -115,6 +115,25 @@ static func hello_mac(t) -> void:
 	t.expect("binding", "the hello's MAC", mac.hex_encode() == KNOWN_MAC, mac.hex_encode())
 
 
+## "" once this user owns each path, as discovery.gd checks it, else why not. What an elevated administrator writes is
+## owned by the Administrators group (the hosted CI runner), which the check rightly refuses.
+static func _own(paths: Array) -> String:
+	var quoted := PackedStringArray()
+	for p in paths:
+		quoted.append("'%s'" % str(p).replace("/", "\\").replace("'", "''"))
+	var script := ("$ErrorActionPreference='Stop';$me=[Security.Principal.WindowsIdentity]::GetCurrent().User;" +
+		"foreach($p in @(%s)){" % ",".join(quoted) +
+		"if((Get-Item -LiteralPath $p -Force).GetAccessControl('Owner').GetOwner([Security.Principal.SecurityIdentifier]) -ne $me){" +
+		"& \"$env:SystemRoot\\System32\\icacls.exe\" $p /setowner ('*'+$me.Value) /q | Out-Null;" +
+		"if((Get-Item -LiteralPath $p -Force).GetAccessControl('Owner').GetOwner([Security.Principal.SecurityIdentifier]) -ne $me){" +
+		"\"icacls /setowner left $p owned by another (exit $LASTEXITCODE)\";exit}}};'ok'")
+	var shell := OS.get_environment("SystemRoot").path_join("System32/WindowsPowerShell/v1.0/powershell.exe")
+	var out := []
+	var code := OS.execute(shell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", Marshalls.raw_to_base64(script.to_utf16_buffer())], out)
+	var said := str(out[0]).strip_edges() if out.size() > 0 else ""
+	return "" if code == 0 and said == "ok" else "%s (exit %d)" % [said, code]
+
+
 ## The editor's and the game's link, on a brain.json of its own (LOCALAPPDATA pointed at a folder of the test's): for
 ## another project it opens no socket; for this one it does.
 static func the_link_opens_no_socket_for_another_project(t) -> void:
@@ -133,6 +152,10 @@ static func the_link_opens_no_socket_for_another_project(t) -> void:
 		f.store_string(JSON.stringify({"url": "ws://127.0.0.1:1/v1/bridge", "secret": Marshalls.raw_to_base64(_range(0)),
 			"pid": OS.get_process_id(), "folders": [case[0]], "match": "related"}))
 		f.close()
+		var owned := _own([path.get_base_dir(), path])
+		if owned != "":
+			t.expect("binding", "the test's brain.json is owned by this user", false, owned)
+			break
 		var link = Link.new()
 		link.hello_fields = func(): return {}
 		link.open()

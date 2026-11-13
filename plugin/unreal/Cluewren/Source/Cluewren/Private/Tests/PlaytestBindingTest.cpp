@@ -17,8 +17,32 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <aclapi.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+
 namespace
 {
+	// What an elevated administrator writes is owned by the Administrators group, which the plugin rightly refuses: a
+	// test's own brain.json is given to this process's token user, the one PlaytestBrain's check compares with.
+	bool MakeMine(const FString& Path)
+	{
+		HANDLE Token = nullptr;
+		if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token))
+		{
+			return false;
+		}
+		DWORD Size = 0;
+		GetTokenInformation(Token, TokenUser, nullptr, 0, &Size);
+		TArray<uint8> Buffer;
+		Buffer.SetNumUninitialized(Size);
+		const bool bMine = GetTokenInformation(Token, TokenUser, Buffer.GetData(), Size, &Size)
+			&& SetNamedSecurityInfoW(const_cast<TCHAR*>(*Path), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+				reinterpret_cast<TOKEN_USER*>(Buffer.GetData())->User.Sid, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+		CloseHandle(Token);
+		return bMine;
+	}
+
 	struct FVector19
 	{
 		const TCHAR* Name;
@@ -147,6 +171,11 @@ bool FCluewrenBindingReadTest::RunTest(const FString& Parameters)
 	FJsonSerializer::Serialize(Brain, TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text));
 	if (!TestTrue(TEXT("brain.json written"), FFileHelper::SaveStringToFile(Text, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)))
 	{
+		return false;
+	}
+	if (!TestTrue(TEXT("the test's brain.json is owned by this user"), MakeMine(Dir) && MakeMine(Path)))
+	{
+		IFileManager::Get().DeleteDirectory(*Dir, false, true);
 		return false;
 	}
 	PlaytestBrain::FAddress Address;

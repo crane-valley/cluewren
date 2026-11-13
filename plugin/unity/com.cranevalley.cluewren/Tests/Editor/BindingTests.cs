@@ -124,6 +124,7 @@ namespace Cluewren.Tests
                     ["url"] = "ws://127.0.0.1:1/v1/bridge", ["secret"] = Convert.ToBase64String(Range(0)),
                     ["pid"] = Process.GetCurrentProcess().Id, ["folders"] = new List<object> { other }, ["match"] = "related",
                 }));
+                TestFiles.MakeMine(dir, path);
                 var why = Discovery.Read(path, dir, out var brain);
                 Assert.IsNull(brain);
                 StringAssert.Contains(other, why);
@@ -134,6 +135,38 @@ namespace Cluewren.Tests
             finally
             {
                 Directory.Delete(dir, true);
+            }
+        }
+    }
+
+    /// <summary>What an elevated administrator writes is owned by the Administrators group, which the plugin rightly
+    /// refuses: a test's own brain.json is given to this user, the one Native.OwnedByCurrentUser compares with.</summary>
+    static class TestFiles
+    {
+        public static void MakeMine(params string[] paths)
+        {
+            if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)) return;
+            string sid = null;
+            foreach (var path in paths)
+            {
+                if (Native.OwnedByCurrentUser(path)) continue;
+                sid = sid ?? Run("whoami.exe", "/user /fo csv /nh").Split(',').Last().Trim().Trim('"');
+                var said = Run("icacls.exe", $"\"{path}\" /setowner *{sid} /q");
+                if (!Native.OwnedByCurrentUser(path)) Assert.Fail($"{path} stays owned by another than this user ({sid}): {said}");
+            }
+        }
+
+        static string Run(string tool, string arguments)
+        {
+            var info = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), tool), arguments)
+            {
+                UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
+            };
+            using (var p = Process.Start(info))
+            {
+                var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                p.WaitForExit();
+                return output.Trim();
             }
         }
     }

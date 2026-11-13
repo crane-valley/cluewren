@@ -74,6 +74,7 @@ namespace Cluewren.Tests
             {
                 ["url"] = "ws://127.0.0.1:1/v1/bridge", ["secret"] = secret, ["pid"] = pid, ["started"] = "2026-10-31T00:00:00+00:00",
             }));
+            TestFiles.MakeMine(dir, path);
             return path;
         }
 
@@ -104,6 +105,7 @@ namespace Cluewren.Tests
             var system = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe");
             Assert.IsFalse(Native.OwnedByCurrentUser(system));
             var mine = Path.GetTempFileName();
+            TestFiles.MakeMine(mine);
             try
             {
                 Assert.IsTrue(Native.OwnedByCurrentUser(mine));
