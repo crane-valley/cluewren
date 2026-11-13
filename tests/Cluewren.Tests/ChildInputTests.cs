@@ -512,21 +512,23 @@ public sealed class ChildInputTests : IDisposable
         }
     }
 
-    // Before: a raw frame typed as a request reached the plugin with an id the child chose, which can answer for one of
-    // the brain's own requests.
-    [Fact]
-    public async Task A_raw_frame_that_claims_to_be_a_request_ends_the_session_and_is_not_sent()
+    // Before: a raw frame reached the plugin as the child wrote it; typed "REQUEST" it passed the case-sensitive check,
+    // and a plugin that reads the type without case took it as a request with an id the child chose.
+    [Theory]
+    [InlineData("""{"type":"request","id":1,"op":"key","args":{}}""")]
+    [InlineData("""{"type":"REQUEST","id":1,"op":"key","args":{}}""")]
+    [InlineData("""{"type":"note","n":1}""")]
+    public async Task A_raw_frame_from_the_child_ends_the_session_and_is_not_sent(string frame)
     {
         var child = new ScriptedChild();
         var link = new RecordingLink();
         using var session = Start(child, link);
-        child.Out.Write("""{"type":"send","frame":{"type":"note","n":1}}""" + "\n"
-                        + """{"type":"send","frame":{"type":"request","id":1,"op":"key","args":{}}}""" + "\n");
+        child.Out.Write("""{"type":"send","frame":""" + frame + "}\n");
         await child.KillStarted.Task.WaitAsync(Patience);
         var failed = await Assert.ThrowsAsync<SandboxException>(
             () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
-        Assert.Contains("claims to be a request", failed.Message);
-        Assert.Equal(["""send {"type":"note","n":1}"""], link.Posts);
+        Assert.Contains("may not send raw frames", failed.Message);
+        Assert.Empty(link.Posts);
     }
 
     // Before, the status callback ran under the gate on the reader: a callback that blocked kept the failure from ever

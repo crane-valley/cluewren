@@ -292,19 +292,10 @@ public sealed class SandboxSession : IDisposable
                         _link.Post(op, json => WriteFields(json, args));
                 break;
             }
+            // Only the brain writes raw frames to the plugin: one from the child could pass for any of them, a request
+            // included, and no kit path sends one.
             case "send":
-            {
-                var frame = root.GetProperty("frame");
-                // A request takes its id from the brain (req, post): a raw one could answer for the brain's own.
-                if (frame.ValueKind == JsonValueKind.Object)
-                    foreach (var field in frame.EnumerateObject())
-                        if (field.NameEquals("type") && field.Value.ValueEquals("request"))
-                            throw new FormatException("a raw frame that claims to be a request");
-                lock (_gate)
-                    if (!_ended)
-                        _link.Send(json => WriteFields(json, frame));
-                break;
-            }
+                throw new FormatException("the child may not send raw frames to the game");
             case "status":
             {
                 var text = root.GetProperty("text").GetString() ?? "";
