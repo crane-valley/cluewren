@@ -133,10 +133,15 @@ sealed class ChildStdin : Stream
 
 sealed class ScriptedChild : ISandboxProcess
 {
-    readonly ChildStdout _error = new();
     readonly List<string> _events = [];
 
-    public ScriptedChild() => _error.End();
+    public ScriptedChild(bool holdError = false)
+    {
+        if (!holdError)
+            Err.End();
+    }
+
+    public ChildStdout Err { get; } = new();
 
     public ChildStdout Out { get; } = new();
 
@@ -150,7 +155,7 @@ sealed class ScriptedChild : ISandboxProcess
 
     public Stream Output => Out;
 
-    public Stream Error => _error;
+    public Stream Error => Err;
 
     public string Kind => "scripted";
 
@@ -304,6 +309,34 @@ public sealed class ChildInputTests : IDisposable
         var call = session.Call("ping", null, seconds, CancellationToken.None);
         child.Out.Write(Reply(await CallId(child)));
         return (await call.WaitAsync(Patience)).GetString()!;
+    }
+
+    // Before, the log belonged to the thread draining the child's stderr and stayed open until the child closed it, so
+    // a session disposed while the child still held its stderr left the log open after Dispose had returned.
+    [Fact]
+    public async Task Once_dispose_returns_the_log_is_closed_even_while_the_child_holds_its_stderr()
+    {
+        var child = new ScriptedChild(holdError: true);
+        var session = Start(child, new RecordingLink());
+        try
+        {
+            child.Err.Write("boom\n");
+            await Until(() =>
+            {
+                if (!File.Exists(_log))
+                    return false;
+                using var reading = new FileStream(_log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                return reading.Length > 0;
+            });
+            session.Dispose();
+            File.Delete(_log);
+            Assert.False(File.Exists(_log));
+        }
+        finally
+        {
+            child.Err.End();
+            session.Dispose();
+        }
     }
 
     // A reply with neither field used to reach the caller as a KeyNotFoundException and leave the child running.

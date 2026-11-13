@@ -54,6 +54,8 @@ public sealed class SandboxSession : IDisposable
     readonly Lock _gate = new();
     readonly Lock _ending = new();
     readonly Queue<(string Text, int Bytes)> _statuses = new();
+    readonly Lock _logging = new();
+    FileStream? _log;
     long _ids;
     int _heldItems;
     long _heldBytes;
@@ -75,8 +77,9 @@ public sealed class SandboxSession : IDisposable
         _out = new LineWriter(process.Input);
         _forward = Forward;
         _link.Event += _forward;
+        _log = OpenLog(logPath);
         new Thread(ReadLoop) { IsBackground = true, Name = "sandbox-read" }.Start();
-        new Thread(() => DrainError(logPath)) { IsBackground = true, Name = "sandbox-log" }.Start();
+        new Thread(DrainError) { IsBackground = true, Name = "sandbox-log" }.Start();
     }
 
     public string Kind => _process.Kind;
@@ -109,26 +112,66 @@ public sealed class SandboxSession : IDisposable
         });
     }
 
-    void DrainError(string path)
+    static FileStream? OpenLog(string path)
     {
         try
         {
-            using var log = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+            return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    // The log belongs to the session, not to this thread: Dispose closes it, so it is closed once Dispose returns even
+    // while this thread still waits on a stderr the child has not closed.
+    void DrainError()
+    {
+        try
+        {
             var chunk = new byte[4096];
             while (true)
             {
                 var read = _process.Error.Read(chunk);
                 if (read <= 0)
                     return;
-                if (log.Length < MaxLog)
+                lock (_logging)
                 {
-                    log.Write(chunk, 0, read);
-                    log.Flush();
+                    if (_log is null)
+                        return;
+                    if (_log.Length < MaxLog)
+                    {
+                        _log.Write(chunk, 0, read);
+                        _log.Flush();
+                    }
                 }
             }
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or UnauthorizedAccessException)
         {
+        }
+        finally
+        {
+            CloseLog();
+        }
+    }
+
+    void CloseLog()
+    {
+        lock (_logging)
+        {
+            var log = _log;
+            _log = null;
+            // Disposing flushes again, and a disk that failed one flush fails this one too: on the drain thread that
+            // would end the brain, in Dispose it would skip the rest.
+            try
+            {
+                log?.Dispose();
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ObjectDisposedException)
+            {
+            }
         }
     }
 
@@ -547,6 +590,7 @@ public sealed class SandboxSession : IDisposable
         _link.Event -= _forward;
         _closing.Cancel();
         _process.Dispose();
+        CloseLog();
         _closing.Dispose();
         foreach (var call in calls)
             call.TrySetResult(null);
