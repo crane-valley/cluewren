@@ -473,6 +473,7 @@ public sealed class ChildInputTests : IDisposable
             Volatile.Write(ref answering, 0);
         });
         using var session = Start(child, link, jev, recorder);
+        session.Episode = 1;
         child.Out.Write("""{"type":"jev","rid":1,"body":{}}""" + "\n");
         await Until(() => jev.Asked > 0);
         child.Out.Write("""{"type":"episode","rid":2,"mark":"begin","n":1}""" + "\n"
@@ -543,6 +544,20 @@ public sealed class ChildInputTests : IDisposable
             release.Set();
             session.Dispose();
         }
+    }
+
+    // Before: an episode mark was taken with any number, so a child could add spans to the recorder without end.
+    [Fact]
+    public async Task A_mark_for_another_episode_than_the_one_played_ends_the_session()
+    {
+        var child = new ScriptedChild();
+        using var session = Start(child, new RecordingLink());
+        session.Episode = 3;
+        child.Out.Write("""{"type":"episode","rid":1,"mark":"begin","n":7}""" + "\n");
+        await child.KillStarted.Task.WaitAsync(Patience);
+        var failed = await Assert.ThrowsAsync<SandboxException>(
+            () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
+        Assert.Contains("another episode", failed.Message);
     }
 
     // Before: a raw frame reached the plugin as the child wrote it; typed "REQUEST" it passed the case-sensitive check,

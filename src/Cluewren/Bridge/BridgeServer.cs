@@ -265,9 +265,20 @@ public sealed class BridgeServer : IAsyncDisposable
 
             if (resumable is not null)
             {
+                if (!resumable.Rewind(root.TryGetProperty("received", out var received) && received.TryGetInt64(out var seen)
+                    ? seen : null))
+                {
+                    const string gone = "the game came back after requests it missed were no longer kept";
+                    _sessions.TryRemove(resumable.Session, out _);
+                    End(resumable, gone);
+                    // A plain close, not an error frame: the plugin has been welcomed and ends as for any lost brain.
+                    Note($"{Shown(project)}: {gone}");
+                    await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "resume refused", deadline.Token)
+                        .ConfigureAwait(false);
+                    hello.Dispose();
+                    return null;
+                }
                 resumable.Hello = root;
-                resumable.Rewind(root.TryGetProperty("received", out var received) && received.TryGetInt64(out var seen)
-                    ? seen : long.MaxValue);
                 return (resumable, hello);
             }
             var link = new BridgeLink(session, root) { Project = verified };
