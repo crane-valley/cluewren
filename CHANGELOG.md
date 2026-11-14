@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-14
+
+Cluewren 0.1.2 bounds what the brain holds for the game on behalf of a harness child, drops unread game messages past 32, reports file errors in `cluewren run` with exit code 1, measures frame rates through the editor, and checks Unreal Shipping packages.
+
+### Security
+
+- The link to the game is bounded ([ADR 0016](https://github.com/crane-valley/cluewren/blob/main/docs/adr/0016-the-link-bounds-what-a-harness-child-queues.md), closes issue 19): Frames a harness child has the brain send to the game (a post, a request, a status) are taken only while less than 16 MiB waits to be written to the game. A request that is not taken fails at once, a status is dropped, and a post that is not taken ends the child's session (and kills the child, as every other violation does). The brain's own frames (releasing held input, pausing, ending a run) are always sent. The frames kept for replay after a reconnect are at most 1024 frames and 32 MiB. So what the brain holds for the game on behalf of a child is at most 16 MiB waiting plus 32 MiB kept for replay. A reconnect (an editor coming back after a script reload) that needs a request no longer kept is not resumed with a gap any more: the brain ends the connection and the run's link ("the game came back after requests it missed were no longer kept"). The editor sees a normal disconnect.
+- Episode mark verification: An episode mark from the child for another episode than the one being played ends the session.
+- Unread game messages: Messages from the game that nobody reads (for example a recording a harness starts under `cluewren run`) are kept to the newest 32; older ones are dropped.
+- Link repairs: Requests reach the game in the order of their ids; a reconnect interrupted a second time keeps that order and does not send again a request the game says it has; a reply arriving just as its request gave up waiting is released.
+
+### Changed
+
+- Compatibility and upgrade: No protocol change. Brain 0.1.2 works with plugin 0.1.1 and 0.1.2; plugin 0.1.2 differs from 0.1.1 only in its version number. Upgrading the brain alone is enough; upgrading both is fine. Nothing to run again after upgrading from 0.1.1 unless the folder moved (then `connect` as before).
+
+### Fixed
+
+- Issue 23: `cluewren run` reports a file error while compiling or writing the harness (the run folder's bin not writable, the disk full, a file in use) with "The run couldn't use its files: ..." and exit code 1, instead of ending with an unhandled exception.
+- On macOS and Linux (unsupported) the brain waits for a killed harness child to exit, as on Windows since 0.1.1. Not run: the build and test machines are Windows.
+
+### Performance
+
+- Unreal packaged Shipping build (Unreal 5.8, BuildCookRun, Win64 Shipping): the package contains none of the plugin's code, binaries or content. What it does contain from the plugin: two small text files inside the .pak (the descriptor `Cluewren.uplugin`, 932 bytes, and `Config/FilterPlugin.ini`, 40 bytes) and the plugin's class names as strings in the cooked script-object table. The executable holds none of the plugin's names.
+- Frame rate through the editor (the way a user's playtest runs), same 900-object scene as in 0.1.1, three 22 s repetitions each, machine otherwise idle (total CPU 16-26%):
+  - Godot 4.7.2, game started by the editor: the mean frame rate during a run was 6% lower in one set (550 fps without a run, 518 with) and 11% lower in the other (469 without, 418 with); median frame time +0.09 ms and +0.24 ms; the longest frame 14-19 ms against 5-7 ms.
+  - Unreal 5.8, play-in-editor: 92 fps without a run, 90 with (2% lower, the same size as the drift between repetitions).
+  - Together with 0.1.1's measurements (games started directly: no difference beyond noise on Godot and Unreal; Unity in the editor's play mode 164 against 159 fps).
+  - Still not measured: the first seconds after connecting on Unreal while its asset export runs; a harness that records frames continuously.
+
+### Known limitations
+
+- Windows 11 x64 only. Linux and macOS remain untested and unsupported. On Linux, the whole file system is bound read-only so the harness can read every file the user can read, and there is no CPU or memory limit there.
+- The Unreal plugin is beta and source-only.
+- Project-matching limits:
+  - An editor that opened its project through another alias than the agent's folder (a second junction, a subst drive, an 8.3 name) does not match textually; pass `project` with the path the editor shows.
+  - An agent started in a folder that holds several game projects matches all of them; the first matching editor is played unless `project` is given.
+  - One brain.json per user: a later start_run from another agent session takes the announcement over (as in 0.1.0).
+  - At most 8 handshakes are in progress at a time; another user's process on the same machine can hold them for up to 10 s each and delay an editor's connection (it cannot authenticate, learn the run's folder, or make the brain open a file).
+- Editors of matching projects still connect by themselves.
+- Development and debug builds contain the plugin and activate only with the connect flag.
+- Unreal Shipping builds contain none of the plugin's code (checked on a packaged build; the package carries the plugin's descriptor and one small config file).
+- Godot starts powershell.exe once per brain.json to check ownership.
+- Link limits ([ADR 0016](https://github.com/crane-valley/cluewren/blob/main/docs/adr/0016-the-link-bounds-what-a-harness-child-queues.md) bounds what the brain holds for the game per child at 16 MiB waiting plus 32 MiB kept for replay):
+  - Posts a child queued before its session failed are still delivered, and replayed on a reconnect, within those limits.
+  - A status is lost while the game is 16 MiB behind.
+  - The one message being written is buffered outside these counters.
+- For `connect claude`, ownership is judged from what `claude mcp get` displays, and that display drops trailing white space. So an entry that runs a file named cluewren or cluewren.exe with arguments that differ from `mcp` only by invisible trailing white-space arguments cannot be told apart from Cluewren's own and is treated as Cluewren's.
+- `cluewren connect codex`: the `config.toml` write is not atomic and there is no copy to go back to; on macOS/Linux (unsupported) another program is not kept from writing the file between connect's read and write.
+- Unmeasured as of release ([ADR 0006](https://github.com/crane-valley/cluewren/blob/main/docs/adr/0006-autopilot-is-the-floor.md)): a comparison on an untuned Unity game; decision-model token and subscription usage. Frame rate during a run was measured on each engine (see Performance): on Godot through the editor it was 6-11% lower; Unreal's first seconds after connecting and a harness that records frames continuously are not measured.
+- rc refusals add a few microseconds per remote call on Godot ([ADR 0014](https://github.com/crane-valley/cluewren/blob/main/docs/adr/0014-rc-refusals-on-every-engine.md)).
+- rc refusals are defense in depth, not a boundary ([ADR 0014](https://github.com/crane-valley/cluewren/blob/main/docs/adr/0014-rc-refusals-on-every-engine.md)).
+- Issue 27: on Unreal a run started from the brain creates the play-in-editor world twice, 0.6 s apart; play then goes on normally. Not investigated.
+
 ## [0.1.1] - 2026-11-14
 
 Cluewren 0.1.1 binds playtest runs to an editor whose project matches the agent's working folder, treats harness child input as untrusted, sets a CPU ceiling on the harness child process, removes automatic tool approval from `cluewren connect`, adds MCP tool annotations, and improves capture and path-planning performance.
@@ -129,5 +182,6 @@ gh attestation verify <file> --repo crane-valley/cluewren
 
 Review the CycloneDX SBOM: `cluewren-0.1.0.cdx.json`.
 
+[0.1.2]: https://github.com/crane-valley/cluewren/releases/tag/v0.1.2
 [0.1.1]: https://github.com/crane-valley/cluewren/releases/tag/v0.1.1
 [0.1.0]: https://github.com/crane-valley/cluewren/releases/tag/v0.1.0

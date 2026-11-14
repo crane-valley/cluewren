@@ -68,13 +68,22 @@ There is no service level agreement. The report is acknowledged and handled thro
   - Per child the brain holds at most 512 items or 16 MiB across game requests and Jev requests being served and statuses waiting to be shown, past which the session ends.
   - After a session ends nothing already read is delivered or forwarded and requests being served are cancelled.
   - The child cannot send raw frames to the game (a `send` from the child ends the session).
+  - An episode mark from the child for another episode than the one being played ends the session.
+  - Messages from the game that nobody reads (for example a recording a harness starts under `cluewren run`) are kept to the newest 32; older ones are dropped.
 
-#### What the brain does not guarantee (issue 19)
+#### The link to the game is bounded ([ADR 0016](docs/adr/0016-the-link-bounds-what-a-harness-child-queues.md), closes issue 19)
 
-- Frames the child has the brain forward to the game (`post`) are not counted or limited, and the link keeps them for replay.
-- After a child fails, frames it had already queued are still sent and are replayed on a reconnect.
-- A reconnect that needs frames no longer held is not refused.
-- Episode notifications from the child are not checked against the brain's episode.
+- Frames a harness child has the brain send to the game (a post, a request, a status) are taken only while less than 16 MiB waits to be written to the game. A request that is not taken fails at once, a status is dropped, and a post that is not taken ends the child's session (and kills the child, as every other violation does). The brain's own frames (releasing held input, pausing, ending a run) are always sent.
+- The frames kept for replay after a reconnect are at most 1024 frames and 32 MiB.
+- So what the brain holds for the game on behalf of a child is at most 16 MiB waiting plus 32 MiB kept for replay.
+- A reconnect (an editor coming back after a script reload) that needs a request no longer kept is not resumed with a gap any more: the brain ends the connection and the run's link ("the game came back after requests it missed were no longer kept"). The editor sees a normal disconnect.
+- Repairs in the same code: requests reach the game in the order of their ids; a reconnect interrupted a second time keeps that order and does not send again a request the game says it has; a reply arriving just as its request gave up waiting is released.
+
+#### What stays not guaranteed
+
+- Posts a child queued before its session failed are still delivered, and replayed on a reconnect, within the limits above.
+- A status is lost while the game is 16 MiB behind.
+- The one message being written is buffered outside these counters.
 
 ### Agent setup and `cluewren connect`
 
@@ -82,7 +91,7 @@ There is no service level agreement. The report is acknowledged and handled thro
 - One ownership rule: an entry is Cluewren's only when it is a stdio server that runs a file named `cluewren` or `cluewren.exe` with the single argument `mcp` (in Codex's `config.toml` also `dotnet` with `Cluewren.dll` and `mcp`). connect never removes or rewrites anything else, never reads an entry's environment for reuse, and never prints another entry's command, arguments or environment values.
 - `cluewren connect claude` registers Cluewren with Claude Code (user scope) only when Claude Code has no server named cluewren. If that entry already runs this Cluewren, nothing changes. Any other entry named cluewren is left as it is, and connect says what to do by hand. connect never moves or copies the settings of an existing entry. If connect cannot tell what is registered (an error, a timeout, an answer it does not recognise), it changes nothing. For `connect claude`, ownership is judged from what `claude mcp get` displays, and that display drops trailing white space. So an entry that runs a file named cluewren or cluewren.exe with arguments that differ from `mcp` only by invisible trailing white-space arguments cannot be told apart from Cluewren's own and is treated as Cluewren's.
 - `cluewren connect codex` changes only the command and args of a cluewren table that already runs Cluewren; every other line and sub-table stays byte for byte (env such as `CLUEWREN_SANDBOX = "required"`, cwd, tool lists). A table that runs something else, an HTTP server, or a config.toml that connect cannot read exactly is left unchanged, and connect prints the lines to set by hand. `connect codex --remove`, and an add followed by a remove, leave every byte outside Cluewren's own table as it was (line endings included).
-- Save sequence for `config.toml`: connect edits the file in place. It reads the file and computes the change; then it opens the file once so that no other program can open it meanwhile (a Windows guarantee), reads it again through that handle, and writes only if it still holds what was read. It makes no other file with the config's content: no temporary file and no backup. 0.1.1 does not write `config.toml.before-cluewren`, and one that 0.1.0 left is not touched (the user may delete it).
+- Save sequence for `config.toml`: connect edits the file in place. It reads the file and computes the change; then it opens the file once so that no other program can open it meanwhile (a Windows guarantee), reads it again through that handle, and writes only if it still holds what was read. It makes no other file with the config's content: no temporary file and no backup. Since 0.1.1 connect does not write `config.toml.before-cluewren`, and one that 0.1.0 left is not touched (the user may delete it).
 - Why `config.toml` is edited in place: the config can hold keys in MCP env settings, and a new file does not reliably keep the old one's access rules, owner, mode, encryption or links; editing in place leaves all of those as they were. A `config.toml` that is a symbolic link stays a link and its target is edited. A hard link to the file under another name shares the file, so that name changes too.
 - What is given up: the write is not atomic and there is no copy to go back to. If the write fails part way (disk error, power loss during a write of a few kilobytes), the file can be left damaged; connect then prints "Writing <path> failed after it began: ... What the file holds now is not known; it may be damaged. Check it." and the lines to set by hand. A user who wants a copy makes one before running connect.
 - A `config.toml` that cannot be opened that way (open in another program, read-only, access denied) is left as it is: "Left <path> as it is: <reason>. Set the cluewren server up there by hand: command = ..., args = [...]" and connect ends with exit code 3. If the file changed between the two reads: "Left <path> as it is: it changed while connect was reading it; run connect again".
@@ -127,7 +136,7 @@ As recorded in [ADR 0014](docs/adr/0014-rc-refusals-on-every-engine.md), the fol
 
 Additional residual risks:
 
-- The link-side limits of issue 19: frames the child has the brain forward to the game (`post`) are not counted or limited, and the link keeps them for replay; after a child fails, frames it had already queued are still sent and are replayed on a reconnect; a reconnect that needs frames no longer held is not refused; episode notifications from the child are not checked against the brain's episode.
+- The link-side limits: posts a child queued before its session failed are still delivered, and replayed on a reconnect, within the link limits; a status is lost while the game is 16 MiB behind; the one message being written is buffered outside these counters.
 - Project-matching limits: an editor that opened its project through another alias than the agent's folder (a second junction, a subst drive, an 8.3 name) does not match textually; pass `project` with the path the editor shows. An agent started in a folder that holds several game projects matches all of them; the first matching editor is played unless `project` is given. One brain.json per user: a later start_run from another agent session takes the announcement over (as in 0.1.0).
 - Local peer delay: another user's process on the same machine can hold up to 8 handshakes for up to 10 s each and delay an editor's connection; it cannot authenticate, learn the run's folder, or make the brain open a file.
 - For `connect claude`, ownership is judged from what `claude mcp get` displays, and that display drops trailing white space. So an entry that runs a file named cluewren or cluewren.exe with arguments that differ from `mcp` only by invisible trailing white-space arguments cannot be told apart from Cluewren's own and is treated as Cluewren's.
@@ -139,20 +148,20 @@ Additional residual risks:
 
 ## Verifying a download
 
-Downloads are available on the [release page](https://github.com/crane-valley/cluewren/releases/tag/v0.1.1).
+Downloads are available on the [release page](https://github.com/crane-valley/cluewren/releases/tag/v0.1.2).
 
-1. Check the hash of `cluewren-0.1.1-win-x64.zip` against `SHA256SUMS.txt`:
+1. Check the hash of `cluewren-0.1.2-win-x64.zip` against `SHA256SUMS.txt`:
    ```powershell
-   (Get-FileHash -Algorithm SHA256 .\cluewren-0.1.1-win-x64.zip).Hash.ToLowerInvariant()
+   (Get-FileHash -Algorithm SHA256 .\cluewren-0.1.2-win-x64.zip).Hash.ToLowerInvariant()
    ```
-   Compare the result with the line for `cluewren-0.1.1-win-x64.zip` in `SHA256SUMS.txt`.
+   Compare the result with the line for `cluewren-0.1.2-win-x64.zip` in `SHA256SUMS.txt`.
 
 2. Verify the GitHub build provenance attestation for any release asset:
    ```bash
    gh attestation verify <file> --repo crane-valley/cluewren
    ```
 
-3. Review `cluewren-0.1.1.cdx.json`, the CycloneDX SBOM provided with the release.
+3. Review `cluewren-0.1.2.cdx.json`, the CycloneDX SBOM provided with the release.
 
 ## Hardening for a managed environment
 

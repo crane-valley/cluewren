@@ -80,7 +80,7 @@ namespace Cluewren
     public sealed class PlaytestClient
     {
         public const int Protocol = 1;
-        public const string PluginVersion = "0.1.1";
+        public const string PluginVersion = "0.1.2";
         const double MaxBackoff = 30.0;
         const double HandshakeSeconds = 10.0;
         const int MaxLogEventsPerFrame = 50;
