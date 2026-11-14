@@ -1,6 +1,6 @@
 {
   "name": "com.cranevalley.cluewren",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "displayName": "Cluewren",
   "description": "AI playtesting for Unity games. Connects out over a loopback WebSocket to a brain on this machine, which plays the game through this package.",
   "unity": "6000.0",
