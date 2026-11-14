@@ -510,6 +510,32 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         await AssertNothingMoreAsync(plugin);
     }
 
+    // Regression: a compiled harness that could not be written escaped `cluewren run` as an exception.
+    [Fact]
+    public async Task Cluewren_run_reports_a_file_it_cannot_write_as_a_run_that_did_not_start()
+    {
+        var foo = Folder("Foo");
+        var runFolder = Folder("run");
+        await File.WriteAllTextAsync(Path.Combine(runFolder, "harness.cs"), "class A : Harness { }\n");
+        await File.WriteAllTextAsync(Path.Combine(runFolder, "bin"), "");
+        await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+        var link = await server.NextLinkAsync();
+        var said = new StringWriter();
+        var error = Console.Error;
+        Console.SetError(said);
+        try
+        {
+            using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            Assert.Equal(1, await RunCommand.PlayAsync(link, runFolder, 1, SandboxMode.Auto, limit.Token));
+        }
+        finally
+        {
+            Console.SetError(error);
+        }
+        Assert.Contains("The run couldn't use its files", said.ToString());
+    }
+
     // Regression: a plugin's start error or a disconnect in the new start step escaped `cluewren run` as an exception.
     [Fact]
     public async Task Cluewren_run_reports_a_start_error_or_a_disconnect_as_a_run_that_did_not_start()
