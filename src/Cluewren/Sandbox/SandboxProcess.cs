@@ -288,6 +288,8 @@ public static class ChildRuntime
 // Off Windows only: there the plain child is created inside its job by WindowsContainer.
 public sealed class PlainChild : ISandboxProcess
 {
+    const int ExitWaitMilliseconds = 30000;
+
     readonly Process _process;
 
     PlainChild(Process process, string kind)
@@ -343,6 +345,14 @@ public sealed class PlainChild : ISandboxProcess
     public void Dispose()
     {
         Kill();
+        // Until the child is gone it still holds the compiled harness in the run folder. Bounded: the kill is already issued.
+        try
+        {
+            _process.WaitForExit(ExitWaitMilliseconds);
+        }
+        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+        }
         _process.Dispose();
     }
 }

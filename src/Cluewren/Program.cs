@@ -172,6 +172,11 @@ namespace Cluewren
                 Console.Error.WriteLine($"The sandbox failed: {e.Message}");
                 return 1;
             }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"The run couldn't use its files: {e.Message}");
+                return 1;
+            }
         }
     }
 }
