@@ -13,15 +13,27 @@ public sealed class BridgeLink : IGameLink
 
     const int MaxFrameBytes = 16 * 1024 * 1024;
     const int MaxReplayFrames = 1024;
+    const int MaxMessages = 32;
+    const long MaxQueuedBytes = 16 * 1024 * 1024;
+    const long MaxReplayBytes = 32 * 1024 * 1024;
 
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonDocument>> _pending = new();
     readonly Channel<(long Id, byte[] Frame)> _outgoing =
         Channel.CreateUnbounded<(long, byte[])>(new UnboundedChannelOptions { SingleReader = true });
-    readonly Channel<JsonDocument> _messages = Channel.CreateUnbounded<JsonDocument>();
+    // Frames and other messages nobody takes (a recording the harness child started under `cluewren run`) must not pile up.
+    readonly Channel<JsonDocument> _messages = Channel.CreateBounded<JsonDocument>(
+        new BoundedChannelOptions(MaxMessages) { FullMode = BoundedChannelFullMode.DropOldest }, static dropped => dropped.Dispose());
     readonly Queue<(long Id, byte[] Frame)> _sent = new();
     readonly Queue<(long Id, byte[] Frame)> _replay = new();
     (long Id, byte[] Frame)? _unsent;
+    // The id, the room check and the queue go together: ids leave in queue order, which Rewind relies on. What a harness
+    // child has the link send is taken only while less than MaxQueuedBytes waits; the brain's own frames (releasing input,
+    // pausing, ending a run) always are. With the replay window that bounds what the link holds for a child.
+    readonly Lock _queue = new();
     long _nextId;
+    long _queuedBytes;
+    long _sentBytes;
+    long _droppedThrough;
     long _gameTime = BitConverter.DoubleToInt64Bits(double.NaN);
     volatile string? _closed;
     JsonElement _hello;
@@ -76,24 +88,29 @@ public sealed class BridgeLink : IGameLink
 
     internal volatile bool Suspended;
 
-    public async Task<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args = null, TimeSpan? timeout = null,
-        CancellationToken ct = default)
+    public long QueuedBytes => Interlocked.Read(ref _queuedBytes);
+
+    public Task<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args = null, TimeSpan? timeout = null,
+        CancellationToken ct = default) => RequestAsync(op, args, timeout, false, ct);
+
+    public Task<GameAnswer> RequestWithinAsync(string op, Action<Utf8JsonWriter>? args = null, TimeSpan? timeout = null,
+        CancellationToken ct = default) => RequestAsync(op, args, timeout, true, ct);
+
+    async Task<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args, TimeSpan? timeout, bool within, CancellationToken ct)
     {
-        var id = Interlocked.Increment(ref _nextId);
         var answer = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[id] = answer;
-        if (_closed is { } why)
-        {
-            _pending.TryRemove(id, out _);
-            throw new GameDisconnectedException(why);
-        }
-        _outgoing.Writer.TryWrite((id, EncodeRequest(id, op, args)));
+        if (Enqueue(op, args, answer, within) is not { } id)
+            throw new GameDisconnectedException(_closed ?? Stalled);
+        var returned = false;
         try
         {
             var document = await answer.Task.WaitAsync(timeout ?? DefaultTimeout, ct).ConfigureAwait(false);
             var frame = document.RootElement;
             if (frame.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True)
+            {
+                returned = true;
                 return new GameAnswer(document);
+            }
             var status = frame.TryGetProperty("status", out var s) && s.TryGetInt32(out var code) ? code : 400;
             var error = frame.TryGetProperty("error", out var e) ? e.GetString() : null;
             document.Dispose();
@@ -106,19 +123,52 @@ public sealed class BridgeLink : IGameLink
         finally
         {
             _pending.TryRemove(id, out _);
+            // A reply can land between the wait giving up and the removal above: nobody reads it then.
+            if (!returned)
+                _ = answer.Task.ContinueWith(static reply => reply.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
+        }
+    }
+
+    const string Stalled = "the game isn't reading what it is sent";
+
+    long? Enqueue(string op, Action<Utf8JsonWriter>? args, TaskCompletionSource<JsonDocument>? answer, bool within)
+    {
+        // Written before the lock: the caller's writer may itself ask the link for something.
+        var written = EncodeArgs(args);
+        lock (_queue)
+        {
+            if (_closed is not null)
+                return null;
+            var id = _nextId + 1;
+            var frame = EncodeRequest(id, op, written);
+            if (within && _queuedBytes + frame.Length > MaxQueuedBytes)
+                return null;
+            if (answer is not null)
+                _pending[id] = answer;
+            if (!_outgoing.Writer.TryWrite((id, frame)))
+            {
+                _pending.TryRemove(id, out _);
+                return null;
+            }
+            _nextId = id;
+            Interlocked.Add(ref _queuedBytes, frame.Length);
+            return id;
         }
     }
 
     ValueTask<GameAnswer> IGameLink.RequestAsync(string op, Action<Utf8JsonWriter>? args, TimeSpan? timeout,
         CancellationToken ct) => new(RequestAsync(op, args, timeout, ct));
 
+    // A harness child's statuses come this way too, so a status is dropped while the plugin isn't reading.
     public void Status(string text) => Send(json =>
     {
         json.WriteString("type", "status");
         json.WriteString("text", text);
-    });
+    }, true);
 
-    public void Send(Action<Utf8JsonWriter> frame)
+    public void Send(Action<Utf8JsonWriter> frame) => Send(frame, false);
+
+    void Send(Action<Utf8JsonWriter> frame, bool within)
     {
         if (_closed is not null)
             return;
@@ -129,30 +179,41 @@ public sealed class BridgeLink : IGameLink
             frame(json);
             json.WriteEndObject();
         }
-        _outgoing.Writer.TryWrite((0, buffer.WrittenSpan.ToArray()));
-    }
-
-    public void Post(string op, Action<Utf8JsonWriter>? args = null)
-    {
-        if (_closed is null)
+        var bytes = buffer.WrittenSpan.ToArray();
+        lock (_queue)
         {
-            var id = Interlocked.Increment(ref _nextId);
-            _outgoing.Writer.TryWrite((id, EncodeRequest(id, op, args)));
+            if ((!within || _queuedBytes + bytes.Length <= MaxQueuedBytes) && _outgoing.Writer.TryWrite((0, bytes)))
+                Interlocked.Add(ref _queuedBytes, bytes.Length);
         }
     }
 
-    static byte[] EncodeRequest(long id, string op, Action<Utf8JsonWriter>? args)
+    public void Post(string op, Action<Utf8JsonWriter>? args = null) => Enqueue(op, args, null, false);
+
+    public bool TryPost(string op, Action<Utf8JsonWriter>? args = null) => Enqueue(op, args, null, true) is not null;
+
+    static byte[] EncodeArgs(Action<Utf8JsonWriter>? args)
     {
-        var buffer = new ArrayBufferWriter<byte>(128);
+        var buffer = new ArrayBufferWriter<byte>(64);
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            args?.Invoke(json);
+            json.WriteEndObject();
+        }
+        return buffer.WrittenSpan.ToArray();
+    }
+
+    static byte[] EncodeRequest(long id, string op, byte[] args)
+    {
+        var buffer = new ArrayBufferWriter<byte>(64 + args.Length);
         using (var json = new Utf8JsonWriter(buffer))
         {
             json.WriteStartObject();
             json.WriteString("type", "request");
             json.WriteNumber("id", id);
             json.WriteString("op", op);
-            json.WriteStartObject("args");
-            args?.Invoke(json);
-            json.WriteEndObject();
+            json.WritePropertyName("args");
+            json.WriteRawValue(args, skipInputValidation: true);
             json.WriteEndObject();
         }
         return buffer.WrittenSpan.ToArray();
@@ -195,9 +256,16 @@ public sealed class BridgeLink : IGameLink
                     ? replayed
                     : await _outgoing.Reader.ReadAsync(ct).ConfigureAwait(false);
                 await socket.SendAsync(_unsent.Value.Frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+                var size = _unsent.Value.Frame.Length;
+                Interlocked.Add(ref _queuedBytes, -size);
                 _sent.Enqueue(_unsent.Value);
-                if (_sent.Count > MaxReplayFrames)
-                    _sent.Dequeue();
+                _sentBytes += size;
+                while (_sent.Count > MaxReplayFrames || _sentBytes > MaxReplayBytes)
+                {
+                    var dropped = _sent.Dequeue();
+                    _sentBytes -= dropped.Frame.Length;
+                    _droppedThrough = Math.Max(_droppedThrough, dropped.Id);
+                }
                 _unsent = null;
             }
         }
@@ -208,17 +276,36 @@ public sealed class BridgeLink : IGameLink
 
     // A send can succeed after the plugin's 1012 close left it, while the socket still reads Open, so only the plugin
     // knows what arrived. Runs between pumps: no send loop is alive.
-    internal void Rewind(long received)
+    // False when a request the plugin didn't get is no longer kept: going on would leave a gap nobody sees.
+    internal bool Rewind(long? received)
     {
+        if (_droppedThrough > (received ?? 0))
+            return false;
+        // What was already waiting for replay comes after these: it was queued later.
+        var later = _replay.ToArray();
+        _replay.Clear();
         foreach (var frame in _sent)
         {
-            if (frame.Id > received)
+            if (frame.Id > (received ?? long.MaxValue))
+            {
                 _replay.Enqueue(frame);
+                Interlocked.Add(ref _queuedBytes, frame.Frame.Length);
+            }
         }
         _sent.Clear();
+        _sentBytes = 0;
+        // The send that was cut off can have arrived all the same: a request the plugin says it has is not sent twice.
         if (_unsent is { } unsent)
-            _replay.Enqueue(unsent);
+        {
+            if (unsent.Id > 0 && unsent.Id <= received)
+                Interlocked.Add(ref _queuedBytes, -unsent.Frame.Length);
+            else
+                _replay.Enqueue(unsent);
+        }
         _unsent = null;
+        foreach (var frame in later)
+            _replay.Enqueue(frame);
+        return true;
     }
 
     void Feed(JsonDocument frame)

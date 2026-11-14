@@ -255,6 +255,56 @@ public sealed class BridgeServerTests : IDisposable
         await Assert.ThrowsAsync<GameDisconnectedException>(() => asked);
     }
 
+    static readonly string Megabyte = new('x', 1 << 20);
+
+    // Before: what waited to be sent had no limit, so posts piled up for as long as the plugin didn't read.
+    [Fact]
+    public async Task A_plugin_that_does_not_read_leaves_a_bounded_queue_on_the_link()
+    {
+        await using var server = await StartAsync();
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
+        var link = await server.NextLinkAsync();
+        var refused = false;
+        for (var i = 0; i < 64 && !refused; i++)
+            refused = !link.TryPost("note", json => json.WriteString("text", Megabyte));
+        Assert.True(refused);
+        Assert.InRange(link.QueuedBytes, 1, 16 * 1024 * 1024);
+        var queued = link.QueuedBytes;
+        await Assert.ThrowsAsync<GameDisconnectedException>(
+            () => link.RequestWithinAsync("note", json => json.WriteString("text", Megabyte)).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(queued, link.QueuedBytes);
+        link.Post("release_all");
+        Assert.True(link.QueuedBytes > queued);
+    }
+
+    // Before: frames pushed out of the replay window were lost silently and the resumed session went on with the gap.
+    [Fact]
+    public async Task A_resume_that_needs_requests_no_longer_kept_is_refused_and_the_link_closes()
+    {
+        await using var server = await StartAsync();
+        var first = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
+        var link = await server.NextLinkAsync();
+        var reading = Task.Run(async () =>
+        {
+            var buffer = new byte[1 << 16];
+            for (var messages = 0; messages < 40;)
+                if ((await first.Socket.ReceiveAsync(buffer, default)).EndOfMessage)
+                    messages++;
+        });
+        for (var i = 0; i < 40; i++)
+            while (!link.TryPost("note", json => json.WriteString("text", Megabyte)))
+                await Task.Delay(5);
+        await reading.WaitAsync(TimeSpan.FromSeconds(60));
+        first.Socket.Abort();
+        await first.DisposeAsync();
+
+        await using var second = await ResumeAsync(server.Url, first.Session, _project);
+        using var patience = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var closed = await second.Socket.ReceiveAsync(new byte[1024], patience.Token);
+        Assert.Equal(WebSocketMessageType.Close, closed.MessageType);
+        Assert.Contains("no longer kept", link.Closed);
+    }
+
     static async Task<FakePlugin> ResumeAsync(string url, string session, string project)
     {
         for (var i = 0; i < 200; i++)

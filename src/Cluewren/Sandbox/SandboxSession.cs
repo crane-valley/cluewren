@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Text.Json;
+using Cluewren.Bridge;
 using Cluewren.Jev;
 using Cluewren.Kit;
 
@@ -83,6 +84,8 @@ public sealed class SandboxSession : IDisposable
     }
 
     public string Kind => _process.Kind;
+
+    public int Episode { get; set; }
 
     public void Init(string runFolder, string? level, int maxDecisions) =>
         _out.Write((runFolder, level, maxDecisions, Link: _link, Jev: _jev is not null), static (json, s) =>
@@ -330,9 +333,17 @@ public sealed class SandboxSession : IDisposable
             {
                 var op = Text(root, "op");
                 var args = root.TryGetProperty("args", out var posted) ? posted : default;
+                var taken = true;
                 lock (_gate)
                     if (!_ended)
-                        _link.Post(op, json => WriteFields(json, args));
+                    {
+                        if (_link is BridgeLink bridge)
+                            taken = bridge.TryPost(op, json => WriteFields(json, args));
+                        else
+                            _link.Post(op, json => WriteFields(json, args));
+                    }
+                if (!taken && _link.Closed is null)
+                    throw new FormatException("the game isn't taking what the harness posts");
                 break;
             }
             // Only the brain writes raw frames to the plugin: one from the child could pass for any of them, a request
@@ -431,7 +442,9 @@ public sealed class SandboxSession : IDisposable
         {
             var args = root.TryGetProperty("args", out var given) ? given : default;
             TimeSpan? timeout = root.TryGetProperty("timeout", out var limit) ? TimeSpan.FromSeconds(limit.GetDouble()) : null;
-            using var answer = await _link.RequestAsync(op, json => WriteFields(json, args), timeout, _closing.Token).ConfigureAwait(false);
+            using var answer = await (_link is BridgeLink bridge
+                ? bridge.RequestWithinAsync(op, json => WriteFields(json, args), timeout, _closing.Token)
+                : _link.RequestAsync(op, json => WriteFields(json, args), timeout, _closing.Token).AsTask()).ConfigureAwait(false);
             _out.Write((rid, answer, Link: _link), static (json, s) =>
             {
                 json.WriteString("type", "res");
@@ -509,6 +522,8 @@ public sealed class SandboxSession : IDisposable
 
     void ServeEpisode(long rid, string mark, int n)
     {
+        if (n != Episode)
+            throw new FormatException("an episode mark for another episode than the one being played");
         try
         {
             if (mark == "begin")
