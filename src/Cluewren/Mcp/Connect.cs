@@ -617,13 +617,30 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         return string.Join('\n', output);
     }
 
-    public sealed record CodexChange(string Path, byte[]? Before, byte[]? After, string Message, bool Refused);
+    public sealed record CodexChange(string Path, byte[]? Before, byte[]? After, string Message, string ByHand, bool Refused);
 
     static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
+    static string LeftAsItIs(string path, string why, string byHand) => $"Left {path} as it is: {why}. {byHand}";
+
+    static string Why(Exception e) => e.Message.TrimEnd('.');
+
+    static bool FileFailure(Exception e) => e is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException
+        or OperationCanceledException or System.Security.SecurityException;
+
     public static CodexChange PlanCodex(string path, string[]? command, bool approve)
     {
-        var before = File.Exists(path) ? File.ReadAllBytes(path) : null;
+        var lines = command is null ? "" : $"{CommandLine(command)}, {ArgsLine(command)}" + (approve ? $", {ApprovalLine}" : "");
+        var byHand = command is null ? $"Remove the {Name} server by hand: codex mcp remove {Name}" : $"Set the {Name} server up there by hand: {lines}";
+        byte[]? before;
+        try
+        {
+            before = File.Exists(path) ? File.ReadAllBytes(path) : null;
+        }
+        catch (Exception e) when (FileFailure(e))
+        {
+            return new(path, null, null, LeftAsItIs(path, Why(e), byHand), byHand, true);
+        }
         var bom = before is [0xEF, 0xBB, 0xBF, ..];
         string text;
         try
@@ -632,28 +649,28 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         }
         catch (DecoderFallbackException)
         {
-            return new(path, before, null, $"Left {path} as it is: it isn't UTF-8 text", true);
+            return new(path, before, null, LeftAsItIs(path, "it isn't UTF-8 text", byHand), byHand, true);
         }
-        var lines = command is null ? "" : $"{CommandLine(command)}, {ArgsLine(command)}" + (approve ? $", {ApprovalLine}" : "");
         try
         {
             var changed = CodexConfig(text, command, approve);
             return new(path, before, changed == text ? null : [.. (bom ? (byte[])[0xEF, 0xBB, 0xBF] : []), .. Utf8.GetBytes(changed)],
                 $"{(command is null ? "Removed" : "Set up")} the {Name} MCP server in {path}" + (approve ? ": Codex calls its tools without asking you first" : ""),
-                false);
+                byHand, false);
         }
         catch (NotCluewrensException e)
         {
             return new(path, before, null, $"Left the {Name} MCP server in {path} as it is: {e.Message}"
-                + (command is null ? "" : $". To have Cluewren's there, rename that server and connect again, or set it up there by hand: {lines}"), true);
+                + (command is null ? "" : $". To have Cluewren's there, rename that server and connect again, or set it up there by hand: {lines}"), byHand, true);
         }
         catch (FormatException e)
         {
-            return new(path, before, null, $"Left {path} as it is: {e.Message}. "
-                + (command is null ? $"Remove the {Name} server by hand: codex mcp remove {Name}" : $"Set the {Name} server up there by hand: {lines}"), true);
+            return new(path, before, null, LeftAsItIs(path, e.Message, byHand), byHand, true);
         }
     }
 
+    // The config can hold keys in MCP env settings, and a new file (a temporary copy, a backup) doesn't reliably carry the old
+    // one's access rules, owner, mode, encryption or links, so connect edits the file itself through one handle.
     // A file that changed after it was read is left alone: writing what was computed from the old text would lose that change.
     public bool ApplyCodex(CodexChange change)
     {
@@ -664,35 +681,49 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         }
         if (change.After is not { } after)
             return true;
+        const string changed = "it changed while connect was reading it; run connect again";
         var path = change.Path;
-        var now = File.Exists(path) ? File.ReadAllBytes(path) : null;
-        if (now is null != change.Before is null || now is not null && !now.AsSpan().SequenceEqual(change.Before))
-        {
-            say($"Left {path} as it is: it changed while connect was reading it. Run connect again");
-            return false;
-        }
-        var folder = Path.GetDirectoryName(Path.GetFullPath(path))!;
-        Directory.CreateDirectory(folder);
-        var temp = Path.Combine(folder, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        FileStream? file = null;
+        var began = false;
         try
         {
-            File.WriteAllBytes(temp, after);
-            if (now is null)
-                File.Move(temp, path);
+            if (change.Before is null)
+            {
+                if (Path.GetDirectoryName(Path.GetFullPath(path)) is { } folder)
+                    Directory.CreateDirectory(folder);
+                var create = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None, BufferSize = 0 };
+                if (!OperatingSystem.IsWindows())
+                    create.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                file = new FileStream(path, create);
+            }
             else
-                File.Replace(temp, path, path + ".before-cluewren");
+            {
+                file = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 0);
+                using var now = new MemoryStream();
+                file.CopyTo(now);
+                if (!now.ToArray().AsSpan().SequenceEqual(change.Before))
+                {
+                    say(LeftAsItIs(path, changed, change.ByHand));
+                    return false;
+                }
+                file.Position = 0;
+            }
+            began = true;
+            file.Write(after);
+            file.SetLength(after.Length);
+            file.Flush(true);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        catch (Exception e) when (FileFailure(e))
         {
-            try
-            {
-                File.Delete(temp);
-            }
-            catch (Exception left) when (left is IOException or UnauthorizedAccessException)
-            {
-            }
-            say($"Left {path} as it is: {e.Message}");
+            if (began)
+                say($"Writing {path} failed after it began: {Why(e)}. What the file holds now is not known; it may be damaged. Check it. {change.ByHand}");
+            else
+                say(LeftAsItIs(path, e is IOException && File.Exists(path) != (change.Before is not null) ? changed : Why(e), change.ByHand));
             return false;
+        }
+        finally
+        {
+            file?.Dispose();
         }
         say(change.Message);
         return true;
@@ -712,7 +743,11 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         }
     }
 
-    bool Put(string path, string text)
+    bool Put(string path, string text) => Tried(path, () => Write(path, text));
+
+    bool Drop(string path) => Tried(path, () => Delete(path));
+
+    bool Write(string path, string text)
     {
         if (!Ours(path))
         {
@@ -725,15 +760,29 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         return true;
     }
 
-    void Drop(string path)
+    bool Delete(string path)
     {
         if (!File.Exists(path) || !Ours(path))
-            return;
+            return true;
         File.Delete(path);
         say($"Removed {path}");
         var folder = Path.GetDirectoryName(path)!;
         if (!Directory.EnumerateFileSystemEntries(folder).Any())
             Directory.Delete(folder);
+        return true;
+    }
+
+    bool Tried(string path, Func<bool> step)
+    {
+        try
+        {
+            return step();
+        }
+        catch (Exception e) when (FileFailure(e))
+        {
+            say($"Couldn't finish with {path}: {Why(e)}");
+            return false;
+        }
     }
 
     sealed record ClaudeEntry(string Scope, string Type, string Command, string Args, bool NoEnvironment);
@@ -886,14 +935,14 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
         if (client == "claude")
         {
             ok = ClaudeServer(null);
-            Drop(Path.Combine(ClaudeHome(), "skills", Name, "SKILL.md"));
-            Drop(Path.Combine(ClaudeHome(), "agents", $"{ClaudeDescriber}.md"));
+            ok &= Drop(Path.Combine(ClaudeHome(), "skills", Name, "SKILL.md"));
+            ok &= Drop(Path.Combine(ClaudeHome(), "agents", $"{ClaudeDescriber}.md"));
         }
         else
         {
             ok = EditCodexConfig(null, false);
-            Drop(Path.Combine(AgentsHome(), "skills", Name, "SKILL.md"));
-            Drop(Path.Combine(CodexHome(), "agents", $"{CodexDescriber}.toml"));
+            ok &= Drop(Path.Combine(AgentsHome(), "skills", Name, "SKILL.md"));
+            ok &= Drop(Path.Combine(CodexHome(), "agents", $"{CodexDescriber}.toml"));
         }
         return ok ? 0 : 3;
     }

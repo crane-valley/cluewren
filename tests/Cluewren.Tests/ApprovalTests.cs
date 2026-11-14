@@ -1,10 +1,51 @@
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using Cluewren.Mcp;
 
 namespace Cluewren.Tests;
 
+sealed class SymbolicLinkFactAttribute : FactAttribute
+{
+    public SymbolicLinkFactAttribute()
+    {
+        var folder = Directory.CreateTempSubdirectory("link-probe").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(folder, "target"), "");
+            File.CreateSymbolicLink(Path.Combine(folder, "link"), Path.Combine(folder, "target"));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Skip = $"this account can't create a symbolic link here: {e.Message}";
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+}
+
+sealed class UnixFactAttribute : FactAttribute
+{
+    public UnixFactAttribute()
+    {
+        if (OperatingSystem.IsWindows())
+            Skip = "Unix file modes; runs where the suite runs on Linux or macOS";
+    }
+}
+
 public class CodexApprovalTests
 {
     static readonly string[] Command = ["C:/tools/cluewren.exe", "mcp"];
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateHardLinkW(string link, string existing, IntPtr security);
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int link(string existing, string link);
+
+    static void HardLink(string name, string existing) =>
+        Assert.True(OperatingSystem.IsWindows() ? CreateHardLinkW(name, existing, IntPtr.Zero) : link(existing, name) == 0);
 
     static string Lines(params string[] lines) => string.Join('\n', lines) + "\n";
 
@@ -234,23 +275,28 @@ public class CodexApprovalTests
     }
 
     [Fact]
-    public void A_change_replaces_the_file_whole_and_keeps_the_old_one_beside_it()
+    public void A_change_is_written_into_the_file_itself_and_nothing_beside_it()
     {
         var path = TempConfig("model = \"m\"\n");
+        var otherName = Path.Combine(Directory.CreateTempSubdirectory("codex-link").FullName, "other.toml");
         try
         {
+            HardLink(otherName, path);
             var said = new List<string>();
             Assert.True(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
             Assert.Equal("model = \"m\"\n\n" + Connect.CodexConfig("", Command), File.ReadAllText(path));
-            Assert.Equal("model = \"m\"\n", File.ReadAllText(path + ".before-cluewren"));
-            Assert.Equal(["config.toml", "config.toml.before-cluewren"],
-                Directory.GetFiles(Path.GetDirectoryName(path)!).Select(file => Path.GetFileName(file)).Order());
+            Assert.Equal(File.ReadAllText(path), File.ReadAllText(otherName));
+            Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!));
             Assert.True(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
             Assert.Single(said);
+            Assert.True(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, null, false)));
+            Assert.Equal("model = \"m\"\n"u8.ToArray(), File.ReadAllBytes(path));
+            Assert.Equal("model = \"m\"\n"u8.ToArray(), File.ReadAllBytes(otherName));
         }
         finally
         {
             Directory.Delete(Path.GetDirectoryName(path)!, true);
+            Directory.Delete(Path.GetDirectoryName(otherName)!, true);
         }
     }
 
@@ -262,7 +308,7 @@ public class CodexApprovalTests
         {
             Assert.True(new Connect(_ => { }).ApplyCodex(Connect.PlanCodex(path, Command, false)));
             Assert.Equal(Connect.CodexConfig("", Command), File.ReadAllText(path));
-            Assert.False(File.Exists(path + ".before-cluewren"));
+            Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!));
         }
         finally
         {
@@ -283,6 +329,74 @@ public class CodexApprovalTests
             Assert.False(new Connect(said.Add).ApplyCodex(change));
             Assert.Equal("model = \"edited meanwhile\"\n", File.ReadAllText(path));
             Assert.Contains("changed while connect was reading it", said[^1]);
+            Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!));
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    // Regression: the replace swapped a linked config.toml (a dotfiles setup) for a plain file, cutting it off from its target.
+    [SymbolicLinkFact]
+    public void A_config_that_is_a_link_stays_a_link_and_its_target_is_written()
+    {
+        var folder = Directory.CreateTempSubdirectory("codex-home").FullName;
+        try
+        {
+            var target = Path.Combine(folder, "dotfiles.toml");
+            File.WriteAllText(target, "model = \"m\"\n");
+            var path = Path.Combine(folder, "config.toml");
+            File.CreateSymbolicLink(path, target);
+            Assert.True(new Connect(_ => { }).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal(target, new FileInfo(path).LinkTarget);
+            Assert.Equal("model = \"m\"\n\n" + Connect.CodexConfig("", Command), File.ReadAllText(target));
+            Assert.Equal(["config.toml", "dotfiles.toml"], Directory.GetFiles(folder).Select(file => Path.GetFileName(file)).Order());
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    // Regression: the temporary file took the umask's mode and replaced a 0600 config, leaving it readable to other users.
+    [UnixFact]
+    [UnsupportedOSPlatform("windows")]
+    public void A_written_config_is_never_readable_by_more_than_before()
+    {
+        var path = TempConfig("model = \"m\"\n");
+        try
+        {
+            const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            File.SetUnixFileMode(path, ownerOnly);
+            Assert.True(new Connect(_ => { }).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal(ownerOnly, File.GetUnixFileMode(path));
+            File.Delete(path);
+            Assert.True(new Connect(_ => { }).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+            Assert.Equal(ownerOnly, File.GetUnixFileMode(path));
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    // Regression: a config held open by another program made connect throw, or was left without the lines to set by hand.
+    [Fact]
+    public void A_config_in_use_is_left_as_it_is_with_the_lines_to_set_by_hand()
+    {
+        var path = TempConfig("model = \"m\"\n");
+        try
+        {
+            foreach (var share in (FileShare[])[FileShare.None, FileShare.Read])
+            {
+                var said = new List<string>();
+                using (new FileStream(path, FileMode.Open, FileAccess.Read, share))
+                    Assert.False(new Connect(said.Add).ApplyCodex(Connect.PlanCodex(path, Command, false)));
+                Assert.Equal("model = \"m\"\n", File.ReadAllText(path));
+                Assert.StartsWith($"Left {path} as it is: ", said[^1]);
+                Assert.Contains("command = \"C:/tools/cluewren.exe\"", said[^1]);
+            }
             Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!));
         }
         finally
