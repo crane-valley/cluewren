@@ -37,7 +37,7 @@ The plugin connects out to the Cluewren process on the same machine over a loopb
 
 3. In that folder, run `.\cluewren.exe connect claude` or `.\cluewren.exe connect codex`:
    - `connect claude` registers the MCP server with `claude mcp add --scope user` (every project) only when Claude Code has no server named cluewren, and writes `~/.claude/skills/cluewren/SKILL.md` and `~/.claude/agents/frame-describer.md`. Any other entry named cluewren is left as it is, and connect says what to do by hand.
-   - `connect codex` adds a `[mcp_servers."cluewren"]` table to `~/.codex/config.toml` (backing up the old file as `config.toml.before-cluewren`) and writes `~/.agents/skills/cluewren/SKILL.md` and `~/.codex/agents/frame_describer.toml`. On an existing cluewren table running Cluewren, it changes only the command and args, keeping every other line byte for byte. A cluewren table that runs something else, an HTTP server, or a config.toml connect cannot read exactly is left unchanged, and connect prints the lines to set by hand. `connect codex --remove`, and an add followed by a remove, leave every byte outside Cluewren's own table as it was (line endings included).
+   - `connect codex` adds a `[mcp_servers."cluewren"]` table to `~/.codex/config.toml` (editing the file in place and writing no backup) and writes `~/.agents/skills/cluewren/SKILL.md` and `~/.codex/agents/frame_describer.toml`. On an existing cluewren table running Cluewren, it changes only the command and args, keeping every other line byte for byte. A cluewren table that runs something else, an HTTP server, or a config.toml connect cannot read exactly is left unchanged, and connect prints the lines to set by hand. `connect codex --remove`, and an add followed by a remove, leave every byte outside Cluewren's own table as it was (line endings included).
    `connect` registers no automatic approval. It records the absolute path of the binary. After moving the folder or installing a new version, run `connect` again. Use `--remove` with either command to take them out.
 
 4. Install the engine plugin into your project (see [Engine plugins](#engine-plugins)).
@@ -123,7 +123,7 @@ Files written in the game project:
 - Godot: `.godot/cluewren` (runs, traces, reports, run memory) and `.godot/cluewren_codex` (project summary; falls back to `user://cluewren_codex` when `res://` is not writable).
 - Unreal: `Saved/Cluewren` (runs, traces, reports, run memory), `Saved/CluewrenCodex` (the Blueprint export), and `Saved/Logs/CluewrenCodexExport.log`.
 
-To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, project data, or `config.toml.before-cluewren`.
+To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, or project data; 0.1.1 writes no backup, and a `config.toml.before-cluewren` left by 0.1.0 is the user's to delete.
 
 ## Upgrade
 

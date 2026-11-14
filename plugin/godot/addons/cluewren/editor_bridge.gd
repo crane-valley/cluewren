@@ -140,7 +140,7 @@ func _set_busy(busy: bool) -> void:
 
 func _hello() -> Dictionary:
 	var cfg := ConfigFile.new()
-	var version := "0.1.0"
+	var version := "0.1.1"
 	if cfg.load("res://addons/cluewren/plugin.cfg") == OK:
 		version = str(cfg.get_value("plugin", "version", version))
 	return {"plugin_version": version, "engine": "godot", "engine_version": Engine.get_version_info().string,
