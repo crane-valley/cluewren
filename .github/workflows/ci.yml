@@ -20,6 +20,9 @@ jobs:
           dotnet-version: 10.0.x
       - run: dotnet build Cluewren.slnx -c Release
       - run: dotnet test tests/Cluewren.Tests -c Release --no-build
+      - name: Check the user-facing documents
+        shell: pwsh
+        run: ./eng/check-docs.ps1
       - name: Check for vulnerable packages
         shell: pwsh
         run: |

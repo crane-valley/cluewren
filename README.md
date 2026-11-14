@@ -8,7 +8,7 @@ Cluewren itself never starts or drives a language model and holds no language mo
 
 Your agent researches the game's code, tries things in the live game, and writes a C# harness for this game and request. A fast decision model (TypeSafe's Jev) makes the choices in play inside that harness. The agent looks at frames through a frame-describer subagent that sees the frames but not the claim, then reports what play showed, with evidence.
 
-The plugin connects out to the Cluewren process on the same machine over a loopback WebSocket (127.0.0.1) with a per-start secret handshake. An editor connects only when its project is the agent's working folder, inside it, or contains it.
+The plugin connects out to the Cluewren process (the brain) on the same machine over a loopback WebSocket (127.0.0.1) with a per-start secret handshake.
 
 ## Requirements
 
@@ -24,13 +24,13 @@ The plugin connects out to the Cluewren process on the same machine over a loopb
 
 ## Quick start
 
-1. Download `cluewren-0.1.1-win-x64.zip` and `SHA256SUMS.txt` from the [release page](https://github.com/crane-valley/cluewren/releases/tag/v0.1.1) and check the zip against `SHA256SUMS.txt`:
+1. Download `cluewren-0.1.2-win-x64.zip` and `SHA256SUMS.txt` from the [release page](https://github.com/crane-valley/cluewren/releases/tag/v0.1.2) and check the zip against `SHA256SUMS.txt`:
    ```powershell
-   (Get-FileHash -Algorithm SHA256 .\cluewren-0.1.1-win-x64.zip).Hash.ToLowerInvariant()
+   (Get-FileHash -Algorithm SHA256 .\cluewren-0.1.2-win-x64.zip).Hash.ToLowerInvariant()
    ```
    Compare the hash with the line for that file in `SHA256SUMS.txt`. You can also verify the GitHub build provenance attestation:
    ```bash
-   gh attestation verify cluewren-0.1.1-win-x64.zip --repo crane-valley/cluewren
+   gh attestation verify cluewren-0.1.2-win-x64.zip --repo crane-valley/cluewren
    ```
 
 2. Unzip it to a folder that will stay put.
@@ -79,9 +79,9 @@ This requires the .NET 10 SDK. The binary is `src/Cluewren/bin/Release/net10.0/c
 
 ## Engine plugins
 
-- Unity 6000.0+: `cluewren-unity-0.1.1.zip` (package `com.cranevalley.cluewren` 0.1.1); source `plugin/unity/com.cranevalley.cluewren` - [install](https://docs.cluewren.dev/engines/unity/)
-- Godot 4 (tested with 4.7.2): `cluewren-godot-0.1.1.zip` (unzips to `addons/cluewren` in the project root); source `plugin/godot/addons/cluewren` - [install](https://docs.cluewren.dev/engines/godot/)
-- Unreal Engine 5 (tested with 5.8, Win64 only, beta): `cluewren-unreal-0.1.1.zip` (source only, built with your engine); source `plugin/unreal/Cluewren` - [install](https://docs.cluewren.dev/engines/unreal/)
+- Unity 6000.0+: `cluewren-unity-0.1.2.zip` (package `com.cranevalley.cluewren` 0.1.2); source `plugin/unity/com.cranevalley.cluewren` - [install](https://docs.cluewren.dev/engines/unity/)
+- Godot 4 (tested with 4.7.2): `cluewren-godot-0.1.2.zip` (unzips to `addons/cluewren` in the project root); source `plugin/godot/addons/cluewren` - [install](https://docs.cluewren.dev/engines/godot/)
+- Unreal Engine 5 (tested with 5.8, Win64 only, beta): `cluewren-unreal-0.1.2.zip` (source only, built with your engine); source `plugin/unreal/Cluewren` - [install](https://docs.cluewren.dev/engines/unreal/)
 
 ## Privacy
 
@@ -101,7 +101,7 @@ An editor connects only when its project is the agent's working folder, inside i
 
 The compiled C# harness runs in a child process inside a Windows AppContainer with no network access and write access only to its run folder, held by a Job Object with a CPU ceiling of two logical processors' worth of the whole machine (a ceiling, not a reservation). It reaches the game and the decision model only through the cluewren process over stdio.
 
-Input from the harness child is treated as untrusted: a line over 4 MiB, a line that is not JSON, a message of the wrong shape, a reply without value or error, or a `send` from the child ends the session and kills the child (the brain itself keeps running); per child the brain holds at most 512 items or 16 MiB across game requests and Jev requests being served and statuses waiting to be shown, past which the session ends. Not guaranteed (issue 19): frames the child has the brain forward to the game (`post`) are not counted or limited, and some link-side replay behaviour is unchecked; see SECURITY.md.
+Input from the harness child is treated as untrusted: a line over 4 MiB, a line that is not JSON, a message of the wrong shape, a reply without value or error, or a `send` from the child ends the session and kills the child (the brain itself keeps running); per child the brain holds at most 512 items or 16 MiB across game requests and Jev requests being served and statuses waiting to be shown, past which the session ends. What the brain holds for the game on behalf of a child is bounded: 16 MiB waiting plus 32 MiB kept for replay; see SECURITY.md.
 
 If the container cannot be created, the default (`auto`) runs harness code in a plain child process created directly inside its job object with no keys in its environment and notes the downgrade. That child can read the user's files and reach the network. Setting `CLUEWREN_SANDBOX=required` makes the container mandatory and refuses to run harness code without it.
 
@@ -109,7 +109,7 @@ Linux and macOS are unsupported (untested), not disabled. On Linux, the harness 
 
 Through the engine plugin's remote calls (rc), harness code acts inside the editor with the editor's rights. The container does not limit that. The plugins refuse nine categories of remote calls on all three engines as defense in depth, not as a boundary. Game code remains reachable and may do anything. Treat harness code as running with the editor's rights.
 
-For the threat model, verification steps and hardening guidance, see [SECURITY.md](SECURITY.md), [ADR 0014](docs/adr/0014-rc-refusals-on-every-engine.md), and [ADR 0015](docs/adr/0015-a-run-takes-only-its-projects-editor.md).
+For the threat model, verification steps and hardening guidance, see [SECURITY.md](SECURITY.md), [ADR 0014](docs/adr/0014-rc-refusals-on-every-engine.md), [ADR 0015](docs/adr/0015-a-run-takes-only-its-projects-editor.md), and [ADR 0016](docs/adr/0016-the-link-bounds-what-a-harness-child-queues.md).
 
 ## Files and uninstall
 
@@ -123,14 +123,16 @@ Files written in the game project:
 - Godot: `.godot/cluewren` (runs, traces, reports, run memory) and `.godot/cluewren_codex` (project summary; falls back to `user://cluewren_codex` when `res://` is not writable).
 - Unreal: `Saved/Cluewren` (runs, traces, reports, run memory), `Saved/CluewrenCodex` (the Blueprint export), and `Saved/Logs/CluewrenCodexExport.log`.
 
-To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, or project data; 0.1.1 writes no backup, and a `config.toml.before-cluewren` left by 0.1.0 is the user's to delete.
+To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, or project data; connect writes no backup of config.toml. A `config.toml.before-cluewren` left by 0.1.0 is yours to delete.
 
 ## Upgrade
 
-To upgrade:
+Upgrading from 0.1.1 has no protocol change: brain 0.1.2 works with plugin 0.1.1 and 0.1.2, upgrading the brain alone is enough (both is fine), and there is nothing to run again unless the folder moved (then run `connect` again).
 
-1. Download `cluewren-0.1.1-win-x64.zip` and replace the binary folder's contents (or unzip to a new folder).
-2. Upgrade the engine plugin in each project to 0.1.1. Brain 0.1.1 needs plugin 0.1.1 in the game project: a 0.1.0 plugin is refused with the text "update the Cluewren plugin in this project". Plugin 0.1.1 still works with a 0.1.0 brain. Upgrade both.
+To upgrade from 0.1.0:
+
+1. Download `cluewren-0.1.2-win-x64.zip` and replace the binary folder's contents (or unzip to a new folder).
+2. Upgrade the engine plugin in each project to 0.1.2. Brain 0.1.1 and later need a plugin of 0.1.1 or later in the game project: a 0.1.0 plugin is refused with the text "update the Cluewren plugin in this project". A plugin of 0.1.1 or later also works with a 0.1.0 brain. Upgrade both.
 3. For Codex, run connect once to remove the automatic approval line 0.1.0 wrote:
    ```powershell
    .\cluewren.exe connect codex
@@ -152,7 +154,7 @@ To upgrade:
 
 ## Status
 
-Version 0.1.1, Windows 11 x64 only. Linux and macOS are not supported. The Unreal plugin is marked beta. See [CHANGELOG.md](CHANGELOG.md) for known limitations.
+Version 0.1.2, Windows 11 x64 only. Linux and macOS are not supported. The Unreal plugin is marked beta. See [CHANGELOG.md](CHANGELOG.md) for known limitations.
 
 ## Support
 
