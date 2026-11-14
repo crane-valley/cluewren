@@ -301,12 +301,15 @@ public class ConnectTests
             var skill = Path.Combine(home, "skills", "cluewren", "SKILL.md");
             var describer = Path.Combine(home, "agents", "frame-describer.md");
             var commands = new List<string[]>();
-            string? server = null;
+            (string Command, string Args)? server = null;
             var connect = new Connect(_ => { }, command =>
             {
                 commands.Add(command);
                 if (command[2] == "get")
-                    return server is null ? (1, "No MCP server found") : (0, $"Command: {server}");
+                    return server is not { } shown ? (1, "No MCP server named \"cluewren\". Run `claude mcp add` to add one.\n")
+                        : (0, "cluewren:\n  Scope: User config (available in all your projects)\n  Status: \u2714 Connected\n  Type: stdio\n"
+                            + $"  Command: {shown.Command}\n  Args: {shown.Args}\n  Environment:\n\n"
+                            + "To remove this server, run: claude mcp remove cluewren -s user\n");
                 if (command[2] == "remove")
                     server = null;
                 return (0, "");
@@ -317,12 +320,12 @@ public class ConnectTests
             Assert.Contains("cluewren connect", File.ReadAllText(skill));
             Assert.Contains("cluewren connect", File.ReadAllText(describer));
 
-            server = "C:/tools/cluewren.exe mcp";
+            server = ("C:/tools/cluewren.exe", "mcp");
             Assert.Equal(0, connect.Remove("claude"));
             Assert.Null(server);
             Assert.False(File.Exists(skill) || File.Exists(describer));
 
-            server = "npx someone-elses-server";
+            server = ("npx", "someone-elses-server");
             Directory.CreateDirectory(Path.GetDirectoryName(describer)!);
             File.WriteAllText(describer, "mine");
             commands.Clear();

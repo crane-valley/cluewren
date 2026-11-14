@@ -29,8 +29,17 @@ installed by a `connect` command for Claude Code and for Codex, as upstream's `a
   unfinished work is inconclusive.
 - The brain holds no language model key and never reads the agent's credentials. It makes no model calls.
 - Jev remains the brain's own call, with the user's TypeSafe key.
-- `connect` owns its skill and agent files and one marked entry in shared config such as Codex's config.toml. It changes
-  nothing else, and `connect --remove` takes those out.
+- `connect` owns its skill and agent files, and an entry in shared config (Claude Code's servers, Codex's config.toml)
+  only when that entry runs Cluewren's own command: a file named cluewren or cluewren.exe with the one argument mcp, or,
+  in config.toml, dotnet with Cluewren.dll and mcp. It changes nothing else, leaves any other entry as it is and says
+  what to do by hand, and `connect --remove` takes out only what it owns.
+- `connect` edits config.toml in place, through one handle that no other program can open meanwhile (on Windows; macOS
+  and Linux don't keep another program out), and writes only if the file still holds what it read. It makes no other file with the config's content, no temporary copy and no
+  backup: the config can hold keys in MCP env settings, and a new file doesn't reliably keep the old one's access rules,
+  owner, mode, encryption or links. A file it can't open that way is left as it is, with the lines to set by hand. What
+  is given up is an atomic write and a copy to go back to: a crash during the write can leave the file damaged, and
+  connect says so when the write fails part way. A hard link to config.toml under another name is the same file and
+  changes with it, and the file's timestamps (and a cloud placeholder's state) change as with any edit.
 - Runs start from the user's agent. The editor window shows, steers and stops a run, as it does for upstream's connect
   runs. It does not start one, and the plugin's own run request (-Playtest, hello.run) is removed.
 
