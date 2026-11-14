@@ -9,8 +9,10 @@ Cluewren plays the game open in the user's editor: a fast decision model makes t
 harness you write for this game and this request. You research the game's code, try things in the live game, write and
 revise the harness, and report what play showed. Its tools come from the `cluewren` MCP server.
 
-1. The game's project must be open in its editor with the Cluewren plugin. When start_run says no editor connected,
-   tell the user that and stop.
+1. The game's project must be open in its editor with the Cluewren plugin. When start_run reports that no editor of this
+   project connected, or that an editor was refused as another project, call start_run again with `project` set to the
+   path the editor shows (or ask the user to start the agent in the game's folder); if still no editor connects, tell
+   the user and stop.
 2. Call `start_run` with the request in the user's words and its kind. A request is one of four types:
    - an exploration ("Explore the crafting system in Lvl_Main"): `explore`, with `minutes` of play when the user gives
      them;

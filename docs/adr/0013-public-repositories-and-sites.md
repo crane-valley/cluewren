@@ -1,6 +1,6 @@
-# 0013 Three public repositories and two sites on cluewren.dev
+# 0013 A public code repository, two site repositories and two sites on cluewren.dev
 
-Status: accepted
+Status: accepted, the site repositories' visibility amended on 2026-11-12 (see Amendment)
 Date: 2026-11-03
 
 ## Context
@@ -31,3 +31,11 @@ Rejected:
 - Every change to main, including the owner's, goes through a pull request.
 - The Cloudflare Pages projects and their custom domains are created by the owner in the dashboard.
 - Kit docs change in the code repository; the docs site's reference page only links to them.
+
+## Amendment (2026-11-12)
+
+On 2026-11-12 the owner made the two site repositories (crane-valley/cluewren-www and crane-valley/cluewren-docs)
+private, matching Framedash's site repositories, which are private.
+
+The code repository crane-valley/cluewren remains public. Both sites are still served by Cloudflare Pages from main.
+The docs site's "Edit page" link was removed.
