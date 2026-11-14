@@ -284,6 +284,7 @@ public sealed class HarnessHost : IAsyncDisposable
             }
             var session = await StartChild(ct).ConfigureAwait(false);
             _running = session;
+            session.Episode = n;
             using var stop = ct.Register(session.Stop);
             try
             {
