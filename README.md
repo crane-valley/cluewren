@@ -8,7 +8,7 @@ Cluewren itself never starts or drives a language model and holds no language mo
 
 Your agent researches the game's code, tries things in the live game, and writes a C# harness for this game and request. A fast decision model (TypeSafe's Jev) makes the choices in play inside that harness. The agent looks at frames through a frame-describer subagent that sees the frames but not the claim, then reports what play showed, with evidence.
 
-The plugin connects out to the Cluewren process on the same machine over a loopback WebSocket (127.0.0.1) with a per-start secret handshake. An editor connects only when its project is the agent's working folder, inside it, or contains it.
+The plugin connects out to the Cluewren process (the brain) on the same machine over a loopback WebSocket (127.0.0.1) with a per-start secret handshake.
 
 ## Requirements
 
@@ -101,7 +101,7 @@ An editor connects only when its project is the agent's working folder, inside i
 
 The compiled C# harness runs in a child process inside a Windows AppContainer with no network access and write access only to its run folder, held by a Job Object with a CPU ceiling of two logical processors' worth of the whole machine (a ceiling, not a reservation). It reaches the game and the decision model only through the cluewren process over stdio.
 
-Input from the harness child is treated as untrusted: a line over 4 MiB, a line that is not JSON, a message of the wrong shape, a reply without value or error, or a `send` from the child ends the session and kills the child (the brain itself keeps running); per child the brain holds at most 512 items or 16 MiB across game requests and Jev requests being served and statuses waiting to be shown, past which the session ends. What the brain holds for the game on behalf of a child is bounded: 16 MiB waiting plus 32 MiB kept for replay ([ADR 0016](docs/adr/0016-the-link-bounds-what-a-harness-child-queues.md)); see SECURITY.md.
+Input from the harness child is treated as untrusted: a line over 4 MiB, a line that is not JSON, a message of the wrong shape, a reply without value or error, or a `send` from the child ends the session and kills the child (the brain itself keeps running); per child the brain holds at most 512 items or 16 MiB across game requests and Jev requests being served and statuses waiting to be shown, past which the session ends. What the brain holds for the game on behalf of a child is bounded: 16 MiB waiting plus 32 MiB kept for replay; see SECURITY.md.
 
 If the container cannot be created, the default (`auto`) runs harness code in a plain child process created directly inside its job object with no keys in its environment and notes the downgrade. That child can read the user's files and reach the network. Setting `CLUEWREN_SANDBOX=required` makes the container mandatory and refuses to run harness code without it.
 
@@ -123,16 +123,16 @@ Files written in the game project:
 - Godot: `.godot/cluewren` (runs, traces, reports, run memory) and `.godot/cluewren_codex` (project summary; falls back to `user://cluewren_codex` when `res://` is not writable).
 - Unreal: `Saved/Cluewren` (runs, traces, reports, run memory), `Saved/CluewrenCodex` (the Blueprint export), and `Saved/Logs/CluewrenCodexExport.log`.
 
-To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, or project data; since 0.1.1 connect writes no backup, and a `config.toml.before-cluewren` left by 0.1.0 is the user's to delete.
+To uninstall, run `cluewren connect claude --remove` or `cluewren connect codex --remove`. Then delete the folders listed above, the engine plugin from each project, and the binary folder. `--remove` does not delete `keys.env`, the `Cluewren-child` folder, or project data; connect writes no backup of config.toml. A `config.toml.before-cluewren` left by 0.1.0 is yours to delete.
 
 ## Upgrade
 
-Upgrading from 0.1.1 has no protocol change: brain 0.1.2 works with plugin 0.1.1 and 0.1.2, upgrading the brain alone is enough (both is fine), and there is nothing to run again unless the folder moved (then `connect` as before).
+Upgrading from 0.1.1 has no protocol change: brain 0.1.2 works with plugin 0.1.1 and 0.1.2, upgrading the brain alone is enough (both is fine), and there is nothing to run again unless the folder moved (then run `connect` again).
 
 To upgrade from 0.1.0:
 
 1. Download `cluewren-0.1.2-win-x64.zip` and replace the binary folder's contents (or unzip to a new folder).
-2. Upgrade the engine plugin in each project to 0.1.2. Since 0.1.1 the brain needs a plugin of 0.1.1 or later in the game project: a 0.1.0 plugin is refused with the text "update the Cluewren plugin in this project". A plugin of 0.1.1 or later still works with a 0.1.0 brain. Upgrade both.
+2. Upgrade the engine plugin in each project to 0.1.2. Brain 0.1.1 and later need a plugin of 0.1.1 or later in the game project: a 0.1.0 plugin is refused with the text "update the Cluewren plugin in this project". A plugin of 0.1.1 or later also works with a 0.1.0 brain. Upgrade both.
 3. For Codex, run connect once to remove the automatic approval line 0.1.0 wrote:
    ```powershell
    .\cluewren.exe connect codex
