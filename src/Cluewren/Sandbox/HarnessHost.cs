@@ -91,13 +91,15 @@ public sealed class HarnessHost : IAsyncDisposable
 
     bool SpendDecision() => Interlocked.Increment(ref _decisions) <= _options.MaxJevDecisions;
 
-    async Task<SandboxSession> Attach(ISandboxProcess process, CancellationToken ct)
+    async Task<SandboxSession> Attach(ISandboxProcess process, NoGameLink? preflight, CancellationToken ct)
     {
         SandboxSession? session = null;
         try
         {
-            session = new SandboxSession(process, _link, _options.Jev, SpendDecision, _options.Recorder, _say,
-                Path.Combine(_runFolder, "sandbox.log"));
+            var log = Path.Combine(_runFolder, "sandbox.log");
+            session = preflight is null
+                ? new SandboxSession(process, _link, _options.Jev, SpendDecision, _options.Recorder, _say, log)
+                : new SandboxSession(process, preflight, null, () => false, null, _ => preflight.Status(""), log);
             session.Init(_runFolder, _game.Level, Math.Max(0, _options.MaxJevDecisions - JevDecisions));
             if ((await session.Call("ping", null, 60, ct).ConfigureAwait(false)).GetString() != "pong")
                 throw new SandboxException("the child didn't answer its first call");
@@ -113,7 +115,7 @@ public sealed class HarnessHost : IAsyncDisposable
         }
     }
 
-    async Task<SandboxSession> StartChild(CancellationToken ct)
+    async Task<SandboxSession> StartChild(CancellationToken ct, NoGameLink? preflight = null)
     {
         var spec = Spec();
         var mode = _downgrade is not null ? SandboxMode.Process : _options.Mode;
@@ -125,13 +127,13 @@ public sealed class HarnessHost : IAsyncDisposable
         SandboxSession session;
         try
         {
-            session = await Attach(process, ct).ConfigureAwait(false);
+            session = await Attach(process, preflight, ct).ConfigureAwait(false);
         }
         catch (SandboxException e) when (_options.Mode == SandboxMode.Auto && process.Kind != "process")
         {
             _downgrade = SandboxStarter.Downgraded(e.Message);
             (var plain, _, _uncapped) = SandboxStarter.Start(spec, SandboxMode.Process);
-            session = await Attach(plain, ct).ConfigureAwait(false);
+            session = await Attach(plain, preflight, ct).ConfigureAwait(false);
         }
         Sandbox = session.Kind;
         return session;
@@ -322,6 +324,43 @@ public sealed class HarnessHost : IAsyncDisposable
             {
                 _running = null;
                 await Abandon(session).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _one.Release();
+        }
+    }
+
+    // StartMap is the harness's own code: it is read in the child, and the harness is never made in this process.
+    public async Task<(string? StartMap, string? Problem)> StartMapAsync(CancellationToken ct = default)
+    {
+        await _one.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(_harness))
+                return (null, "harness.cs doesn't exist yet: write it first.");
+            var compiled = _compiler.CompileHarness(_harness, _lib);
+            if (!compiled.Ok)
+                return (null, "The harness doesn't load:\n" + compiled.ProblemText);
+            var unreachable = new NoGameLink();
+            var session = await StartChild(ct, unreachable).ConfigureAwait(false);
+            try
+            {
+                var value = await session.Call("start_map", new Dictionary<string, object?>
+                {
+                    ["assembly"] = compiled.Assembly, ["type"] = compiled.Type,
+                }, 60, ct).ConfigureAwait(false);
+                if (unreachable.Tried)
+                    return (null, "The harness doesn't load: it tried to reach the game before the run started.");
+                if (value.TryGetProperty("problem", out var problem) && problem.GetString() is { } text)
+                    return (null, text);
+                return (value.TryGetProperty("start_map", out var map) && map.ValueKind == JsonValueKind.String
+                    ? map.GetString() : null, null);
+            }
+            finally
+            {
+                session.Dispose();
             }
         }
         finally

@@ -33,10 +33,10 @@ namespace Cluewren.Editor
 
         static string State(PlaytestClient client)
         {
-            if (client == null) return "Disconnected";
-            if (client.Connected) return "Connected";
-            if (!string.IsNullOrEmpty(client.Problem)) return client.Problem;
-            return client.WantConnected ? "Connecting" : "Disconnected";
+            if (client != null && client.Connected) return "Connected";
+            if (client != null && !string.IsNullOrEmpty(client.Problem)) return client.Problem;
+            if (client != null && client.WantConnected) return "Connecting";
+            return EditorHost.Unusable ?? "Disconnected";
         }
     }
 }

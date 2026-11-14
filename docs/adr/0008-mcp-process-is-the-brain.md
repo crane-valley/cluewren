@@ -1,6 +1,6 @@
 # 0008 The MCP process is the brain, for one run at a time
 
-Status: accepted
+Status: accepted, which editor a run takes amended by 0015
 Date: 2026-10-31
 
 ## Context

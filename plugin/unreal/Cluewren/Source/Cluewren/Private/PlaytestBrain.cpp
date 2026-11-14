@@ -49,6 +49,35 @@ namespace
 		const DWORD Attributes = GetFileAttributesW(*Path);
 		return Attributes != INVALID_FILE_ATTRIBUTES && !(Attributes & FILE_ATTRIBUTE_REPARSE_POINT) && OwnerIsThisUser(Path);
 	}
+
+	// Only ASCII letters are folded: each engine folds other letters its own way, and the three must compare alike.
+	FString Folder(const FString& Path)
+	{
+		FString P = Path.Replace(TEXT("/"), TEXT("\\"), ESearchCase::CaseSensitive);
+		const TCHAR Drive = P.Len() >= 3 ? P[0] : TEXT('\0');
+		if (P.Len() < 3 || P[1] != TEXT(':') || P[2] != TEXT('\\') || !((Drive >= TEXT('A') && Drive <= TEXT('Z')) || (Drive >= TEXT('a') && Drive <= TEXT('z'))))
+		{
+			return FString();
+		}
+		while (P.Len() > 3 && P[P.Len() - 1] == TEXT('\\'))
+		{
+			P.LeftChopInline(1);
+		}
+		for (int32 i = 0; i < P.Len(); ++i)
+		{
+			if (P[i] >= TEXT('A') && P[i] <= TEXT('Z'))
+			{
+				P[i] += 32;
+			}
+		}
+		return P;
+	}
+
+	bool Within(const FString& Inner, const FString& Outer)
+	{
+		return Inner.Equals(Outer, ESearchCase::CaseSensitive)
+			|| Inner.StartsWith(Outer.EndsWith(TEXT("\\"), ESearchCase::CaseSensitive) ? Outer : Outer + TEXT("\\"), ESearchCase::CaseSensitive);
+	}
 }
 
 FString FilePath()
@@ -56,7 +85,7 @@ FString FilePath()
 	return FString(FPlatformProcess::UserSettingsDir()) / TEXT("Cluewren") / TEXT("brain.json");
 }
 
-FString Read(const FString& Path, FAddress& Out)
+FString Read(const FString& Path, const FString& ProjectDir, FAddress& Out)
 {
 	if (!FPaths::FileExists(Path))
 	{
@@ -89,7 +118,68 @@ FString Read(const FString& Path, FAddress& Out)
 	{
 		return TEXT("The brain in brain.json isn't running");
 	}
+	const FString Why = ForAnotherProject(*Said, ProjectDir);
+	if (!Why.IsEmpty())
+	{
+		return Why;
+	}
 	return CheckUrl(Url, Out);
+}
+
+FString ProjectDir()
+{
+	return ProjectDirOf(FPaths::ProjectDir());
+}
+
+FString ProjectDirOf(const FString& Dir)
+{
+	FString Full = FPaths::ConvertRelativePathToFull(Dir);
+	FPaths::NormalizeDirectoryName(Full);
+	return Full;
+}
+
+FString ForAnotherProject(const FJsonObject& Said, const FString& ProjectDir)
+{
+	const TSharedPtr<FJsonValue> Folders = Said.TryGetField(TEXT("folders"));
+	if (!Folders.IsValid() || Folders->Type == EJson::Null || (Folders->Type == EJson::Array && Folders->AsArray().IsEmpty()))
+	{
+		return FString();
+	}
+	const TSharedPtr<FJsonValue> Given = Said.TryGetField(TEXT("match"));
+	const FString Match = Given.IsValid() && Given->Type == EJson::String ? Given->AsString() : FString();
+	const FString Mine = Folder(ProjectDir);
+	TArray<FString> Named;
+	bool bFound = false;
+	if (Folders->Type == EJson::Array)
+	{
+		for (const TSharedPtr<FJsonValue>& Entry : Folders->AsArray())
+		{
+			if (!Entry.IsValid() || Entry->Type != EJson::String)
+			{
+				continue;
+			}
+			Named.Add(FString::Printf(TEXT("\"%s\""), *Entry->AsString()));
+			const FString Theirs = Folder(Entry->AsString());
+			if (Mine.IsEmpty() || Theirs.IsEmpty())
+			{
+				continue;
+			}
+			if (Match.Equals(TEXT("exact"), ESearchCase::CaseSensitive))
+			{
+				bFound |= Mine.Equals(Theirs, ESearchCase::CaseSensitive);
+			}
+			else if (Match.Equals(TEXT("related"), ESearchCase::CaseSensitive))
+			{
+				bFound |= Within(Mine, Theirs) || Within(Theirs, Mine);
+			}
+		}
+	}
+	if (bFound)
+	{
+		return FString();
+	}
+	return FString::Printf(TEXT("For another project: the run is for %s (match \"%s\"), this project is \"%s\""),
+		Named.Num() > 0 ? *FString::Join(Named, TEXT(" or ")) : TEXT("no folder"), *Match, *ProjectDir);
 }
 
 FString CheckUrl(const FString& Url, FAddress& Out)
@@ -148,6 +238,23 @@ TArray<uint8> Prove(const TArray<uint8>& Secret, const TCHAR* Role, const TArray
 	Input.Add(0);
 	Input.Append(PluginNonce);
 	Input.Append(BrainNonce);
+	TArray<uint8> Mac;
+	Mac.SetNumUninitialized(32);
+	verify(BCRYPT_SUCCESS(BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE, const_cast<uint8*>(Secret.GetData()), Secret.Num(), Input.GetData(), Input.Num(), Mac.GetData(), Mac.Num())));
+	return Mac;
+}
+
+TArray<uint8> HelloMac(const TArray<uint8>& Secret, const TArray<uint8>& PluginNonce, const FString& ProjectDir)
+{
+	const FTCHARToUTF8 Label(HelloRole);
+	const FTCHARToUTF8 Project(*ProjectDir);
+	TArray<uint8> Input;
+	Input.Reserve(Label.Length() + 1 + PluginNonce.Num() + 1 + Project.Length());
+	Input.Append(reinterpret_cast<const uint8*>(Label.Get()), Label.Length());
+	Input.Add(0);
+	Input.Append(PluginNonce);
+	Input.Add(0);
+	Input.Append(reinterpret_cast<const uint8*>(Project.Get()), Project.Length());
 	TArray<uint8> Mac;
 	Mac.SetNumUninitialized(32);
 	verify(BCRYPT_SUCCESS(BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE, const_cast<uint8*>(Secret.GetData()), Secret.Num(), Input.GetData(), Input.Num(), Mac.GetData(), Mac.Num())));

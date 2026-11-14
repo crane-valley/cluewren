@@ -74,6 +74,7 @@ namespace Cluewren.Tests
             {
                 ["url"] = "ws://127.0.0.1:1/v1/bridge", ["secret"] = secret, ["pid"] = pid, ["started"] = "2026-10-31T00:00:00+00:00",
             }));
+            TestFiles.MakeMine(dir, path);
             return path;
         }
 
@@ -85,11 +86,11 @@ namespace Cluewren.Tests
             try
             {
                 var secret = Convert.ToBase64String(Range(0));
-                Assert.IsNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, secret), out var brain));
+                Assert.IsNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, secret), dir, out var brain));
                 Assert.AreEqual(Range(0), brain.Secret);
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, 0, secret), out _));
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, "short"), out _));
-                Assert.IsNotNull(Discovery.Read(Path.Combine(dir, "missing.json"), out _));
+                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, 0, secret), dir, out _));
+                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, "short"), dir, out _));
+                Assert.IsNotNull(Discovery.Read(Path.Combine(dir, "missing.json"), dir, out _));
             }
             finally
             {
@@ -104,6 +105,7 @@ namespace Cluewren.Tests
             var system = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe");
             Assert.IsFalse(Native.OwnedByCurrentUser(system));
             var mine = Path.GetTempFileName();
+            TestFiles.MakeMine(mine);
             try
             {
                 Assert.IsTrue(Native.OwnedByCurrentUser(mine));

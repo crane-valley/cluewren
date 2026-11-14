@@ -10,6 +10,7 @@ namespace Cluewren
     {
         public const string BrainRole = "brain-proof";
         public const string PluginRole = "plugin-proof";
+        public const string HelloRole = "hello";
         public const int NonceBytes = 32;
 
         public static byte[] NewNonce()
@@ -26,6 +27,17 @@ namespace Cluewren
             label.CopyTo(input, 0);
             pluginNonce.CopyTo(input, label.Length + 1);
             brainNonce.CopyTo(input, label.Length + 1 + pluginNonce.Length);
+            using (var mac = new HMACSHA256(secret)) return mac.ComputeHash(input);
+        }
+
+        public static byte[] HelloMac(byte[] secret, byte[] pluginNonce, string projectDir)
+        {
+            var label = Encoding.ASCII.GetBytes(HelloRole);
+            var project = Encoding.UTF8.GetBytes(projectDir);
+            var input = new byte[label.Length + 1 + pluginNonce.Length + 1 + project.Length];
+            label.CopyTo(input, 0);
+            pluginNonce.CopyTo(input, label.Length + 1);
+            project.CopyTo(input, label.Length + 1 + pluginNonce.Length + 1);
             using (var mac = new HMACSHA256(secret)) return mac.ComputeHash(input);
         }
 

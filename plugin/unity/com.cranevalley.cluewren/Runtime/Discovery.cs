@@ -42,8 +42,9 @@ namespace Cluewren
             return Path.Combine(root, FolderName);
         }
 
-        /// <summary>Why the brain announced in <paramref name="path"/> can't be used, or null with its address.</summary>
-        public static string Read(string path, out BrainAddress brain)
+        /// <summary>Why the brain announced in <paramref name="path"/> can't be used by the project in
+        /// <paramref name="projectDir"/>, or null with its address.</summary>
+        public static string Read(string path, string projectDir, out BrainAddress brain)
         {
             brain = null;
             if (!File.Exists(path)) return "No brain is running on this machine";
@@ -71,9 +72,59 @@ namespace Cluewren
             }
             if (secret.Length < SecretBytes) return $"{path} has no usable secret";
             if (!Running((int)Json.Num(said, "pid", 0))) return "The brain in brain.json isn't running";
+            var why = ForAnotherProject(said, projectDir, RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+            if (why != null) return why;
             brain = new BrainAddress { Url = Json.Str(said, "url"), Secret = secret };
             return null;
         }
+
+        /// <summary>Why a run announced in brain.json isn't this project's, or null. The same rule and words as the Godot
+        /// and Unreal plugins: no `folders` (a brain before 0.1.1) is no filter; an unknown `match` is never a match.</summary>
+        public static string ForAnotherProject(Dictionary<string, object> said, string project, bool windowsPaths)
+        {
+            if (!said.TryGetValue("folders", out var folders) || folders == null || folders is List<object> none && none.Count == 0)
+                return null;
+            var match = said.TryGetValue("match", out var given) && given is string text ? text : "";
+            var named = new List<string>();
+            var separator = windowsPaths ? '\\' : '/';
+            var mine = windowsPaths ? Folder(project ?? "") : PosixFolder(project ?? "");
+            var found = false;
+            foreach (var entry in folders as List<object> ?? new List<object>())
+            {
+                if (!(entry is string f)) continue;
+                named.Add($"\"{f}\"");
+                var theirs = windowsPaths ? Folder(f) : PosixFolder(f);
+                if (mine.Length == 0 || theirs.Length == 0) continue;
+                if (match == "exact") found |= mine == theirs;
+                else if (match == "related") found |= Within(mine, theirs, separator) || Within(theirs, mine, separator);
+            }
+            if (found) return null;
+            return $"For another project: the run is for {(named.Count > 0 ? string.Join(" or ", named) : "no folder")} "
+                   + $"(match \"{match}\"), this project is \"{project}\"";
+        }
+
+        // Only ASCII letters are folded: each engine folds other letters its own way, and the three must compare alike.
+        static string Folder(string path)
+        {
+            var p = path.Replace('/', '\\');
+            if (p.Length < 3 || p[1] != ':' || p[2] != '\\' || !(p[0] >= 'A' && p[0] <= 'Z' || p[0] >= 'a' && p[0] <= 'z'))
+                return "";
+            while (p.Length > 3 && p[p.Length - 1] == '\\') p = p.Substring(0, p.Length - 1);
+            var folded = p.ToCharArray();
+            for (var i = 0; i < folded.Length; ++i)
+                if (folded[i] >= 'A' && folded[i] <= 'Z') folded[i] = (char)(folded[i] + 32);
+            return new string(folded);
+        }
+
+        static string PosixFolder(string path)
+        {
+            if (path.Length == 0 || path[0] != '/') return "";
+            while (path.Length > 1 && path[path.Length - 1] == '/') path = path.Substring(0, path.Length - 1);
+            return path;
+        }
+
+        static bool Within(string inner, string outer, char separator) =>
+            inner == outer || inner.StartsWith(outer[outer.Length - 1] == separator ? outer : outer + separator, StringComparison.Ordinal);
 
         static bool Running(int pid)
         {

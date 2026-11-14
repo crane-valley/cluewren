@@ -226,7 +226,7 @@ IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, CluewrenTests, "CluewrenTe
     $report = Join-Path $folder 'report'
     $log = Join-Path $folder 'editor.log'
     # Unreal's -Key="value" form, which is why Invoke-Tool takes the command line as one string.
-    $code = Invoke-Tool $editor ("`"$uproject`" -ExecCmds=`"Automation RunTests Cluewren.Rc;Quit`" " +
+    $code = Invoke-Tool $editor ("`"$uproject`" -ExecCmds=`"Automation RunTests Cluewren;Quit`" " +
         "-TestExit=`"Automation Test Queue Empty`" -ReportExportPath=`"$report`" -abslog=`"$log`" " +
         '-unattended -nullrhi -nosplash -nosound -nop4') -Quiet
     $problems = [System.Collections.Generic.List[string]]::new()

@@ -30,9 +30,11 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             + "what the user asks for, in their words (\"Verify that the door opens with the key\"). kind: verify for a claim to check "
             + "(CONFIRMED, DENIED or INCONCLUSIVE), goal for something to make happen in play, explore to look for bugs or to test the "
             + "game. minutes: an exploration's minutes of play (default 10). time_limit_minutes: the run's time limit (default 30). "
-            + "level: the level to play, when you know its path or name (default: the one open in the editor). Answers with the "
-            + "briefing and the instructions to follow; the game is paused between calls.",
-            """{"type":"object","properties":{"request":{"type":"string"},"kind":{"type":"string","enum":["verify","goal","explore"]},"minutes":{"type":"number"},"time_limit_minutes":{"type":"number"},"level":{"type":"string"}},"required":["request","kind"]}"""),
+            + "level: the level to play, when you know its path or name (default: the one open in the editor). project: the game "
+            + "project's folder as a full path, when it is not the folder you work in, inside it or around it; only an editor of "
+            + "exactly that project is then taken. Answers with the briefing and the instructions to follow; the game is paused "
+            + "between calls.",
+            """{"type":"object","properties":{"request":{"type":"string"},"kind":{"type":"string","enum":["verify","goal","explore"]},"minutes":{"type":"number"},"time_limit_minutes":{"type":"number"},"level":{"type":"string"},"project":{"type":"string"}},"required":["request","kind"]}"""),
         ("wait",
             "Wait for the call still going (an episode, the game starting) and give its result. If it is still going after about 40 s, it "
             + "says so: call wait again.",
@@ -92,6 +94,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     Task? _watch;
 
     public string? JevKey { get; init; }
+
+    public string WorkingFolder { get; } = Environment.CurrentDirectory;
 
     public SandboxMode Sandbox { get; init; }
 
@@ -333,10 +337,17 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         var kind = args["kind"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(request) || kind is not ("verify" or "goal" or "explore"))
             return ToolResult.Say("start_run needs request and kind (verify, goal or explore).", true);
+        var project = args["project"]?.GetValue<string>();
+        if (project is not null && (!ProjectScope.IsLocalPath(project) || !Directory.Exists(project)))
+            return ToolResult.Say($"project must be the game project's folder as a full local path (like C:\\Games\\Foo): {project} "
+                + "isn't one.", true);
+        var scope = project is null ? ProjectScope.Related(WorkingFolder) : ProjectScope.ExactlyAt(project);
         _ = Task.Run(HarnessCompiler.Warm);
         var secret = Handshake.NewSecret();
-        _bridge = await BridgeServer.StartAsync(secret).ConfigureAwait(false);
-        var announced = new Discovery(_bridge.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow);
+        var bridge = await BridgeServer.StartAsync(secret, scope).ConfigureAwait(false);
+        _bridge = bridge;
+        var announced = new Discovery(bridge.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow,
+            scope.Folders, scope.Match);
         _discovery = (DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder), announced);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
         deadline.CancelAfter(TimeSpan.FromSeconds(connectSeconds));
@@ -351,15 +362,25 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         }
         catch (OperationCanceledException)
         {
+            var text = NoEditorText(bridge, connectSeconds);
             await CloseRunAsync().ConfigureAwait(false);
-            return ToolResult.Say($"No editor connected within {connectSeconds:0} s. Tell the user to open the game's project in its editor with the "
-                + "Cluewren plugin, then call start_run again.", true);
+            return ToolResult.Say(text, true);
         }
         catch (Exception e)
         {
             await CloseRunAsync().ConfigureAwait(false);
             return ToolResult.Say($"The run didn't start: {e.Message}", true);
         }
+    }
+
+    public static string NoEditorText(BridgeServer bridge, double seconds)
+    {
+        var refused = bridge.Refused;
+        return $"No editor connected within {seconds:0} s. This run takes an editor whose project is {bridge.Scope.Described}"
+            + (bridge.Scope.Exact ? ". " : " (start_run's project names one exactly). ")
+            + (refused.Count > 0 ? $"Refused at the handshake: {string.Join("; ", refused)}. " : "")
+            + "An editor of another project doesn't connect, and shows why in its own Cluewren window. Tell the user to open "
+            + "the game's project in its editor with the Cluewren plugin, then call start_run again.";
     }
 
     async Task CloseRunAsync(bool remember = false)

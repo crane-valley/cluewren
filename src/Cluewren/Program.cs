@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using Cluewren.Bridge;
 using Cluewren.Jev;
+using Cluewren.Kit;
 using Cluewren.Mcp;
 using Cluewren.Sandbox;
 
@@ -9,7 +10,9 @@ const string Usage = """
     usage:
       cluewren connect claude|codex [--remove]   set up your own agent to use Cluewren
       cluewren mcp                               the MCP server your agent starts
-      cluewren run <run folder> [seconds]        play <run folder>/harness.cs once, without an agent
+      cluewren run <run folder> [seconds] [--project <folder>]
+                                                 play <run folder>/harness.cs once, without an agent, in the
+                                                 editor of <folder> (default: this folder, inside or around it)
       cluewren --version                         this build's version
     """;
 
@@ -61,7 +64,30 @@ async Task<int> RunHarness()
 {
     if (SandboxSetting() is not { } sandbox)
         return 2;
-    var seconds = args.Length > 2 && double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : 30;
+    var positional = new List<string>();
+    string? project = null;
+    for (var i = 1; i < args.Length; i++)
+    {
+        if (args[i] != "--project")
+            positional.Add(args[i]);
+        else if (i + 1 < args.Length)
+            project = args[++i];
+        else
+            project = "";
+    }
+    if (positional.Count == 0)
+    {
+        Console.Error.WriteLine(Usage);
+        return 2;
+    }
+    if (project is not null && (!ProjectScope.IsLocalPath(project) || !Directory.Exists(project)))
+    {
+        Console.Error.WriteLine($"--project needs the game project's folder as a full local path: \"{project}\" isn't one.");
+        return 2;
+    }
+    var scope = project is null ? ProjectScope.Related(Environment.CurrentDirectory) : ProjectScope.ExactlyAt(project);
+    var seconds = positional.Count > 1 && double.TryParse(positional[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+        ? parsed : 30;
     using var cancel = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) =>
     {
@@ -70,36 +96,75 @@ async Task<int> RunHarness()
     };
 
     var secret = Handshake.NewSecret();
-    await using var server = await BridgeServer.StartAsync(secret);
-    var announced = new Discovery(server.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow);
+    await using var server = await BridgeServer.StartAsync(secret, scope);
+    server.Refusing += refusal => Console.WriteLine($"Refused an editor: {refusal}");
+    var announced = new Discovery(server.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow,
+        scope.Folders, scope.Match);
     var path = DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder);
 
     try
     {
-        Console.WriteLine($"Waiting for the plugin on {server.Url}");
+        Console.WriteLine($"Waiting on {server.Url} for an editor whose project is {scope.Described}");
         var link = await server.NextLinkAsync(cancel.Token);
-        link.Send(json => json.WriteString("type", "run_started"));
-        var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
-        await using var jev = key is null ? null : new JevClient(new JevOptions(key));
-        await using var host = new HarnessHost(new HostOptions(link, args[1]) { Jev = jev, Say = Console.WriteLine, Mode = sandbox });
-        var result = await host.RunHarnessAsync(seconds, ct: cancel.Token);
-        Console.WriteLine($"sandbox: {result.Sandbox}");
-        Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");
-        Console.WriteLine(result.Text);
-        Console.WriteLine(result.Stats?.GetRawText());
-        return result.Played ? 0 : 1;
+        return await Cluewren.RunCommand.PlayAsync(link, positional[0], seconds, sandbox, cancel.Token);
     }
     catch (OperationCanceledException)
     {
         return 130;
     }
-    catch (SandboxException e)
-    {
-        Console.Error.WriteLine($"The sandbox failed: {e.Message}");
-        return 1;
-    }
     finally
     {
         DiscoveryFile.Withdraw(path, announced);
+    }
+}
+
+namespace Cluewren
+{
+    public static class RunCommand
+    {
+        public static async Task<int> PlayAsync(BridgeLink link, string runFolder, double seconds, SandboxMode sandbox,
+            CancellationToken ct)
+        {
+            try
+            {
+                var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
+                await using var jev = key is null ? null : new JevClient(new JevOptions(key));
+                await using var host = new HarnessHost(new HostOptions(link, runFolder)
+                {
+                    Jev = jev, Say = Console.WriteLine, Mode = sandbox,
+                });
+                var (map, problem) = await host.StartMapAsync(ct).ConfigureAwait(false);
+                if (problem is not null)
+                {
+                    Console.WriteLine(problem);
+                    return 1;
+                }
+                try
+                {
+                    await PlaytestRun.StartGameAsync(link, map, ct).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is InvalidOperationException or GameException or GameDisconnectedException)
+                {
+                    Console.Error.WriteLine($"The run didn't start: {e.Message}");
+                    return 1;
+                }
+                link.Send(json => json.WriteString("type", "run_started"));
+                var result = await host.RunHarnessAsync(seconds, ct: ct).ConfigureAwait(false);
+                Console.WriteLine($"sandbox: {result.Sandbox}");
+                Console.WriteLine($"state: {result.State} reason: {result.Reason} decisions: {result.Decisions}");
+                Console.WriteLine(result.Text);
+                Console.WriteLine(result.Stats?.GetRawText());
+                return result.Played ? 0 : 1;
+            }
+            catch (OperationCanceledException)
+            {
+                return 130;
+            }
+            catch (SandboxException e)
+            {
+                Console.Error.WriteLine($"The sandbox failed: {e.Message}");
+                return 1;
+            }
+        }
     }
 }

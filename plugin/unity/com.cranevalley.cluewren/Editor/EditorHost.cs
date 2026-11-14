@@ -1,4 +1,5 @@
-// Modified by Crane Valley: the editor connects when asked (the window, the command line), never by itself; the agent
+// Modified by Crane Valley: the editor connects by itself once brain.json announces a brain for this project (unless it
+// was disconnected in the window, and never in batch mode), and when asked (the window, the command line); the agent
 // service, sign-in, uninstall and preferences paths are removed, and a command line asks for a connection, never a run;
 // rc is told which assemblies the editor alone compiles.
 // The bridge in the editor: one client for the editor's life, in edit mode and play mode alike (play mode is the
@@ -77,7 +78,6 @@ namespace Cluewren.Editor
         {
             if (Client != null) return Client;
             Client = new PlaytestClient(Instance);
-            Hands.EnsureDevices();
             return Client;
         }
 
@@ -90,6 +90,7 @@ namespace Cluewren.Editor
         public static void Disconnect()
         {
             SessionState.SetBool(DisconnectedKey, true);
+            Unusable = null;
             Client?.Disconnect();
             Hands.RemoveDevices();
             SessionState.EraseString(StateKey);
@@ -102,8 +103,14 @@ namespace Cluewren.Editor
             if (SessionState.GetBool(DisconnectedKey, false)) return;
             // A brain that failed its proof is refused until the user asks again.
             if (Client != null && (Client.WantConnected || !string.IsNullOrEmpty(Client.Problem))) return;
-            if (Discovery.Read(Discovery.FilePath(), out _) == null) Connect();
+            var path = Discovery.FilePath();
+            var why = Discovery.Read(path, Instance.ProjectDir, out _);
+            // (shown in the window: a brain is announced, and this editor doesn't take it)
+            Unusable = why != null && File.Exists(path) ? why : null;
+            if (why == null) Connect();
         }
+
+        public static string Unusable { get; private set; }
 
         static void Restore()
         {
@@ -261,7 +268,9 @@ namespace Cluewren.Editor
 
         public string HostName => "editor";
 
-        public string ProjectDir => Directory.GetParent(Application.dataPath).FullName;
+        public string ProjectDir => ProjectDirOf(Application.dataPath);
+
+        public static string ProjectDirOf(string dataPath) => Directory.GetParent(dataPath).FullName;
 
         public string ProjectId => PlayerSettings.productGUID.ToString();
 

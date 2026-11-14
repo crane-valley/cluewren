@@ -13,22 +13,29 @@ public sealed class FakePlugin : IAsyncDisposable
 
     public string Session { get; private set; } = "";
 
-    public static async Task<FakePlugin> ConnectAsync(string url, byte[] secret, string? resume = null)
+    public static Dictionary<string, object?> Hello(byte[] secret, byte[] nonce, string project, string? resume = null,
+        string? engine = null) => new()
+    {
+        ["type"] = "hello",
+        ["protocol"] = 1,
+        ["nonce"] = Convert.ToBase64String(nonce),
+        ["engine"] = engine,
+        ["project_dir"] = project,
+        ["mac"] = Convert.ToBase64String(Handshake.ProveHello(secret, nonce, project)),
+        ["resume"] = resume,
+        ["received"] = resume is null ? null : 0,
+    };
+
+    public static async Task<FakePlugin> ConnectAsync(string url, byte[] secret, string project, string? resume = null,
+        string? engine = null)
     {
         var plugin = new FakePlugin();
         await plugin.Socket.ConnectAsync(new Uri(url), default);
         var nonce = Handshake.NewNonce();
-        await plugin.SendAsync(new Dictionary<string, object?>
-        {
-            ["type"] = "hello",
-            ["protocol"] = 1,
-            ["nonce"] = Convert.ToBase64String(nonce),
-            ["resume"] = resume,
-            ["received"] = resume is null ? null : 0,
-        });
+        await plugin.SendAsync(Hello(secret, nonce, project, resume, engine));
         using var welcome = await plugin.ReceiveAsync();
         var root = welcome.RootElement;
-        Assert.Equal("welcome", root.GetProperty("type").GetString());
+        Assert.True("welcome" == root.GetProperty("type").GetString(), root.GetRawText());
         var brainNonce = root.GetProperty("nonce").GetBytesFromBase64();
         Assert.True(Handshake.Verify(secret, Handshake.BrainRole, nonce, brainNonce,
             root.GetProperty("proof").GetBytesFromBase64()));
@@ -73,14 +80,21 @@ public sealed class FakePlugin : IAsyncDisposable
     }
 }
 
-public class BridgeServerTests
+public sealed class BridgeServerTests : IDisposable
 {
     static readonly byte[] Secret = Handshake.NewSecret();
+
+    readonly string _project = Directory.CreateTempSubdirectory("cluewren-project").FullName;
+
+    Task<BridgeServer> StartAsync(TimeSpan? resumeWindow = null) =>
+        BridgeServer.StartAsync(Secret, ProjectScope.Related(_project), resumeWindow);
+
+    public void Dispose() => Directory.Delete(_project, true);
 
     [Fact]
     public async Task Refuses_browser_origin()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
+        await using var server = await StartAsync();
         using var socket = new ClientWebSocket();
         socket.Options.SetRequestHeader("Origin", "https://example.invalid");
         var refused = await Assert.ThrowsAsync<WebSocketException>(() => socket.ConnectAsync(new Uri(server.Url), default));
@@ -90,18 +104,18 @@ public class BridgeServerTests
     [Fact]
     public async Task Binds_loopback_only()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
+        await using var server = await StartAsync();
         Assert.True(IPAddress.IsLoopback(IPAddress.Parse(new Uri(server.Url).Host)));
     }
 
     [Fact]
     public async Task Plugin_with_wrong_secret_gets_no_link()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
+        await using var server = await StartAsync();
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(new Uri(server.Url), default);
         var nonce = Handshake.NewNonce();
-        await Send(socket, new { type = "hello", protocol = 1, nonce = Convert.ToBase64String(nonce) });
+        await Send(socket, FakePlugin.Hello(Secret, nonce, _project));
         using var welcome = await Receive(socket);
         var brainNonce = welcome.RootElement.GetProperty("nonce").GetBytesFromBase64();
         var wrong = Handshake.Prove(Handshake.NewSecret(), Handshake.PluginRole, nonce, brainNonce);
@@ -115,10 +129,10 @@ public class BridgeServerTests
     [Fact]
     public async Task Reflected_brain_proof_is_refused()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
+        await using var server = await StartAsync();
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(new Uri(server.Url), default);
-        await Send(socket, new { type = "hello", protocol = 1, nonce = Convert.ToBase64String(Handshake.NewNonce()) });
+        await Send(socket, FakePlugin.Hello(Secret, Handshake.NewNonce(), _project));
         using var welcome = await Receive(socket);
         await Send(socket, new { type = "proof", proof = welcome.RootElement.GetProperty("proof").GetString() });
         using var refusal = await Receive(socket);
@@ -128,7 +142,7 @@ public class BridgeServerTests
     [Fact]
     public async Task Hello_without_nonce_is_refused()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
+        await using var server = await StartAsync();
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(new Uri(server.Url), default);
         await Send(socket, new { type = "hello", protocol = 1 });
@@ -139,8 +153,8 @@ public class BridgeServerTests
     [Fact]
     public async Task Request_gets_its_answer()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var asked = link.RequestAsync("pose");
         await plugin.AnswerNextAsync(new { yaw = 90 });
@@ -152,8 +166,8 @@ public class BridgeServerTests
     [Fact]
     public async Task An_answer_survives_the_frames_after_it()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var first = link.RequestAsync("pose");
         await plugin.AnswerNextAsync(new { yaw = 1111 });
@@ -168,8 +182,8 @@ public class BridgeServerTests
     [Fact]
     public async Task Error_answer_raises_game_exception()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var asked = link.RequestAsync("pose");
         using var request = await plugin.ReceiveAsync();
@@ -188,8 +202,8 @@ public class BridgeServerTests
     [Fact]
     public async Task Disconnect_fails_waiting_requests()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var asked = link.RequestAsync("pose");
         await plugin.Socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", default);
@@ -199,14 +213,14 @@ public class BridgeServerTests
     [Fact]
     public async Task Script_reload_keeps_the_session_and_its_requests()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        var first = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        var first = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         await first.Socket.CloseOutputAsync((WebSocketCloseStatus)1012, "reload", default);
         await first.DisposeAsync();
 
         var asked = link.RequestAsync("pose");
-        await using var second = await ResumeAsync(server.Url, first.Session);
+        await using var second = await ResumeAsync(server.Url, first.Session, _project);
         Assert.Equal(first.Session, second.Session);
         await second.AnswerNextAsync(new { yaw = 1 });
         using var answer = await asked;
@@ -216,14 +230,14 @@ public class BridgeServerTests
     [Fact]
     public async Task A_reload_that_loses_its_close_frame_keeps_the_session()
     {
-        await using var server = await BridgeServer.StartAsync(Secret);
-        var first = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync();
+        var first = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var asked = link.RequestAsync("pose");
         first.Socket.Abort();
         await first.DisposeAsync();
 
-        await using var second = await ResumeAsync(server.Url, first.Session);
+        await using var second = await ResumeAsync(server.Url, first.Session, _project);
         await second.AnswerNextAsync(new { yaw = 2 });
         using var answer = await asked;
         Assert.Equal(2, answer.Result.GetProperty("yaw").GetInt32());
@@ -232,8 +246,8 @@ public class BridgeServerTests
     [Fact]
     public async Task Link_closes_when_the_plugin_never_comes_back()
     {
-        await using var server = await BridgeServer.StartAsync(Secret, TimeSpan.FromMilliseconds(100));
-        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret);
+        await using var server = await StartAsync(TimeSpan.FromMilliseconds(100));
+        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
         var link = await server.NextLinkAsync();
         var asked = link.RequestAsync("pose");
         await plugin.Socket.CloseOutputAsync((WebSocketCloseStatus)1012, "reload", default);
@@ -241,11 +255,11 @@ public class BridgeServerTests
         await Assert.ThrowsAsync<GameDisconnectedException>(() => asked);
     }
 
-    static async Task<FakePlugin> ResumeAsync(string url, string session)
+    static async Task<FakePlugin> ResumeAsync(string url, string session, string project)
     {
         for (var i = 0; i < 200; i++)
         {
-            var plugin = await FakePlugin.ConnectAsync(url, Secret, resume: session);
+            var plugin = await FakePlugin.ConnectAsync(url, Secret, project, resume: session);
             if (plugin.Session == session)
                 return plugin;
             await plugin.DisposeAsync();

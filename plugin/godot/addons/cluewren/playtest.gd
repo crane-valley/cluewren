@@ -21,6 +21,7 @@ const Ui = preload("lib/ui.gd")
 const Codex = preload("lib/codex.gd")
 const Detectors = preload("lib/detectors.gd")
 const Link = preload("lib/link.gd")
+const Discovery = preload("lib/discovery.gd")
 const Media = preload("lib/media.gd")
 
 const CAPTURE := "cluewren"
@@ -473,7 +474,7 @@ func context() -> Dictionary:
 		"dimension": world.dimension(), "game_name": str(ProjectSettings.get_setting("application/config/name", "")),
 		"host": "editor" if relay else "game", "engine": "godot", "engine_version": Engine.get_version_info().string,
 		"session_running": s != null, "paused": get_tree().paused, "game_time": Frame.r2(game_time),
-		"project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/"), "controls": Keys.controls(),
+		"project_dir": Discovery.project_dir(), "controls": Keys.controls(),
 		"launch_scene": _launch_scene, "rendering": DisplayServer.get_name() != "headless"}
 
 

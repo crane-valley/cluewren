@@ -157,7 +157,7 @@ void UPlaytestSubsystem::TryConnect(double T)
 		return;
 	}
 	PlaytestBrain::FAddress Brain;
-	const FString Why = PlaytestBrain::Read(Path, Brain);
+	const FString Why = PlaytestBrain::Read(Path, PlaytestBrain::ProjectDir(), Brain);
 	if (!Why.IsEmpty())
 	{
 		Status(Why);
@@ -204,6 +204,9 @@ void UPlaytestSubsystem::SendHello()
 	}
 	Hello->SetStringField(TEXT("host"), GIsEditor ? TEXT("editor") : TEXT("game"));
 	Hello->SetStringField(TEXT("nonce"), FBase64::Encode(PluginNonce));
+	const FString ProjectDir = PlaytestBrain::ProjectDir();
+	Hello->SetStringField(TEXT("project_dir"), ProjectDir);
+	Hello->SetStringField(TEXT("mac"), FBase64::Encode(PlaytestBrain::HelloMac(Secret, PluginNonce, ProjectDir)));
 	if (!SessionId.IsEmpty())
 	{
 		Hello->SetStringField(TEXT("resume"), SessionId);

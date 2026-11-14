@@ -1,8 +1,27 @@
-## rc's refusals by category (docs/adr/0014), on this Godot: godot --headless --path plugin/godot -s res://tests/rc_test.gd
+## rc's refusals by category (docs/adr/0014) and which brain an editor takes (tests/binding.gd), on this Godot:
+## godot --headless --path plugin/godot -s res://tests/rc_test.gd
+## Any error logged counts as a failure, and every way out prints the summary: a script error stops only the function
+## it is in, and one in _initialize or _run would otherwise leave the tree running with nothing to quit it.
 extends SceneTree
 
-const Rc = preload("res://addons/cluewren/lib/rc.gd")
-const Codex = preload("res://addons/cluewren/lib/codex.gd")
+const TIMEOUT_SECONDS := 120
+
+class Errors extends Logger:
+	var _lock := Mutex.new()
+	var _count := 0
+
+	func _log_error(_function: String, _file: String, _line: int, _code: String, _rationale: String, _editor_notify: bool,
+			error_type: int, _script_backtraces: Array) -> void:
+		if error_type != ERROR_TYPE_WARNING:
+			_lock.lock()
+			_count += 1
+			_lock.unlock()
+
+	func count() -> int:
+		_lock.lock()
+		var n := _count
+		_lock.unlock()
+		return n
 
 const REVIEWED := {
 	"GLTFState.set_base_path": "a field of the state; GLTFDocument, which reads and writes files, is refused",
@@ -18,13 +37,29 @@ const REVIEWED := {
 }
 const REVIEWED_PREFIXES := ["OpenXR"]  # OpenXR action and interaction paths, not files
 
+var Rc
+var Codex
+var Binding
 var rc
 var host: Node
 var failures := 0
 var passes := 0
+var _errors := Errors.new()
+var _watchdog := Thread.new()
+var _lock := Mutex.new()
+var _over := false
+var _started := false
+var _ran := false
 
 
 func _initialize() -> void:
+	OS.add_logger(_errors)
+	_watchdog.start(_time_out)
+	_main.call_deferred()
+	# (loaded here, not preloaded: an addon script that doesn't compile is a failure with a summary, not a silent exit)
+	Rc = load("res://addons/cluewren/lib/rc.gd")
+	Codex = load("res://addons/cluewren/lib/codex.gd")
+	Binding = load("res://tests/binding.gd")
 	host = Node.new()
 	host.name = "Host"
 	root.add_child(host)
@@ -35,7 +70,47 @@ func _initialize() -> void:
 	for n in [HTTPRequest.new(), LinkButton.new(), FileDialog.new()]:
 		n.name = n.get_class()
 		root.add_child(n)
-	_run.call_deferred()
+	_started = true
+
+
+func _main() -> void:
+	if not _started:
+		print("FAIL start-up stopped on an error")
+	else:
+		_run()
+		if not _ran:
+			print("FAIL _run stopped on an error")
+	_lock.lock()
+	_over = true
+	_lock.unlock()
+	_watchdog.wait_to_finish()
+	OS.remove_logger(_errors)
+	quit(1 if _report_failed() else 0)
+
+
+func _report_failed() -> bool:
+	var errors := _errors.count()
+	if errors > 0:
+		print("FAIL %d errors logged" % errors)
+	var failed := failures + errors + (0 if _started and _ran else 1)
+	print("%d passed, %d failed" % [passes, failed])
+	return failed > 0 or passes == 0
+
+
+# A hang the tree can't end (a check that never returns): the summary, then out with code 1. taskkill /F exits
+# with 1 where OS.kill would exit with 0.
+func _time_out() -> void:
+	var deadline := Time.get_ticks_msec() + TIMEOUT_SECONDS * 1000
+	while Time.get_ticks_msec() < deadline:
+		_lock.lock()
+		var over := _over
+		_lock.unlock()
+		if over:
+			return
+		OS.delay_msec(100)
+	print("FAIL no end within %d s" % TIMEOUT_SECONDS)
+	_report_failed()
+	OS.execute(OS.get_environment("SystemRoot").path_join("System32/taskkill.exe"), ["/F", "/PID", str(OS.get_process_id())])
 
 
 func _run() -> void:
@@ -51,8 +126,8 @@ func _run() -> void:
 	c9_data_folder()
 	still_reachable()
 	census()
-	print("%d passed, %d failed" % [passes, failures])
-	quit(1 if failures > 0 else 0)
+	Binding.run(self)
+	_ran = true
 
 
 func expect(cell: String, what: String, ok: bool, detail = "") -> void:

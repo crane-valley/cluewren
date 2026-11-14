@@ -87,15 +87,79 @@ static func _parse(path: String) -> Dictionary:
 	return said
 
 
-## {"url", "secret"} of a brain check() passed, or {"error"}.
-static func read(path: String) -> Dictionary:
+## {"url", "secret"} of a brain check() passed, or {"error"}. project: this project's folder (project_dir()).
+static func read(path: String, project: String) -> Dictionary:
 	var said := _parse(path)
 	if said.has("error"):
 		return said
 	var secret := Marshalls.base64_to_raw(str(said.get("secret", "")))
 	if secret.size() < SECRET_BYTES:
 		return {"error": "%s has no usable secret" % path}
+	var why := for_another_project(said, project)
+	if why != "":
+		return {"error": why}
 	return {"url": str(said.get("url", "")), "secret": secret}
+
+
+static func project_dir() -> String:
+	return _dir_of(ProjectSettings.globalize_path("res://"))
+
+
+## A drive root keeps its separator: "C:" alone is no folder, and both this filter and the brain refuse it.
+static func _dir_of(globalized: String) -> String:
+	var trimmed := globalized.trim_suffix("/")
+	return globalized if trimmed == "" or trimmed.ends_with(":") else trimmed
+
+
+## Why a run announced in brain.json isn't this project's, or "". The same rule and words as the Unity and Unreal
+## plugins: no `folders` (a brain before 0.1.1) is no filter; an unknown `match` is never a match.
+static func for_another_project(said: Dictionary, project: String) -> String:
+	var folders = said.get("folders")
+	if folders == null or typeof(folders) == TYPE_ARRAY and folders.is_empty():
+		return ""
+	var given = said.get("match")
+	var match_mode: String = given if typeof(given) == TYPE_STRING else ""
+	var named := PackedStringArray()
+	var mine := _folder(project)
+	var found := false
+	if typeof(folders) == TYPE_ARRAY:
+		for f in folders:
+			if typeof(f) != TYPE_STRING:
+				continue
+			named.append("\"%s\"" % f)
+			var theirs := _folder(f)
+			if mine == "" or theirs == "":
+				continue
+			if match_mode == "exact":
+				found = found or mine == theirs
+			elif match_mode == "related":
+				found = found or _within(mine, theirs) or _within(theirs, mine)
+	if found:
+		return ""
+	return "For another project: the run is for %s (match \"%s\"), this project is \"%s\"" % [
+		" or ".join(named) if named.size() > 0 else "no folder", match_mode, project]
+
+
+## Only ASCII letters are folded: each engine folds other letters its own way, and the three must compare alike.
+static func _folder(path: String) -> String:
+	var p := path.replace("/", "\\")
+	if p.length() < 3 or p[1] != ":" or p[2] != "\\" or _ascii_lower(p[0]) not in "abcdefghijklmnopqrstuvwxyz":
+		return ""
+	while p.length() > 3 and p.ends_with("\\"):
+		p = p.left(-1)
+	return _ascii_lower(p)
+
+
+static func _ascii_lower(s: String) -> String:
+	var out := ""
+	for c in s:
+		var u := c.unicode_at(0)
+		out += char(u + 32) if u >= 65 and u <= 90 else c
+	return out
+
+
+static func _within(inner: String, outer: String) -> bool:
+	return inner == outer or inner.begins_with(outer if outer.ends_with("\\") else outer + "\\")
 
 
 ## Why a URL is refused, or "". The only URL the addon connects to: ws:// to 127.0.0.1 or [::1], with no userinfo.

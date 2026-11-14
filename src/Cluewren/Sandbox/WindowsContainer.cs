@@ -31,6 +31,7 @@ public sealed class WindowsContainer : ISandboxProcess
     const ushort AllProcessorGroups = 0xFFFF;
     const int CeilingProcessors = 2;
     const string ClaimFile = ".container";
+    const uint ExitWaitMilliseconds = 30000;
 
     readonly IntPtr _job;
     readonly IntPtr _process;
@@ -335,6 +336,9 @@ public sealed class WindowsContainer : ISandboxProcess
         if (Interlocked.Exchange(ref _closed, 1) != 0)
             return;
         Kill();
+        // TerminateJobObject only starts the kill: until the process is gone it still maps the harness assembly in the run
+        // folder. Bounded, since the kill is already issued and closing the job kills again.
+        WaitForSingleObject(_process, ExitWaitMilliseconds);
         Input.Dispose();
         Output.Dispose();
         Error.Dispose();
@@ -463,6 +467,9 @@ public sealed class WindowsContainer : ISandboxProcess
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool TerminateJobObject(IntPtr job, uint code);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
     [DllImport("kernel32.dll")]
     static extern bool CloseHandle(IntPtr handle);

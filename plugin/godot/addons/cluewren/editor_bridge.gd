@@ -40,6 +40,7 @@ var _forwarded := {}  # request ids in flight to the game
 var _pending := []  # session waits: {"tick": Callable(now) -> bool}
 var _heartbeat_at := 0.0
 var _auto_connect_at := 0.0
+var _shown_state := ""
 var _detector_config := {}
 var _summary_task := -1
 var _last_played := ""
@@ -158,8 +159,13 @@ func _process(_delta: float) -> void:
 	link.poll()
 	if not link.want:
 		_auto_connect(now)
-	# attach to a game that started, until it answers (its autoload may not be listening yet)
-	if _game_session >= 0 and not _game_ready and now < _attach_until and now >= _attach_at:
+	# (the link changes its problem as it retries, with no event of its own: the dock shows why it doesn't connect)
+	if state_text() != _shown_state:
+		_shown_state = state_text()
+		state_changed.emit()
+	# attach to a game that started, until it answers (its autoload may not be listening yet); only for a brain that has
+	# proved itself, as Unity and Unreal leave a game alone until then
+	if link.connected and _game_session >= 0 and not _game_ready and now < _attach_until and now >= _attach_at:
 		_attach_at = now + 0.5
 		var cfg := {"detectors": _detector_config}
 		if _record != null:
@@ -194,16 +200,14 @@ func _auto_connect(now: float) -> void:
 func _on_welcomed(resumed: bool) -> void:
 	state_changed.emit()
 	_set_busy(true)
-	if resumed:
-		return
-	run_active = false
-	_pending.clear()
-	_forwarded.clear()
-	_record = null
-	_record_starts.clear()
-	if _game_session >= 0:
-		# a game already playing: attach to it again, for this brain
-		_game_ready = false
+	if not resumed:
+		run_active = false
+		_pending.clear()
+		_forwarded.clear()
+		_record = null
+		_record_starts.clear()
+		_game_ready = false  # (a game already playing is attached again, for this brain)
+	if _game_session >= 0 and not _game_ready:
 		_attach_at = 0.0
 		_attach_until = _now() + SESSION_TIMEOUT
 
@@ -330,7 +334,7 @@ func _editor_context() -> Dictionary:
 	return {"world": "", "scene": "", "character": "", "controller": "", "input_subsystem": "", "camera_manager": "", "camera": "",
 		"game_name": str(ProjectSettings.get_setting("application/config/name", "")), "host": "editor", "engine": "godot",
 		"engine_version": Engine.get_version_info().string, "session_running": false, "paused": false, "game_time": 0.0,
-		"project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/"), "controls": controls}
+		"project_dir": Discovery.project_dir(), "controls": controls}
 
 
 # --- the play session -------------------------------------------------------------------------------

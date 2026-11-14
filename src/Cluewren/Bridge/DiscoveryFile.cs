@@ -6,9 +6,18 @@ using System.Text.Json.Serialization;
 
 namespace Cluewren.Bridge;
 
-public sealed record Discovery(string Url, string Secret, int Pid, DateTimeOffset Started);
+public sealed record Discovery(string Url, string Secret, int Pid, DateTimeOffset Started,
+    IReadOnlyList<string>? Folders = null, string? Match = null)
+{
+    public bool Equals(Discovery? other) =>
+        other is not null && Url == other.Url && Secret == other.Secret && Pid == other.Pid && Started == other.Started
+        && Match == other.Match && (Folders ?? []).SequenceEqual(other.Folders ?? []);
 
-[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
+    public override int GetHashCode() => HashCode.Combine(Url, Secret, Pid, Started, Match);
+}
+
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(Discovery))]
 internal sealed partial class DiscoveryJson : JsonSerializerContext;
 
