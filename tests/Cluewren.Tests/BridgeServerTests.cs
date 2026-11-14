@@ -14,7 +14,7 @@ public sealed class FakePlugin : IAsyncDisposable
     public string Session { get; private set; } = "";
 
     public static Dictionary<string, object?> Hello(byte[] secret, byte[] nonce, string project, string? resume = null,
-        string? engine = null) => new()
+        string? engine = null, long received = 0) => new()
     {
         ["type"] = "hello",
         ["protocol"] = 1,
@@ -23,16 +23,16 @@ public sealed class FakePlugin : IAsyncDisposable
         ["project_dir"] = project,
         ["mac"] = Convert.ToBase64String(Handshake.ProveHello(secret, nonce, project)),
         ["resume"] = resume,
-        ["received"] = resume is null ? null : 0,
+        ["received"] = resume is null ? null : received,
     };
 
     public static async Task<FakePlugin> ConnectAsync(string url, byte[] secret, string project, string? resume = null,
-        string? engine = null)
+        string? engine = null, long received = 0)
     {
         var plugin = new FakePlugin();
         await plugin.Socket.ConnectAsync(new Uri(url), default);
         var nonce = Handshake.NewNonce();
-        await plugin.SendAsync(Hello(secret, nonce, project, resume, engine));
+        await plugin.SendAsync(Hello(secret, nonce, project, resume, engine, received));
         using var welcome = await plugin.ReceiveAsync();
         var root = welcome.RootElement;
         Assert.True("welcome" == root.GetProperty("type").GetString(), root.GetRawText());
@@ -305,11 +305,53 @@ public sealed class BridgeServerTests : IDisposable
         Assert.Contains("no longer kept", link.Closed);
     }
 
-    static async Task<FakePlugin> ResumeAsync(string url, string session, string project)
+    static async Task<long> NextIdAsync(FakePlugin plugin)
+    {
+        using var patience = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var whole = new MemoryStream();
+        var buffer = new byte[1 << 16];
+        while (true)
+        {
+            var read = await plugin.Socket.ReceiveAsync(buffer, patience.Token);
+            whole.Write(buffer, 0, read.Count);
+            if (read.EndOfMessage)
+                break;
+        }
+        using var frame = JsonDocument.Parse(whole.ToArray());
+        return frame.RootElement.GetProperty("id").GetInt64();
+    }
+
+    // Before: a resume cut off a second time put what was still waiting for replay ahead of what had gone out, so the
+    // plugin got requests out of order, and one it had named as received could be sent again.
+    [Fact]
+    public async Task A_resume_cut_off_again_keeps_the_order_and_skips_what_the_plugin_has()
+    {
+        await using var server = await StartAsync();
+        var first = await FakePlugin.ConnectAsync(server.Url, Secret, _project);
+        var link = await server.NextLinkAsync();
+        var large = new string('x', 3 << 20);
+        for (var i = 0; i < 8; i++)
+            link.Post("note", json => json.WriteString("text", large));
+        for (var id = 1; id <= 6; id++)
+            Assert.Equal(id, await NextIdAsync(first));
+        first.Socket.Abort();
+        await first.DisposeAsync();
+
+        var second = await ResumeAsync(server.Url, first.Session, _project);
+        Assert.Equal(1, await NextIdAsync(second));
+        second.Socket.Abort();
+        await second.DisposeAsync();
+
+        await using var third = await ResumeAsync(server.Url, first.Session, _project, received: 1);
+        for (var id = 2; id <= 8; id++)
+            Assert.Equal(id, await NextIdAsync(third));
+    }
+
+    static async Task<FakePlugin> ResumeAsync(string url, string session, string project, long received = 0)
     {
         for (var i = 0; i < 200; i++)
         {
-            var plugin = await FakePlugin.ConnectAsync(url, Secret, project, resume: session);
+            var plugin = await FakePlugin.ConnectAsync(url, Secret, project, resume: session, received: received);
             if (plugin.Session == session)
                 return plugin;
             await plugin.DisposeAsync();
