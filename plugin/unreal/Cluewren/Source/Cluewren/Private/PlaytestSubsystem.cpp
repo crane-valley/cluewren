@@ -1,14 +1,14 @@
-// Modified by Crane Valley: connects over PlaytestSocket to the brain in brain.json with a mutual HMAC handshake and resumes
-// its session after a drop; the account, sign-in, Aura, agent service, run request, usage, memory, inspection, steering and
-// report plumbing is removed.
+// Modified by Crane Valley: advertises this process, connects over PlaytestSocket to the brain that invites it with a
+// mutual HMAC handshake and resumes its session after a drop; the account, sign-in, Aura, agent service, run request,
+// usage, memory, inspection, steering and report plumbing is removed.
 #include "PlaytestSubsystem.h"
 
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GeneralProjectSettings.h"
-#include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "Interfaces/IPluginManager.h"
+#include "Kismet/GameplayStatics.h"
 #include "Misc/App.h"
 #include "Misc/Base64.h"
 #include "Misc/CommandLine.h"
@@ -19,6 +19,8 @@
 #include "PlaytestBrain.h"
 #include "PlaytestInternal.h"
 #include "PlaytestJson.h"
+#include "PlaytestLevels.h"
+#include "PlaytestRefusal.h"
 #include "PlaytestSocket.h"
 #include "UObject/Package.h"
 
@@ -85,9 +87,32 @@ namespace
 		FString Text;
 		return Message->TryGetStringField(Field, Text) && FBase64::Decode(Text, Out);
 	}
+
+	FString PluginVersion()
+	{
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Cluewren"));
+		return Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : FString(TEXT("0.2.0"));
+	}
+
+	FString EngineVersion()
+	{
+		return FEngineVersion::Current().ToString(EVersionComponent::Patch);
+	}
 }
 
-DEFINE_LOG_CATEGORY(LogPlaytest);
+DEFINE_LOG_CATEGORY(LogCluewren);
+
+bool UPlaytestSubsystem::FSession::Welcomed(const FString& Session)
+{
+	const bool bResumed = !Asked.IsEmpty() && Session == Asked;
+	if (!bResumed)
+	{
+		Received = 0;
+		Held.Reset();
+	}
+	Id = Session;
+	return bResumed;
+}
 
 UPlaytestSubsystem* UPlaytestSubsystem::Get()
 {
@@ -101,10 +126,43 @@ void UPlaytestSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	{
 		return;
 	}
-	bOnCommandLine = FParse::Param(FCommandLine::Get(), TEXT("PlaytestConnect"));
+	bOnCommandLine = FParse::Param(FCommandLine::Get(), TEXT("CluewrenConnect"));
 	if (!bOnCommandLine && (!GIsEditor || FApp::IsUnattended()))
 	{
-		return;  // (a game, or an unattended editor, opens nothing and connects nowhere unless asked)
+		return;  // (a game, or an unattended editor, advertises nothing and connects nowhere unless asked)
+	}
+	Rendezvous = PlaytestBrain::Folder();
+	PlaytestBrain::FAdvert Advert;
+	Advert.Pid = FPlatformProcess::GetCurrentProcessId();
+	Advert.Id = PlaytestBrain::EditorId();
+	Advert.EngineVersion = EngineVersion();
+	Advert.PluginVersion = PluginVersion();
+	Advert.ProjectDir = PlaytestBrain::ProjectDir();
+	Advert.bEditor = GIsEditor;
+	InvitePath = PlaytestBrain::InvitePath(Rendezvous, Advert.Pid);
+	if (!PlaytestBrain::WriteAdvert(Rendezvous, Advert))
+	{
+		UE_LOG(LogCluewren, Warning, TEXT("[Cluewren] %s couldn't be written: no run will find this process"),
+			*PlaytestBrain::AdvertPath(Rendezvous, Advert.Pid));
+	}
+	TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UPlaytestSubsystem::Tick));
+	if (bOnCommandLine)
+	{
+		Prepare();
+		double Timeout = DefaultConnectTimeout;
+		FParse::Value(FCommandLine::Get(), TEXT("CluewrenConnectTimeout="), Timeout);
+		ConnectDeadline = Timeout > 0 ? Now() + Timeout : 0;
+		FParse::Value(FCommandLine::Get(), TEXT("CluewrenMap="), StartMap);
+	}
+}
+
+// Not at every editor start, nor on an invite alone: only once a brain has proved itself (or at once with -CluewrenConnect),
+// so that what isn't the brain puts nothing in the log's path.
+void UPlaytestSubsystem::Prepare()
+{
+	if (Detectors.IsValid())
+	{
+		return;
 	}
 	Detectors = MakeShared<FPlaytestDetectors>(*this);
 	LogCapture = MakeShared<FPlaytestLogCapture>();
@@ -113,13 +171,6 @@ void UPlaytestSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	{
 		GLog->AddOutputDevice(LogCapture.Get());
 	}
-	TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UPlaytestSubsystem::Tick));
-	if (bOnCommandLine)
-	{
-		double Timeout = DefaultConnectTimeout;
-		FParse::Value(FCommandLine::Get(), TEXT("PlaytestConnectTimeout="), Timeout);
-		ConnectDeadline = Timeout > 0 ? Now() + Timeout : 0;
-	}
 }
 
 void UPlaytestSubsystem::Deinitialize()
@@ -127,6 +178,11 @@ void UPlaytestSubsystem::Deinitialize()
 	if (TickHandle.IsValid())
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
+	}
+	// Not under the ticker's handle: the engine empties the core ticker before it shuts its subsystems down.
+	if (!Rendezvous.IsEmpty())
+	{
+		PlaytestBrain::RemoveAdvert(Rendezvous, FPlatformProcess::GetCurrentProcessId());
 	}
 #if WITH_EDITOR
 	PlaytestExport::Shutdown();
@@ -151,23 +207,47 @@ void UPlaytestSubsystem::Deinitialize()
 void UPlaytestSubsystem::TryConnect(double T)
 {
 	NextAttempt = T + RetrySeconds;
-	const FString Path = PlaytestBrain::FilePath();
-	if (RefusedFile != FDateTime() && IFileManager::Get().GetTimeStamp(*Path) == RefusedFile)
+	const uint64 Written = PlaytestBrain::InviteWritten(InvitePath);
+	if (Written == 0)
+	{
+		InviteSeen = Written;
+		Invited.Reset();
+		Status(TEXT("Waiting for an invite from the cluewren command"));
+		return;
+	}
+	if (Written != InviteSeen)
+	{
+		Invited.Reset();
+		const TSharedRef<PlaytestBrain::FAddress> Brain = MakeShared<PlaytestBrain::FAddress>();
+		FString Why;
+		const PlaytestBrain::EInvite Verdict = PlaytestBrain::ReadInvite(InvitePath, PlaytestBrain::EditorId(), *Brain, Why);
+		if (!Why.IsEmpty())
+		{
+			Status(Why);
+		}
+		if (Verdict == PlaytestBrain::EInvite::Unreadable)
+		{
+			return;  // (it may be readable in a second without having changed)
+		}
+		InviteSeen = Written;
+		if (Verdict != PlaytestBrain::EInvite::Taken)
+		{
+			return;
+		}
+		Invited = Brain;
+	}
+	else if (Invited.IsValid() && !PlaytestBrain::Alive(*Invited))
+	{
+		Invited.Reset();
+		Status(PlaytestBrain::RunEnded);
+	}
+	if (!Invited.IsValid())
 	{
 		return;
 	}
-	PlaytestBrain::FAddress Brain;
-	const FString Why = PlaytestBrain::Read(Path, PlaytestBrain::ProjectDir(), Brain);
-	if (!Why.IsEmpty())
-	{
-		Status(Why);
-		return;
-	}
-	RefusedFile = FDateTime();
-	Secret = MoveTemp(Brain.Secret);
 	bHelloSent = false;
 	HandshakeDeadline = T + HandshakeSeconds;
-	Socket = MakeShared<FPlaytestSocket>(Brain.Host, Brain.Port, Brain.Path);
+	Socket = MakeShared<FPlaytestSocket>(Invited->Host, Invited->Port, Invited->Path);
 }
 
 void UPlaytestSubsystem::SendHello()
@@ -175,15 +255,9 @@ void UPlaytestSubsystem::SendHello()
 	PluginNonce = PlaytestBrain::NewNonce();
 	TSharedRef<FJsonObject> Hello = MakeShared<FJsonObject>();
 	Hello->SetStringField(TEXT("type"), TEXT("hello"));
-	Hello->SetNumberField(TEXT("protocol"), ProtocolVersion);
-	FString Version = TEXT("0.1.2");
-	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Cluewren")))
-	{
-		Version = Plugin->GetDescriptor().VersionName;
-	}
-	Hello->SetStringField(TEXT("plugin_version"), Version);
+	Hello->SetStringField(TEXT("plugin_version"), PluginVersion());
 	Hello->SetStringField(TEXT("engine"), TEXT("unreal"));
-	Hello->SetStringField(TEXT("engine_version"), FEngineVersion::Current().ToString(EVersionComponent::Patch));
+	Hello->SetStringField(TEXT("engine_version"), EngineVersion());
 	Hello->SetStringField(TEXT("project"), FApp::GetProjectName());
 	// What this plugin does beyond the protocol's first version: the brain falls back for a plugin without them
 	TArray<TSharedPtr<FJsonValue>> Features;
@@ -203,16 +277,13 @@ void UPlaytestSubsystem::SendHello()
 		Hello->SetStringField(TEXT("project_id"), ProjectId.ToString(EGuidFormats::DigitsWithHyphensLower));
 	}
 	Hello->SetStringField(TEXT("host"), GIsEditor ? TEXT("editor") : TEXT("game"));
-	Hello->SetStringField(TEXT("nonce"), FBase64::Encode(PluginNonce));
-	const FString ProjectDir = PlaytestBrain::ProjectDir();
-	Hello->SetStringField(TEXT("project_dir"), ProjectDir);
-	Hello->SetStringField(TEXT("mac"), FBase64::Encode(PlaytestBrain::HelloMac(Secret, PluginNonce, ProjectDir)));
-	if (!SessionId.IsEmpty())
+	PlaytestBrain::Sign(*Hello, Invited->Secret, PluginNonce, PlaytestBrain::ProjectDir());
+	if (!Session.Id.IsEmpty())
 	{
-		Hello->SetStringField(TEXT("resume"), SessionId);
-		Hello->SetNumberField(TEXT("received"), (double)LastRequest);
+		Hello->SetStringField(TEXT("resume"), Session.Id);
+		Hello->SetNumberField(TEXT("received"), (double)Session.Received);
 	}
-	AskedResume = SessionId;
+	Session.Asked = Session.Id;
 	Socket->Send(Hello);
 }
 
@@ -230,9 +301,9 @@ void UPlaytestSubsystem::SendOrHold(const TSharedRef<FJsonObject>& Message)
 	{
 		Socket->Send(Message);
 	}
-	else if (!SessionId.IsEmpty() && HeldResponses.Num() < MaxHeldResponses)
+	else if (!Session.Id.IsEmpty() && Session.Held.Num() < MaxHeldResponses)
 	{
-		HeldResponses.Add({Message, {}});
+		Session.Held.Add({Message, {}});
 	}
 }
 
@@ -250,9 +321,9 @@ void UPlaytestSubsystem::SendResponseText(TArray<uint8>&& Text)
 	{
 		Socket->SendBytes(MoveTemp(Text));
 	}
-	else if (!SessionId.IsEmpty() && HeldResponses.Num() < MaxHeldResponses)
+	else if (!Session.Id.IsEmpty() && Session.Held.Num() < MaxHeldResponses)
 	{
-		HeldResponses.Add({nullptr, MoveTemp(Text)});
+		Session.Held.Add({nullptr, MoveTemp(Text)});
 	}
 }
 
@@ -261,7 +332,7 @@ void UPlaytestSubsystem::Status(const FString& Text)
 	if (Text != LastStatus)
 	{
 		LastStatus = Text;
-		UE_LOG(LogPlaytest, Display, TEXT("[Cluewren] %s"), *Text);
+		UE_LOG(LogCluewren, Display, TEXT("[Cluewren] %s"), *Text);
 	}
 }
 
@@ -394,12 +465,13 @@ void UPlaytestSubsystem::HandleMessage(const TSharedPtr<FJsonObject>& Message)
 		}
 		else
 		{
-			FString Said;
+			// Its message is never shown: whoever wrote it has proved nothing yet.
+			FString Code;
 			if (Type == TEXT("error"))
 			{
-				Message->TryGetStringField(TEXT("message"), Said);
+				Message->TryGetStringField(TEXT("code"), Code);
 			}
-			Refuse(Said.IsEmpty() ? FString(TEXT("it didn't prove it is this machine's brain")) : Said);
+			Refuse(PlaytestBrain::RefusalText(Code));
 		}
 		return;
 	}
@@ -411,16 +483,31 @@ void UPlaytestSubsystem::HandleMessage(const TSharedPtr<FJsonObject>& Message)
 	{
 		Status(Message->GetStringField(TEXT("text")));
 	}
+	else if (Type == TEXT("run_started"))
+	{
+		bRunActive = true;
+		ShowRun();
+	}
+	else if (Type == TEXT("result"))
+	{
+		bRunActive = false;
+		ShowRun();
+	}
 	else if (Type == TEXT("error"))
 	{
 		Refuse(Message->GetStringField(TEXT("message")));
 	}
 }
 
+void UPlaytestSubsystem::ShowRun()
+{
+	Status(bRunActive ? TEXT("Connected to the brain: a run is active") : TEXT("Connected to the brain: no run is active"));
+}
+
 void UPlaytestSubsystem::HandleRequest(const TSharedPtr<FJsonObject>& Message)
 {
 	const int64 Id = (int64)Message->GetNumberField(TEXT("id"));
-	LastRequest = FMath::Max(LastRequest, Id);
+	Session.Received = FMath::Max(Session.Received, Id);
 	const TSharedPtr<FJsonObject>* Args = nullptr;
 	const TSharedPtr<FJsonObject> ArgsObj = Message->TryGetObjectField(TEXT("args"), Args) && Args ? *Args : MakeShared<FJsonObject>();
 	PlaytestOps::Handle(*this, Id, Message->GetStringField(TEXT("op")), ArgsObj);
@@ -430,34 +517,32 @@ void UPlaytestSubsystem::HandleWelcome(const TSharedPtr<FJsonObject>& Message)
 {
 	TArray<uint8> BrainNonce, Proof;
 	if (!Bytes(Message, TEXT("nonce"), BrainNonce) || BrainNonce.Num() != PlaytestBrain::NonceBytes || !Bytes(Message, TEXT("proof"), Proof)
-		|| !PlaytestBrain::Verify(Secret, PlaytestBrain::BrainRole, PluginNonce, BrainNonce, Proof))
+		|| !PlaytestBrain::Verify(Invited->Secret, PlaytestBrain::BrainRole, PluginNonce, BrainNonce, Proof))
 	{
-		Refuse(TEXT("it didn't prove it is this machine's brain"));
+		Refuse(PlaytestBrain::Unproven);
 		return;
 	}
 	TSharedRef<FJsonObject> Answer = MakeShared<FJsonObject>();
 	Answer->SetStringField(TEXT("type"), TEXT("proof"));
-	Answer->SetStringField(TEXT("proof"), FBase64::Encode(PlaytestBrain::Prove(Secret, PlaytestBrain::PluginRole, PluginNonce, BrainNonce)));
+	Answer->SetStringField(TEXT("proof"), FBase64::Encode(PlaytestBrain::Prove(Invited->Secret, PlaytestBrain::PluginRole, PluginNonce, BrainNonce)));
 	Socket->Send(Answer);
-	Secret.Empty();
 	PluginNonce.Empty();
-	FString Session;
-	Message->TryGetStringField(TEXT("session"), Session);
-	if (AskedResume.IsEmpty() || Session != AskedResume)
+	Prepare();
+	FString Welcomed;
+	Message->TryGetStringField(TEXT("session"), Welcomed);
+	if (!Session.Welcomed(Welcomed))
 	{
 		++SessionSerial;
-		LastRequest = 0;
-		HeldResponses.Reset();
+		bRunActive = false;
 		PendingOps.Reset();
 		Detectors->Reset();
 #if WITH_EDITOR
 		PlaytestExport::Refresh();
 #endif
 	}
-	SessionId = Session;
 	bConnected = true;
 	LastHeartbeat = 0;
-	for (FHeld& Held : HeldResponses)
+	for (FHeld& Held : Session.Held)
 	{
 		if (Held.Json.IsValid())
 		{
@@ -468,20 +553,20 @@ void UPlaytestSubsystem::HandleWelcome(const TSharedPtr<FJsonObject>& Message)
 			Socket->SendBytes(MoveTemp(Held.Bytes));
 		}
 	}
-	HeldResponses.Reset();
-	Status(TEXT("Connected to the brain"));
+	Session.Held.Reset();
+	ShowRun();
 }
 
-// No reconnect: whatever answers here doesn't know this machine's secret, and asking again won't change that.
+// No reconnect before the invite changes: the same invite gets the same answer from whatever answered here.
 void UPlaytestSubsystem::Refuse(const FString& Why)
 {
 	Status(FString::Printf(TEXT("Refused: %s"), *Why));
-	RefusedFile = IFileManager::Get().GetTimeStamp(*PlaytestBrain::FilePath());
-	Secret.Empty();
+	Invited.Reset();
 	PluginNonce.Empty();
 	Socket.Reset();
 	bConnected = false;
-	SessionId.Empty();
+	bRunActive = false;
+	Session.Id.Empty();
 	if (bOnCommandLine)
 	{
 		ExitWithCode(1);
@@ -493,7 +578,6 @@ void UPlaytestSubsystem::ConnectionLost(double T, const FString& Why)
 	const bool bWas = bConnected;
 	Socket.Reset();
 	bConnected = false;
-	Secret.Empty();
 	NextAttempt = T + RetrySeconds;
 	PlaytestOps::ReleasePointer();
 	if (bWas)
@@ -508,10 +592,10 @@ void UPlaytestSubsystem::ConnectionLost(double T, const FString& Why)
 
 void UPlaytestSubsystem::TickConnection(double T)
 {
-	if (ConnectDeadline > 0 && T >= ConnectDeadline && SessionId.IsEmpty())
+	if (ConnectDeadline > 0 && T >= ConnectDeadline && Session.Id.IsEmpty())
 	{
 		ConnectDeadline = 0;
-		UE_LOG(LogPlaytest, Error, TEXT("[Cluewren] No welcome from a brain within the connect timeout (%s)"), *LastStatus);
+		UE_LOG(LogCluewren, Error, TEXT("[Cluewren] No welcome from a brain within the connect timeout (%s)"), *LastStatus);
 		Socket.Reset();
 		ExitWithCode(1);
 		return;
@@ -546,7 +630,17 @@ void UPlaytestSubsystem::TickConnection(double T)
 	}
 	if (State == FPlaytestSocket::EState::Closed)
 	{
-		ConnectionLost(T, Socket->GetCloseReason());
+		FString Reason;
+		const int32 Code = Socket->GetPeerClose(Reason);
+		const FString Refusal = bConnected ? FString() : PlaytestBrain::RefusalOfClose(Code, Reason);
+		if (!Refusal.IsEmpty())
+		{
+			Refuse(Refusal);
+		}
+		else
+		{
+			ConnectionLost(T, Socket->GetCloseReason(bConnected));
+		}
 	}
 	else if (!bConnected && T >= HandshakeDeadline)
 	{
@@ -591,9 +685,33 @@ void UPlaytestSubsystem::NoteLaunchMap()
 	}
 	// The first game world that began play (not the empty world a game instance makes before it loads its first map)
 	UWorld* World = GetGameWorld();
-	if (World && World->HasBegunPlay() && World->GetPackage())
+	if (!World || !World->HasBegunPlay() || !World->GetPackage())
 	{
-		LaunchMap = UWorld::RemovePIEPrefix(World->GetPackage()->GetName());
+		return;
+	}
+	LaunchMap = UWorld::RemovePIEPrefix(World->GetPackage()->GetName());
+	// A game started with -CluewrenMap plays that level in place of the one it booted into, and a restart reopens it. (The
+	// editor starts its play session in it: PlaytestOps::Session.)
+	if (SessionHandler || StartMap.IsEmpty())
+	{
+		return;
+	}
+	if (PlaytestRefusal::DataPath(StartMap))
+	{
+		UE_LOG(LogCluewren, Warning, TEXT("[Cluewren] -CluewrenMap=%s is refused: nothing under .cluewren is opened as a level"), *StartMap);
+		return;
+	}
+	FString Package, Error;
+	if (!PlaytestLevels::Resolve(StartMap, Package, Error))
+	{
+		UE_LOG(LogCluewren, Warning, TEXT("[Cluewren] -CluewrenMap=%s: %s"), *StartMap, *Error);
+		return;
+	}
+	const FString Booted = LaunchMap;
+	LaunchMap = Package;
+	if (!Booted.Equals(Package, ESearchCase::IgnoreCase))
+	{
+		UGameplayStatics::OpenLevel(World, FName(*Package));
 	}
 }
 
@@ -604,12 +722,16 @@ bool UPlaytestSubsystem::Tick(float DeltaTime)
 	LastTickReal = T;
 
 	TickConnection(T);
+	NoteLaunchMap();  // (connected or not: the map launched with, before any travel)
+	if (!Detectors.IsValid())
+	{
+		return true;  // (no brain has proved itself yet: see Prepare)
+	}
 	PlaytestOps::TickKeys(*this, DeltaTime);  // held keys and axes, every frame (all let go once disconnected)
 	Media->Tick();  // (also once disconnected: a recording pauses until the session resumes)
 #if WITH_EDITOR
 	PlaytestExport::Tick();
 #endif
-	NoteLaunchMap();  // (connected or not: the map launched with, before any travel)
 
 	if (!bConnected)
 	{

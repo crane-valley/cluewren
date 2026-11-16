@@ -12,7 +12,7 @@ Finding things. `game.Actors("Door")`: the GameObjects with a component of that 
 name, subclasses and interfaces too; `Collider`, `Rigidbody`, `Camera` work as well). `game.AllActors()`: the scene's
 things (objects that aren't plain groups, at the top or under a plain group). `game.Named("door")`: by name.
 `game.Request("find", new Dictionary<string, object> { ["class"] = ..., ["name"] = ..., ["inactive"] = true })` also lists
-inactive objects. The codex's `scenes/<scene>.txt` lists every object of a scene by these same paths with its components
+inactive objects. The export's `scenes/<scene>.txt` lists every object of a scene by these same paths with its components
 and their values.
 
 Reading and calling (`game.Get`, `game.Props`, `game.Call`, `game.Describe`). On a component: its fields,
@@ -35,14 +35,14 @@ centre: the feet are `HalfHeight` lower), the eye is the main camera. `Movement(
 CharacterController (half height, radius, step, max slope) and the player script's fields (walk speed from a field
 like `walkSpeed`/`moveSpeed`/`speed`, jump from `jumpSpeed`/`jumpForce` or `jumpHeight`, gravity from `gravity` or
 `Physics.gravity` (`Physics2D.gravity` without the Physics module, else 9.81)); a number it can't find is null: read
-the script in the codex and use the real one.
+the script in the export and use the real one.
 
 Input. Keys go in as a keyboard, mouse and gamepad would (the plugin's own Input System devices): FKey names
 (`W`, `SpaceBar`, `E`, `LeftShift`, `Escape`, `One`, `LeftMouseButton`, `MouseX`/`MouseY` in pixels of mouse
 movement, `Gamepad_LeftX`, `Gamepad_FaceButton_Bottom`...). Input System actions by `Map/Action` or name:
 `game.Press("Player/Jump")`, `game.Hold("Player/Move", new[] { 0.0, 1.0 })` (a Vector2: x right, y forward) then
 `game.Release("Player/Move")`. `(await game.Context())["controls"]` lists each action with its keys and bindings; the
-codex's `input/` has the action maps. Mouse look goes through the game's own look code: `game.CalibrateLook()` once,
+export's `input/` has the action maps. Mouse look goes through the game's own look code: `game.CalibrateLook()` once,
 then `game.Turn` / `LookAt`.
 - Games that read the legacy Input Manager, games played by pointing and clicking, and moving with `game.Request("move", ...)`:
   KIT-POINTER.md.
@@ -54,7 +54,7 @@ button's `onClick` runs). Text drawn with `OnGUI` (IMGUI) can't be read or click
 the world: its texts are in `view`'s `look.texts`.
 
 Sessions. In the editor, the session is play mode: `game.Restart()` reloads the scene play mode started with
-(`map:` a scene name or path from the codex's build_scenes.txt), `game.Request("session", new { action = "restart",
+(`map:` a scene name or path from the export's build_scenes.txt), `game.Request("session", new { action = "restart",
 fresh = true })` leaves and re-enters play mode (static fields reset too). A player build restarts its first scene,
 or the one it was launched with. Objects kept with `DontDestroyOnLoad` (game managers, scores) survive a scene reload,
 as they do for the game itself: read their state after a restart instead of assuming it reset. A game that boots
@@ -65,7 +65,7 @@ screen position, crosshair, `look.parts` mesh names, texts, animation clip) and 
 falling, standing_on, touching), with world-aligned boxes, and `game.View(new { sonar = true })` (`Sonar`, which `WalkTo`
 steers by) feels each way with the player's own capsule (a step above the floor) and rays down for drops: `by` wall,
 drop, steep or reach. It has no `held`, `openings`, `ways_up`, `point_blank` or `lane` (listed in its `omitted`), so `WalkTo`
-finds no way up to a raised goal by itself: walk it to the ramp's or stairs' foot and top first (from the codex,
+finds no way up to a raised goal by itself: walk it to the ramp's or stairs' foot and top first (from the export,
 `game.Locs`). `WalkTo` finds its way round obstacles on the map it feels out with the sonar. `watch` sees objects move, turn
 and change size, not meshes appearing or effects. Detectors: errors and exceptions in the log, NaN transforms, falling out
 of the level, long falls, hitches, on-screen counts above their maximum.

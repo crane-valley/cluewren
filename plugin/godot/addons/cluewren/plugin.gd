@@ -1,13 +1,14 @@
 # Modified by Crane Valley: replaces the dock with connection state and Connect and Disconnect; the theme, badge and the
 # project id written to project.godot are removed.
-## The editor plugin: registers the game-side autoload (playtest.gd) and adds the editor's link to the brain
+## The editor plugin: registers the game-side autoload (game.gd) and adds the editor's link to the brain
 ## (editor_bridge.gd), which reaches the running game over the debugger connection (debugger.gd).
 @tool
 extends EditorPlugin
 
 const AUTOLOAD := "Cluewren"
-const AUTOLOAD_PATH := "res://addons/cluewren/playtest.gd"
+const AUTOLOAD_PATH := "res://addons/cluewren/game.gd"
 const Debugger = preload("debugger.gd")
+const Discovery = preload("lib/discovery.gd")
 const EditorBridge = preload("editor_bridge.gd")
 
 var debugger
@@ -24,6 +25,7 @@ func _enable_plugin() -> void:
 
 func _disable_plugin() -> void:
 	remove_autoload_singleton(AUTOLOAD)
+	Discovery.remove_advert()
 
 
 func _enter_tree() -> void:

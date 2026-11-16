@@ -1,5 +1,7 @@
 #include "PlaytestBrain.h"
 
+#include "Dom/JsonObject.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
@@ -16,6 +18,11 @@ namespace PlaytestBrain
 namespace
 {
 	constexpr int32 SecretBytes = 32;
+	constexpr int32 IdBytes = 16;
+	constexpr int32 MaxCodeShown = 32;
+	constexpr int32 PolicyClose = 1008;
+
+	const TCHAR* const ReleasesDiffer = TEXT("The cluewren command and this plugin are of different releases: install the same release of both");
 
 	bool OwnerIsThisUser(const FString& Path)
 	{
@@ -49,81 +56,175 @@ namespace
 		const DWORD Attributes = GetFileAttributesW(*Path);
 		return Attributes != INVALID_FILE_ATTRIBUTES && !(Attributes & FILE_ATTRIBUTE_REPARSE_POINT) && OwnerIsThisUser(Path);
 	}
-
-	// Only ASCII letters are folded: each engine folds other letters its own way, and the three must compare alike.
-	FString Folder(const FString& Path)
-	{
-		FString P = Path.Replace(TEXT("/"), TEXT("\\"), ESearchCase::CaseSensitive);
-		const TCHAR Drive = P.Len() >= 3 ? P[0] : TEXT('\0');
-		if (P.Len() < 3 || P[1] != TEXT(':') || P[2] != TEXT('\\') || !((Drive >= TEXT('A') && Drive <= TEXT('Z')) || (Drive >= TEXT('a') && Drive <= TEXT('z'))))
-		{
-			return FString();
-		}
-		while (P.Len() > 3 && P[P.Len() - 1] == TEXT('\\'))
-		{
-			P.LeftChopInline(1);
-		}
-		for (int32 i = 0; i < P.Len(); ++i)
-		{
-			if (P[i] >= TEXT('A') && P[i] <= TEXT('Z'))
-			{
-				P[i] += 32;
-			}
-		}
-		return P;
-	}
-
-	bool Within(const FString& Inner, const FString& Outer)
-	{
-		return Inner.Equals(Outer, ESearchCase::CaseSensitive)
-			|| Inner.StartsWith(Outer.EndsWith(TEXT("\\"), ESearchCase::CaseSensitive) ? Outer : Outer + TEXT("\\"), ESearchCase::CaseSensitive);
-	}
 }
 
-FString FilePath()
+FString Folder()
 {
-	return FString(FPlatformProcess::UserSettingsDir()) / TEXT("Cluewren") / TEXT("brain.json");
+	return FString(FPlatformProcess::UserSettingsDir()) / TEXT("Cluewren");
 }
 
-FString Read(const FString& Path, const FString& ProjectDir, FAddress& Out)
+FString AdvertPath(const FString& In, uint32 Pid)
 {
-	if (!FPaths::FileExists(Path))
+	return In / TEXT("editors") / FString::Printf(TEXT("%u.json"), Pid);
+}
+
+FString InvitePath(const FString& In, uint32 Pid)
+{
+	return In / TEXT("invites") / FString::Printf(TEXT("%u.json"), Pid);
+}
+
+const FString& EditorId()
+{
+	static const FString Id = []()
 	{
-		return TEXT("No brain is running on this machine");
+		uint8 Random[IdBytes];
+		verify(BCRYPT_SUCCESS(BCryptGenRandom(nullptr, Random, IdBytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG)));
+		return BytesToHex(Random, IdBytes).ToLower();
+	}();
+	return Id;
+}
+
+TSharedRef<FJsonObject> AdvertJson(const FAdvert& Advert)
+{
+	TSharedRef<FJsonObject> Said = MakeShared<FJsonObject>();
+	Said->SetNumberField(TEXT("pid"), Advert.Pid);
+	Said->SetStringField(TEXT("id"), Advert.Id);
+	Said->SetStringField(TEXT("engine"), TEXT("unreal"));
+	Said->SetStringField(TEXT("engine_version"), Advert.EngineVersion);
+	Said->SetStringField(TEXT("plugin_version"), Advert.PluginVersion);
+	Said->SetNumberField(TEXT("protocol_min"), Protocol);
+	Said->SetNumberField(TEXT("protocol_max"), Protocol);
+	Said->SetStringField(TEXT("project_dir"), Advert.ProjectDir);
+	Said->SetStringField(TEXT("host"), Advert.bEditor ? TEXT("editor") : TEXT("game"));
+	return Said;
+}
+
+bool WriteAdvert(const FString& In, const FAdvert& Advert)
+{
+	const FString Path = AdvertPath(In, Advert.Pid);
+	// Renamed into place: the brain never reads half an advert.
+	const FString Temp = Path + TEXT(".tmp");
+	IFileManager& Files = IFileManager::Get();
+	return Files.MakeDirectory(*FPaths::GetPath(Path), true)
+		&& FFileHelper::SaveStringToFile(PlaytestJson::Write(AdvertJson(Advert)), *Temp, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
+		&& Files.Move(*Path, *Temp, true);
+}
+
+void RemoveAdvert(const FString& In, uint32 Pid)
+{
+	IFileManager::Get().Delete(*AdvertPath(In, Pid), false, true, true);
+}
+
+uint64 InviteWritten(const FString& Path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA Info;
+	if (!GetFileAttributesExW(*Path, GetFileExInfoStandard, &Info))
+	{
+		return 0;
 	}
+	return (uint64(Info.ftLastWriteTime.dwHighDateTime) << 32) | Info.ftLastWriteTime.dwLowDateTime;
+}
+
+EInvite ReadInvite(const FString& Path, const FString& Invited, FAddress& Out, FString& OutStatus)
+{
+	OutStatus.Reset();
 	if (!OwnedByThisUser(FPaths::GetPath(Path)) || !OwnedByThisUser(Path))
 	{
-		return FString::Printf(TEXT("%s isn't owned by this user: refused"), *Path);
+		if (!FPaths::FileExists(Path))
+		{
+			OutStatus = FString::Printf(TEXT("%s can't be read"), *Path);
+			return EInvite::Unreadable;
+		}
+		OutStatus = FString::Printf(TEXT("%s isn't owned by this user: refused"), *Path);
+		return EInvite::NotThisUsers;
 	}
 	FString Text;
 	if (!FFileHelper::LoadFileToString(Text, *Path))
 	{
-		return FString::Printf(TEXT("%s can't be read"), *Path);
+		OutStatus = FString::Printf(TEXT("%s can't be read"), *Path);
+		return EInvite::Unreadable;
 	}
 	const TSharedPtr<FJsonObject> Said = PlaytestJson::Parse(Text);
 	if (!Said.IsValid())
 	{
-		return FString::Printf(TEXT("%s isn't a brain announcement"), *Path);
+		OutStatus = FString::Printf(TEXT("%s isn't an invite"), *Path);
+		return EInvite::NotAnInvite;
 	}
-	FString Secret, Url;
-	double Pid = 0;
+	FString Id, Secret, Url;
+	double Speaks = 0, Pid = 0;
+	Said->TryGetStringField(TEXT("editor_id"), Id);
+	Said->TryGetNumberField(TEXT("protocol"), Speaks);
 	Said->TryGetStringField(TEXT("secret"), Secret);
-	Said->TryGetStringField(TEXT("url"), Url);
 	Said->TryGetNumberField(TEXT("pid"), Pid);
-	if (!FBase64::Decode(Secret, Out.Secret) || Out.Secret.Num() < SecretBytes)
+	Said->TryGetStringField(TEXT("url"), Url);
+	if (!Id.Equals(Invited, ESearchCase::CaseSensitive))
 	{
-		return FString::Printf(TEXT("%s has no usable secret"), *Path);
+		return EInvite::OtherEditor;
+	}
+	if (Speaks != Protocol)
+	{
+		OutStatus = ReleasesDiffer;
+		return EInvite::OtherRelease;
+	}
+	TArray<uint8> Key;
+	if (!FBase64::Decode(Secret, Key) || Key.Num() < SecretBytes)
+	{
+		OutStatus = FString::Printf(TEXT("%s has no usable secret"), *Path);
+		return EInvite::NoSecret;
 	}
 	if (Pid <= 0 || !FPlatformProcess::IsApplicationRunning((uint32)Pid))
 	{
-		return TEXT("The brain in brain.json isn't running");
+		OutStatus = RunEnded;
+		return EInvite::Ended;
 	}
-	const FString Why = ForAnotherProject(*Said, ProjectDir);
-	if (!Why.IsEmpty())
+	FAddress Brain;
+	OutStatus = CheckUrl(Url, Brain);
+	if (!OutStatus.IsEmpty())
 	{
-		return Why;
+		return EInvite::BadUrl;
 	}
-	return CheckUrl(Url, Out);
+	Brain.Secret = MoveTemp(Key);
+	Brain.Pid = (uint32)Pid;
+	Out = MoveTemp(Brain);
+	return EInvite::Taken;
+}
+
+bool Alive(const FAddress& Brain)
+{
+	return FPlatformProcess::IsApplicationRunning(Brain.Pid);
+}
+
+FString RefusalText(const FString& Code)
+{
+	if (Code == TEXT("protocol"))
+	{
+		return ReleasesDiffer;
+	}
+	if (Code == TEXT("not_authenticated"))
+	{
+		return TEXT("The brain did not accept this editor's proof of the invite");
+	}
+	if (Code == TEXT("project"))
+	{
+		return TEXT("The run is for another project than this editor's");
+	}
+	if (Code == TEXT("resume"))
+	{
+		return TEXT("The session this editor tried to resume belongs to another project or engine");
+	}
+	// Whoever sent the code has proved nothing yet: what isn't made as a code is not shown, so that none carries a message.
+	bool bCode = !Code.IsEmpty() && Code.Len() <= MaxCodeShown;
+	for (int32 i = 0; i < Code.Len() && bCode; ++i)
+	{
+		const TCHAR C = Code[i];
+		bCode = (C >= TEXT('a') && C <= TEXT('z')) || (C >= TEXT('0') && C <= TEXT('9')) || C == TEXT('_');
+	}
+	return bCode ? FString::Printf(TEXT("The brain refused the connection (%s)"), *Code) : FString(Unproven);
+}
+
+FString RefusalOfClose(int32 Status, const FString& Reason)
+{
+	return Status == PolicyClose ? RefusalText(Reason) : FString();
 }
 
 FString ProjectDir()
@@ -136,50 +237,6 @@ FString ProjectDirOf(const FString& Dir)
 	FString Full = FPaths::ConvertRelativePathToFull(Dir);
 	FPaths::NormalizeDirectoryName(Full);
 	return Full;
-}
-
-FString ForAnotherProject(const FJsonObject& Said, const FString& ProjectDir)
-{
-	const TSharedPtr<FJsonValue> Folders = Said.TryGetField(TEXT("folders"));
-	if (!Folders.IsValid() || Folders->Type == EJson::Null || (Folders->Type == EJson::Array && Folders->AsArray().IsEmpty()))
-	{
-		return FString();
-	}
-	const TSharedPtr<FJsonValue> Given = Said.TryGetField(TEXT("match"));
-	const FString Match = Given.IsValid() && Given->Type == EJson::String ? Given->AsString() : FString();
-	const FString Mine = Folder(ProjectDir);
-	TArray<FString> Named;
-	bool bFound = false;
-	if (Folders->Type == EJson::Array)
-	{
-		for (const TSharedPtr<FJsonValue>& Entry : Folders->AsArray())
-		{
-			if (!Entry.IsValid() || Entry->Type != EJson::String)
-			{
-				continue;
-			}
-			Named.Add(FString::Printf(TEXT("\"%s\""), *Entry->AsString()));
-			const FString Theirs = Folder(Entry->AsString());
-			if (Mine.IsEmpty() || Theirs.IsEmpty())
-			{
-				continue;
-			}
-			if (Match.Equals(TEXT("exact"), ESearchCase::CaseSensitive))
-			{
-				bFound |= Mine.Equals(Theirs, ESearchCase::CaseSensitive);
-			}
-			else if (Match.Equals(TEXT("related"), ESearchCase::CaseSensitive))
-			{
-				bFound |= Within(Mine, Theirs) || Within(Theirs, Mine);
-			}
-		}
-	}
-	if (bFound)
-	{
-		return FString();
-	}
-	return FString::Printf(TEXT("For another project: the run is for %s (match \"%s\"), this project is \"%s\""),
-		Named.Num() > 0 ? *FString::Join(Named, TEXT(" or ")) : TEXT("no folder"), *Match, *ProjectDir);
 }
 
 FString CheckUrl(const FString& Url, FAddress& Out)
@@ -259,6 +316,14 @@ TArray<uint8> HelloMac(const TArray<uint8>& Secret, const TArray<uint8>& PluginN
 	Mac.SetNumUninitialized(32);
 	verify(BCRYPT_SUCCESS(BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE, const_cast<uint8*>(Secret.GetData()), Secret.Num(), Input.GetData(), Input.Num(), Mac.GetData(), Mac.Num())));
 	return Mac;
+}
+
+void Sign(FJsonObject& Hello, const TArray<uint8>& Secret, const TArray<uint8>& PluginNonce, const FString& ProjectDir)
+{
+	Hello.SetNumberField(TEXT("protocol"), Protocol);
+	Hello.SetStringField(TEXT("nonce"), FBase64::Encode(PluginNonce));
+	Hello.SetStringField(TEXT("project_dir"), ProjectDir);
+	Hello.SetStringField(TEXT("mac"), FBase64::Encode(HelloMac(Secret, PluginNonce, ProjectDir)));
 }
 
 bool Verify(const TArray<uint8>& Secret, const TCHAR* Role, const TArray<uint8>& PluginNonce, const TArray<uint8>& BrainNonce, const TArray<uint8>& Proof)

@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text.Json;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 using Cluewren.Sandbox;
 using Cluewren.Tests.Sim;
@@ -73,7 +73,7 @@ sealed class StillGame : SimLink
     }
 }
 
-sealed class CannedJev(string pick) : IJevRelay
+sealed class CannedJev(string pick) : IDecisionRelay
 {
     public int Calls;
     public string? LastBody;
@@ -100,6 +100,21 @@ sealed class CannedJev(string pick) : IJevRelay
     }
 }
 
+sealed class FixedJev(string? answer) : IDecisionRelay
+{
+    int _calls;
+
+    public int Calls => Volatile.Read(ref _calls);
+
+    public Task<(byte[] Body, long LatencyTicks)> DecideRawAsync(JsonElement stateAndQuestions, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _calls);
+        return answer is null
+            ? Task.FromException<(byte[], long)>(new DecisionException("HTTP 503"))
+            : Task.FromResult((System.Text.Encoding.UTF8.GetBytes(answer), 1000L));
+    }
+}
+
 [CollectionDefinition("sandbox", DisableParallelization = true)]
 public class SandboxCollection;
 
@@ -122,8 +137,12 @@ public sealed class SandboxTests : IDisposable
         }
     }
 
-    HarnessHost Host(IJevRelay? jev = null, long memory = 2L << 30, SandboxMode mode = SandboxMode.Contained) =>
-        new(new HostOptions(_game, Path.Combine(_root, "run")) { Jev = jev, MemoryLimitBytes = memory, Mode = mode, Say = _ => { } });
+    HarnessHost Host(IDecisionRelay? jev = null, long memory = 2L << 30, SandboxMode mode = SandboxMode.Contained,
+        IGameLink? link = null, IEpisodeRecorder? recorder = null) =>
+        new(new HostOptions(link ?? _game, Path.Combine(_root, "run"))
+        {
+            Decider = jev, MemoryLimitBytes = memory, Mode = mode, Say = _ => { }, Recorder = recorder,
+        });
 
     static string Literal(string text) => "@\"" + text.Replace("\"", "\"\"") + "\"";
 
@@ -159,11 +178,31 @@ public sealed class SandboxTests : IDisposable
         await using var host = Host();
         var text = await Probe(host, """
             Console.WriteLine("before");
-            await game.Request("nothing");
+            await game.Request("find");
             """);
         Assert.Contains("before", text);
         Assert.Contains("GameException", text);
-        Assert.Contains("unknown op nothing", text);
+        Assert.Contains("unknown op find", text);
+    }
+
+    [Fact]
+    public async Task A_probe_that_asks_what_harness_code_may_not_is_refused_and_goes_on()
+    {
+        await using var host = Host();
+        var text = await Probe(host, """
+            foreach (var (op, action) in new[] { ("record", "start"), ("session", "stop"), ("timestep", "") })
+            {
+                try { await game.Request(op, json => json.WriteString("action", action)); Console.WriteLine($"{op} ALLOWED"); }
+                catch (GameException e) { Console.WriteLine($"{op} {e.Status} {e.Message}"); }
+            }
+            (await game.Pose()).At.Z + 1
+            """);
+        foreach (var op in (string[])["record", "session", "timestep"])
+            Assert.Contains($"{op} 403", text);
+        Assert.Contains("record: record is refused: harness code may not send it", text);
+        Assert.Contains("91", text);
+        lock (_game.Ops)
+            Assert.DoesNotContain(_game.Ops, op => op is "record" or "session" or "timestep");
     }
 
     [Fact]
@@ -250,10 +289,30 @@ public sealed class SandboxTests : IDisposable
         Assert.True(jev.Calls >= 1);
         Assert.DoesNotContain("\"model\"", jev.LastBody);
         Assert.Contains("walk", result.Summary);
-        Assert.True(File.Exists(Path.Combine(_root, "run", "trace1.jsonl")));
-        Assert.True(File.Exists(Path.Combine(_root, "run", "trace1_summary.txt")));
-        Assert.True(File.Exists(Path.Combine(_root, "run", "harness1.cs")));
-        Assert.True(host.JevDecisions >= 1);
+        Assert.Contains("Episode 1 (work/trace1.jsonl; harness saved as harness1.cs)", result.Text);
+        var run = Path.Combine(_root, "run");
+        Assert.Equal(new[] { "carry.json", "tmp", "trace1.jsonl", "trace1_summary.txt" },
+            Directory.GetFileSystemEntries(Path.Combine(run, "work")).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.Equal(new[] { ".container", "bin", "harness.cs", "harness1.cs", "sandbox.log", "work" },
+            Directory.GetFileSystemEntries(run).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.True(host.DecisionsSpent >= 1);
+        Assert.InRange(result.Decisions, 1, jev.Calls);
+        Assert.Equal(result.Decisions, host.MostDecisions);
+    }
+
+    // The child counts every answer it applied: the gate takes only those the brain saw pick among what was offered.
+    [Fact]
+    public async Task Answers_that_pick_nothing_offered_are_no_decisions_whatever_the_child_counted()
+    {
+        var jev = new FixedJev("""{"answers":{"pick":{"type":"choice","choice":"elsewhere","probabilities":{"elsewhere":1.0}}}}""");
+        await using var host = Host(jev);
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
+        var result = await host.RunHarnessAsync(5);
+        Assert.True(result.Played, result.Text);
+        Assert.True(jev.Calls >= 1);
+        Assert.True(result.Stats!.Value.GetProperty("decisions").GetProperty("answered").GetInt32() >= 1, result.Stats.Value.GetRawText());
+        Assert.Equal(0, result.Decisions);
+        Assert.Equal(0, host.MostDecisions);
     }
 
     [Fact]
@@ -262,7 +321,7 @@ public sealed class SandboxTests : IDisposable
         var jev = new CannedJev("wait");
         await using var host = new HarnessHost(new HostOptions(_game, Path.Combine(_root, "run"))
         {
-            Jev = jev, MaxJevDecisions = 2, Mode = SandboxMode.Contained, Say = _ => { },
+            Decider = jev, MaxDecisions = 2, Mode = SandboxMode.Contained, Say = _ => { },
         });
         await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
         var result = await host.RunHarnessAsync(6);
@@ -277,7 +336,7 @@ public sealed class SandboxTests : IDisposable
         var jev = new CannedJev("wait");
         await using var host = new HarnessHost(new HostOptions(_game, Path.Combine(_root, "run"))
         {
-            Jev = jev, MaxJevDecisions = 1, Mode = SandboxMode.Contained, Say = _ => { },
+            Decider = jev, MaxDecisions = 1, Mode = SandboxMode.Contained, Say = _ => { },
         });
         await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
         await host.RunHarnessAsync(6);
@@ -298,6 +357,97 @@ public sealed class SandboxTests : IDisposable
         Assert.DoesNotContain("walk: ok", text);
     }
 
+    // Before, a stop that came while a call compiled or started its child found nothing running and was lost: the call
+    // then played in full.
+    [Fact]
+    public async Task A_stop_while_a_probe_starts_its_child_ends_it_before_it_begins_and_the_next_probe_plays()
+    {
+        var link = new StopOnAttach(_game);
+        await using var host = Host(link: link);
+        link.Stopping = host.EndEpisode;
+        Assert.Equal("Stopped before it began.", (await host.ProbeAsync("\"played\"")).Text);
+        Assert.Contains("played", await Probe(host, "\"played\""));
+    }
+
+    [Fact]
+    public async Task A_stop_while_a_check_starts_its_child_ends_it_before_it_begins_and_the_next_check_plays()
+    {
+        var link = new StopOnAttach(_game);
+        await using var host = Host(link: link);
+        link.Stopping = host.EndEpisode;
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
+        Assert.Equal("Stopped before it began.", await host.CheckHarnessAsync(3, restart: false, only: ["wait"]));
+        Assert.Contains("wait: ok", await host.CheckHarnessAsync(3, restart: false, only: ["wait"]));
+    }
+
+    [Fact]
+    public async Task A_stop_while_an_episode_starts_its_child_counts_no_episode_and_the_next_episode_plays()
+    {
+        var link = new StopOnAttach(_game);
+        await using var host = Host(new CannedJev("walk"), link: link);
+        link.Stopping = host.EndEpisode;
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
+        var stopped = await host.RunHarnessAsync(10);
+        Assert.Equal(("Stopped before it began.", false, 0), (stopped.Text, stopped.Played, host.Episodes));
+        var played = await host.RunHarnessAsync(10);
+        Assert.True(played.Played, played.Text);
+        Assert.Equal((1, 1), (played.Episode, host.Episodes));
+    }
+
+    const string EndsItsEpisodeEarly = """
+        class EndsEarly : Harness
+        {
+            public override async Task Setup(Game game)
+            {
+                var raw = Console.OpenStandardOutput();
+                raw.Write(System.Text.Encoding.UTF8.GetBytes("{\"type\":\"episode\",\"rid\":999999,\"mark\":\"end\",\"n\":1}\n"));
+                raw.Flush();
+                await game.Request("rc");
+                Environment.Exit(0);
+            }
+        }
+        """;
+
+    // Before, an episode's frames ended at the last end its child marked: harness code that marked it early and then
+    // played on without the child's own end left the rest of its play out of reach.
+    [Fact]
+    public async Task An_episode_is_recorded_to_where_its_call_returned_whatever_end_the_harness_marked_before()
+    {
+        await using var host = Host(new CannedJev("walk"), recorder: new LoggedRecorder(_game.Ops));
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), EndsItsEpisodeEarly);
+        var result = await host.RunHarnessAsync(10);
+        Assert.Contains("sandbox failed", result.Text);
+        lock (_game.Ops)
+        {
+            var marked = _game.Ops.IndexOf("end 1");
+            Assert.True(marked >= 0, string.Join(" ", _game.Ops));
+            var played = _game.Ops.IndexOf("rc", marked);
+            Assert.True(played > marked, string.Join(" ", _game.Ops));
+            Assert.True(_game.Ops.LastIndexOf("end 1") > played, string.Join(" ", _game.Ops));
+        }
+    }
+
+    // Before, an episode's frames began where its child marked it, after the harness was made: harness code could play
+    // first and leave that play out of the episode's pictures.
+    [Fact]
+    public async Task An_episode_is_recorded_from_where_this_process_saw_it_begin()
+    {
+        await using var host = Host(new CannedJev("walk"), recorder: new LoggedRecorder(_game.Ops));
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "harness.cs"), TwoChoices);
+        Assert.True((await host.RunHarnessAsync(6)).Played);
+        int restarted;
+        lock (_game.Ops)
+        {
+            restarted = _game.Ops.IndexOf("session");
+            Assert.True(restarted >= 0, string.Join(" ", _game.Ops));
+            Assert.Equal("begin 1", _game.Ops[restarted + 1]);
+            _game.Ops.Clear();
+        }
+        Assert.True((await host.RunHarnessAsync(6, restart: false)).Played);
+        lock (_game.Ops)
+            Assert.Equal("begin 2", _game.Ops[0]);
+    }
+
     [Fact]
     public async Task What_a_walk_learned_outlives_the_child()
     {
@@ -305,6 +455,22 @@ public sealed class SandboxTests : IDisposable
         await Probe(host, """game.Look.X = 0.25; game.CoastSeconds = 0.3; game.NavMaps["Main"] = new NavMap(); game.NavMaps["Main"].Hits[(1, 2, 0)] = 5.0;""");
         var text = await Probe(host, """Console.WriteLine($"{game.Look.X} {game.CoastSeconds} {game.NavMaps["Main"].Hits[(1, 2, 0)]}");""");
         Assert.Contains("0.25 0.3 5", text);
+    }
+
+    // Before, a carry.json whose shape was wrong in a way the reader didn't expect ended every call after the first,
+    // and was never written over.
+    [Theory]
+    [InlineData("""{"look_x":0,"look_y":0,"coast":0,"keys":{},"maps":{"Main":{"hits":[[]]}}}""")]
+    [InlineData("""{"maps":7}""")]
+    [InlineData("[")]
+    public async Task What_an_earlier_child_carried_is_ignored_when_it_cannot_be_read(string carried)
+    {
+        await using var host = Host();
+        await Probe(host, "1");
+        await File.WriteAllTextAsync(Path.Combine(_root, "run", "work", "carry.json"), carried);
+        Assert.Contains("played", await Probe(host, "\"played\""));
+        await Probe(host, """game.Look.X = 0.25;""");
+        Assert.Contains("0.25", await Probe(host, """Console.WriteLine(game.Look.X);"""));
     }
 
     [Fact]
@@ -394,13 +560,70 @@ public sealed class SandboxTests : IDisposable
         }
     }
 
+    // In an app container Windows gives the child the container's own temporary folder whatever TEMP was set to.
     [Fact]
-    public async Task The_child_writes_inside_the_run_folder_and_nowhere_else()
+    public async Task A_plain_child_starts_in_work_and_has_its_temporary_folder_there()
+    {
+        await using var host = Host(mode: SandboxMode.Process);
+        var work = Path.Combine(_root, "run", "work");
+        var said = await Probe(host, """
+            Console.WriteLine("IN " + Environment.CurrentDirectory);
+            Console.WriteLine("TEMPORARY " + Path.GetTempPath());
+            """);
+        Assert.Equal("process", host.Sandbox);
+        Assert.Contains($"IN {work}\r\n", said);
+        Assert.Contains($"TEMPORARY {Path.Combine(work, "tmp")}{Path.DirectorySeparatorChar}\r\n", said);
+    }
+
+    [Fact]
+    public async Task The_child_writes_under_work_and_nowhere_else()
     {
         await using var host = Host();
-        var inside = Path.Combine(_root, "run", "note.txt");
+        var run = Path.Combine(_root, "run");
+        var work = Path.Combine(run, "work");
+        var harness = Path.Combine(run, "harness.cs");
+        await File.WriteAllTextAsync(harness, "class A : Harness { }\n");
+        var inside = Path.Combine(work, "note.txt");
         Assert.Contains("ALLOWED", await Probe(host, Attempt($"File.WriteAllText({Literal(inside)}, \"x\");")));
         Assert.True(File.Exists(inside));
+        var said = await Probe(host, Attempt("""
+            Console.WriteLine("IN " + Environment.CurrentDirectory);
+            File.WriteAllText("here.txt", "x");
+            File.WriteAllText(Path.Combine(Directory.CreateDirectory("deeper").FullName, "there.txt"), "x");
+            File.WriteAllText(Path.Combine("tmp", "temporary.txt"), "x");
+            File.Delete("note.txt");
+            """));
+        Assert.Contains("ALLOWED", said);
+        Assert.Contains($"IN {work}\r\n", said);
+        Assert.Equal(new[] { "carry.json", "deeper", "here.txt", "tmp" },
+            Directory.GetFileSystemEntries(work).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.True(File.Exists(Path.Combine(work, "deeper", "there.txt")));
+        Assert.True(File.Exists(Path.Combine(work, "tmp", "temporary.txt")));
+
+        Assert.Contains("ALLOWED", await Probe(host, Attempt($"File.ReadAllText({Literal(harness)});")));
+        var compiled = Directory.GetFiles(Path.Combine(run, "bin"), "*.dll")[0];
+        var before = Directory.GetFileSystemEntries(run, "*", SearchOption.AllDirectories).Where(entry => !entry.StartsWith(work)).ToList();
+        foreach (var attempt in (string[])
+                 [
+                     $"File.WriteAllText({Literal(Path.Combine(run, "note.txt"))}, \"x\");",
+                     $"File.WriteAllText({Literal(Path.Combine(run, "bin", "planted.dll"))}, \"x\");",
+                     $"File.WriteAllBytes({Literal(compiled)}, new byte[1]);",
+                     $"File.Delete({Literal(compiled)});",
+                     $"File.AppendAllText({Literal(harness)}, \"// more\");",
+                     $"File.Delete({Literal(harness)});",
+                     $"File.Move({Literal(harness)}, {Literal(Path.Combine(work, "harness.cs"))});",
+                     $"File.WriteAllText({Literal(Path.Combine(run, "report.json"))}, \"{{}}\");",
+                     $"File.AppendAllText({Literal(Path.Combine(run, "sandbox.log"))}, \"x\");",
+                     $"Directory.CreateDirectory({Literal(Path.Combine(run, "work2"))});",
+                     $"Directory.Move({Literal(work)}, {Literal(Path.Combine(run, "moved"))});",
+                 ])
+            Assert.True((await Probe(host, Attempt(attempt))).Contains("REFUSED"), attempt);
+        Assert.Equal("class A : Harness { }\n", await File.ReadAllTextAsync(harness));
+        // Each probe is compiled into bin by the brain, so only what was there before is compared.
+        Assert.Empty(before.Except(Directory.GetFileSystemEntries(run, "*", SearchOption.AllDirectories)));
+        Assert.DoesNotContain(Directory.GetFileSystemEntries(run), entry => Path.GetFileName(entry) is "note.txt" or "report.json" or "work2" or "moved");
+        Assert.False(File.Exists(Path.Combine(run, "bin", "planted.dll")));
+
         var outside = Path.Combine(_root, "escaped.txt");
         Assert.Contains("REFUSED", await Probe(host, Attempt($"File.WriteAllText({Literal(outside)}, \"x\");")));
         Assert.False(File.Exists(outside));
@@ -498,7 +721,7 @@ public sealed class SandboxTests : IDisposable
     [InlineData("""{"type":"post"}""", true)]
     [InlineData("""{"type":"status","text":5}""", true)]
     [InlineData("""{"type":"req","op":"pose"}""", true)]
-    [InlineData("""{"type":"jev","rid":"x","body":{}}""", true)]
+    [InlineData("""{"type":"decide","rid":"x","body":{}}""", true)]
     [InlineData("""{"type":"episode","rid":1,"n":1}""", true)]
     public async Task A_line_off_the_protocol_ends_the_session_and_the_brain_goes_on(string line, bool ends)
     {
@@ -538,6 +761,34 @@ public sealed class SandboxTests : IDisposable
         Assert.False(File.Exists(Path.Combine(run, "sandbox.log")));
     }
 
+    // Before, what harness code left in work could fail the next contained child as it started, and the next revision
+    // ran in a plain child: in the same run, or in the next one given the same folder.
+    [Fact]
+    public async Task What_a_child_left_in_work_buys_the_next_one_no_way_out_of_the_container()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        await using (var host = Host(mode: SandboxMode.Auto))
+        {
+            Assert.Contains("contained", await Probe(host, "\"contained\""));
+            Assert.Equal("appcontainer", host.Sandbox);
+            // Left readable to this user alone: a contained child can't read it, and a plain one could.
+            var carry = new FileInfo(Path.Combine(_root, "run", "work", "carry.json"));
+            var security = new FileSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl,
+                AccessControlType.Allow));
+            carry.SetAccessControl(security);
+            Assert.Contains("again", await Probe(host, "\"again\""));
+            Assert.Equal("appcontainer", host.Sandbox);
+            Assert.Null(host.SandboxNote);
+        }
+        await using var next = Host(mode: SandboxMode.Auto);
+        Assert.Contains("next", await Probe(next, "\"next\""));
+        Assert.Equal("appcontainer", next.Sandbox);
+        Assert.Null(next.SandboxNote);
+    }
+
     [Theory]
     [InlineData(SandboxMode.Contained)]
     [InlineData(SandboxMode.Process)]
@@ -565,7 +816,7 @@ public sealed class SandboxTests : IDisposable
     {
         var folder = Path.Combine(_root, "held");
         Directory.CreateDirectory(folder);
-        var pidFile = Path.Combine(folder, "pid.txt");
+        var pidFile = Path.Combine(folder, "work", "pid.txt");
         var holder = Path.Combine(AppContext.BaseDirectory, "Cluewren.Tools.dll");
         using var parent = Process.Start(new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "Cluewren.Tools.exe"))
         {
@@ -607,6 +858,37 @@ sealed class CancelOnAttach(IGameLink game, CancellationTokenSource cancel) : IG
     {
         add => cancel.Cancel();
         remove { }
+    }
+}
+
+sealed class StopOnAttach(IGameLink game) : IGameLink
+{
+    public Action? Stopping;
+
+    public ValueTask<GameAnswer> RequestAsync(string op, Action<Utf8JsonWriter>? args = null, TimeSpan? timeout = null,
+        CancellationToken ct = default) => game.RequestAsync(op, args, timeout, ct);
+
+    public void Post(string op, Action<Utf8JsonWriter>? args = null) => game.Post(op, args);
+
+    public event Action<JsonElement>? Event
+    {
+        add => Interlocked.Exchange(ref Stopping, null)?.Invoke();
+        remove { }
+    }
+}
+
+sealed class LoggedRecorder(List<string> log) : IEpisodeRecorder
+{
+    public void Begin(int episode)
+    {
+        lock (log)
+            log.Add($"begin {episode}");
+    }
+
+    public void End(int episode)
+    {
+        lock (log)
+            log.Add($"end {episode}");
     }
 }
 

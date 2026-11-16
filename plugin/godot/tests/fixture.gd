@@ -15,11 +15,11 @@ static func twice(x: int) -> int:
 	return x * 2
 
 
-func pick(path := "res://.godot/cluewren/runs/x/evil.tscn") -> String:
+func pick(path := "res://.cluewren/runs/x/work/evil.tscn") -> String:
 	return path
 
 
-func pick_node(path := NodePath("res://.godot/cluewren/runs/x/evil")) -> NodePath:
+func pick_node(path := NodePath("res://.cluewren/runs/x/work/evil")) -> NodePath:
 	return path
 
 

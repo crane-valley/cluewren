@@ -1,6 +1,6 @@
 # 0003 Local only, with no upload path
 
-Status: accepted, where recordings are kept superseded by 0008
+Status: accepted, where recordings are kept superseded by 0008, where run records are kept amended by 0019
 Date: 2026-10-31
 
 ## Context

@@ -12,13 +12,13 @@ and from what you see it do.
 The folders:
   {project}
                 the game's project: {code_folders}, and it is read-only for you
-  {project}/{export_folder}/
+  {export}/
                 {export_contents}
   {memory}/notes.md
                 what earlier requests on this game learned (verified facts, controls, pitfalls), if any
   {memory}/lib.cs
                 harness code earlier requests found reusable for this game, compiled with every harness, if any
-  {memory}/runs/
+  {runs}/
                 earlier runs: their harnesses, trace summaries and reports (reuse what worked)
   {run}/
                 this request's folder: write harness.cs here. Three parts of the kit are here too, to read only when

@@ -1,4 +1,4 @@
-## The mutual proof of brain.json's secret, the same as the brain's src/Cluewren/Bridge/Handshake.cs: the secret
+## The mutual proof of the invite's secret, the same as the brain's src/Cluewren/Bridge/Handshake.cs: the secret
 ## never travels, and each MAC starts with a role label so one side's proof can't be reflected back as the other's.
 extends RefCounted
 

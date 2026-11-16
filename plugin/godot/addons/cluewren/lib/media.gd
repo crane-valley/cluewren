@@ -80,6 +80,7 @@ class Job:
 	var lock := Mutex.new()
 	var still := false  # a capture (answered as a response), else a recording frame
 	var id = null  # the capture's request id
+	var owed := true  # the capture's session still wants its answer
 	var n := 0  # the frame's number
 	var t = null  # game time it shows
 	var wall := 0.0  # unix seconds when taken
@@ -123,7 +124,7 @@ class Job:
 		lock.unlock()
 
 
-var host  # playtest.gd: the viewport, game time, and sending
+var host  # game.gd: the viewport, game time, and sending
 var recording := false
 var fps := 5.0
 var max_dim := 960
@@ -223,6 +224,12 @@ func capture(id, args: Dictionary):
 	_begin(job)
 	_stills.append(job)
 	return null
+
+
+## A new session: a capture still on its way finishes, and answers nobody (its id may be a new request's).
+func drop_stills() -> void:
+	for job in _stills:
+		job.owed = false
 
 
 ## Every frame (the game thread): hand over what is done, and take the recording's next frame when its time comes.
@@ -346,6 +353,8 @@ func _collect(now: float) -> void:
 		var job: Job = _stills[i]
 		if _advance(job, now):
 			_stills.remove_at(i)
+			if not job.owed:
+				continue
 			if job.failed != "":
 				host.respond_error(job.id, "no picture: " + job.failed, 409 if job.failed != "it took too long" else 500)
 			else:

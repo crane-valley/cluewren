@@ -645,14 +645,14 @@ void FPlaytestMedia::Record(int64 Id, const TSharedPtr<FJsonObject>& Args)
 	Result->SetNumberField(TEXT("width"), Sent.X);
 	Result->SetNumberField(TEXT("height"), Sent.Y);
 	Bridge.Respond(Id, MakeShared<FJsonValueObject>(Result));
-	UE_LOG(LogPlaytest, Display, TEXT("[Cluewren] Recording the game: %.1f frames a second, %dx%d"), 1.0 / Interval, Sent.X, Sent.Y);
+	UE_LOG(LogCluewren, Display, TEXT("[Cluewren] Recording the game: %.1f frames a second, %dx%d"), 1.0 / Interval, Sent.X, Sent.Y);
 }
 
 void FPlaytestMedia::StopRecording()
 {
 	if (bRecording)
 	{
-		UE_LOG(LogPlaytest, Display, TEXT("[Cluewren] Recording stopped: %lld frames sent"), (long long)FramesSent);
+		UE_LOG(LogCluewren, Display, TEXT("[Cluewren] Recording stopped: %lld frames sent"), (long long)FramesSent);
 	}
 	bRecording = false;
 	++Generation;  // (frames still in flight are dropped)
@@ -734,7 +734,7 @@ void FPlaytestMedia::Tick()
 		}
 		else if (State == (int32)EJobState::Failed)
 		{
-			UE_LOG(LogPlaytest, Verbose, TEXT("[Cluewren] Frame %lld not recorded: %s"), (long long)Job->N, *Job->Error);
+			UE_LOG(LogCluewren, Verbose, TEXT("[Cluewren] Frame %lld not recorded: %s"), (long long)Job->N, *Job->Error);
 		}
 	}
 

@@ -1,30 +1,104 @@
-// Finding the brain: brain.json, written by src/Cluewren/Bridge/DiscoveryFile.cs. Nothing here decides anything on
-// the file's word alone: its owner is checked before it is read, and any URL must name this machine.
+// The rendezvous with the brain (src/Cluewren/Bridge/Rendezvous.cs): this process advertises itself in
+// editors/<pid>.json, and a brain whose run is for this project answers with invites/<pid>.json, which holds the
+// address and the secret of that run. Nothing here decides anything on the invite's word alone: its owner is checked
+// before it is read, and its URL must name this machine.
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using UnityEngine;
 
 namespace Cluewren
 {
-    public sealed class BrainAddress
+    public sealed class Invite
     {
-        public string Url;
+        public Uri Url;
         public byte[] Secret;
+        public int Pid;
+    }
+
+    public sealed class InviteWatch
+    {
+        readonly string path;
+        readonly string editorId;
+        DateTime seen;
+        Invite invite;
+
+        public InviteWatch(string path, string editorId)
+        {
+            this.path = path;
+            this.editorId = editorId;
+        }
+
+        public string Problem { get; private set; }
+
+        public DateTime Refused { get; set; }
+
+        public Invite Look()
+        {
+            var written = Written();
+            if (written != seen)
+            {
+                invite = null;
+                Problem = null;
+                if (written != default)
+                {
+                    try
+                    {
+                        Problem = Discovery.ReadInvite(path, editorId, out invite);
+                    }
+                    catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+                    {
+                        // Being replaced or removed: `seen` stays as it was, so the next look reads it.
+                        return null;
+                    }
+                }
+                seen = written;
+            }
+            if (invite == null || seen == Refused) return null;
+            if (!Discovery.Running(invite.Pid))
+            {
+                invite = null;
+                Problem = Discovery.RunEnded;
+            }
+            return invite;
+        }
+
+        public void Refuse() => Refused = seen;
+
+        DateTime Written()
+        {
+            try
+            {
+                return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : default;
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+            {
+                return default;
+            }
+        }
     }
 
     public static class Discovery
     {
+        public const string OtherRelease = "The cluewren command and this plugin are of different releases: install the same release of both";
+        public const string RunEnded = "The run this editor was invited to has ended";
         const string FolderName = "Cluewren";
-        const string FileName = "brain.json";
         const int SecretBytes = 32;
 
-        public static string FilePath() => Path.Combine(Folder(), FileName);
+        static string advert;
+
+        public static string Id { get; private set; }
+
+        public static InviteWatch Invites { get; private set; }
 
         // Spelled out for macOS and Linux: Mono's LocalApplicationData there isn't the .NET brain's.
-        static string Folder()
+        public static string Folder()
         {
             string root;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -42,91 +116,130 @@ namespace Cluewren
             return Path.Combine(root, FolderName);
         }
 
-        /// <summary>Why the brain announced in <paramref name="path"/> can't be used by the project in
-        /// <paramref name="projectDir"/>, or null with its address.</summary>
-        public static string Read(string path, string projectDir, out BrainAddress brain)
+        public static string AdvertPath(string folder, int pid) => Path.Combine(folder, "editors", FileName(pid));
+
+        public static string InvitePath(string folder, int pid) => Path.Combine(folder, "invites", FileName(pid));
+
+        static string FileName(int pid) => pid.ToString(CultureInfo.InvariantCulture) + ".json";
+
+        public static string NewId()
         {
-            brain = null;
-            if (!File.Exists(path)) return "No brain is running on this machine";
-            var folder = Path.GetDirectoryName(path);
-            if (!Native.OwnedByCurrentUser(folder) || !Native.OwnedByCurrentUser(path))
+            var bytes = new byte[16];
+            using (var random = RandomNumberGenerator.Create()) random.GetBytes(bytes);
+            var hex = new StringBuilder(32);
+            foreach (var b in bytes) hex.Append(b.ToString("x2"));
+            return hex.ToString();
+        }
+
+        // Any process of this user can write one: it holds no secret and proves nothing, so nothing is added to it.
+        public static Dictionary<string, object> Advert(int pid, string id, string projectDir, string host)
+        {
+            return new Dictionary<string, object>
+            {
+                ["pid"] = pid,
+                ["id"] = id,
+                ["engine"] = "unity",
+                ["engine_version"] = Application.unityVersion,
+                ["plugin_version"] = PlaytestClient.PluginVersion,
+                ["protocol_min"] = PlaytestClient.Protocol,
+                ["protocol_max"] = PlaytestClient.Protocol,
+                ["project_dir"] = projectDir ?? "",
+                ["host"] = host,
+            };
+        }
+
+        public static void Advertise(string id, string projectDir, string host)
+        {
+            int pid;
+            using (var self = Process.GetCurrentProcess()) pid = self.Id;
+            var folder = Folder();
+            Id = id;
+            Invites = new InviteWatch(InvitePath(folder, pid), id);
+            advert = AdvertPath(folder, pid);
+            try
+            {
+                WriteAdvert(advert, Advert(pid, id, projectDir, host));
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+            {
+                UnityEngine.Debug.LogWarning($"[Cluewren] Couldn't write {advert}, so no run will find this process: {e.Message}");
+            }
+        }
+
+        public static void WriteAdvert(string path, Dictionary<string, object> said)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            var bytes = new UTF8Encoding(false).GetBytes(Json.Write(said));
+            var temp = path + ".tmp";
+            try
+            {
+                File.WriteAllBytes(temp, bytes);
+                if (File.Exists(path)) File.Replace(temp, path, null);
+                else File.Move(temp, path);
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is PlatformNotSupportedException)
+            {
+                File.WriteAllBytes(path, bytes);
+                File.Delete(temp);
+            }
+        }
+
+        public static void Withdraw()
+        {
+            if (advert == null) return;
+            try
+            {
+                File.Delete(advert);
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+            {
+                // (the brain removes the advert of a process that is gone)
+            }
+            advert = null;
+        }
+
+        public static string ReadInvite(string path, string editorId, out Invite invite)
+        {
+            invite = null;
+            if (!Native.OwnedByCurrentUser(Path.GetDirectoryName(path)) || !Native.OwnedByCurrentUser(path))
                 return $"{path} isn't owned by this user: refused";
             Dictionary<string, object> said;
             try
             {
                 said = Json.ParseObject(File.ReadAllText(path));
             }
-            catch (Exception e) when (e is IOException || e is FormatException || e is UnauthorizedAccessException)
+            catch (Exception e) when (e is FormatException || e is OverflowException)
             {
-                return $"{path} can't be read: {e.Message}";
+                said = null;
             }
-            if (said == null) return $"{path} isn't a brain announcement";
-            byte[] secret;
-            try
-            {
-                secret = Convert.FromBase64String(Json.Str(said, "secret"));
-            }
-            catch (FormatException)
-            {
-                return $"{path} has no readable secret";
-            }
-            if (secret.Length < SecretBytes) return $"{path} has no usable secret";
-            if (!Running((int)Json.Num(said, "pid", 0))) return "The brain in brain.json isn't running";
-            var why = ForAnotherProject(said, projectDir, RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+            if (said == null) return $"{path} isn't an invite";
+            // Written for a process that had this pid before: passed over without a word.
+            if (!said.TryGetValue("editor_id", out var forId) || !(forId is string answered) || answered != editorId) return null;
+            if (!said.TryGetValue("protocol", out var protocol) || !(protocol is double spoken) || spoken != PlaytestClient.Protocol)
+                return OtherRelease;
+            var secret = said.TryGetValue("secret", out var given) ? Base64(given) : null;
+            if (secret == null || secret.Length < SecretBytes) return $"{path} has no usable secret";
+            var pid = (int)Json.Num(said, "pid", 0);
+            if (!Running(pid)) return RunEnded;
+            var why = CheckUrl(said.TryGetValue("url", out var url) ? url as string ?? "" : "", out var uri);
             if (why != null) return why;
-            brain = new BrainAddress { Url = Json.Str(said, "url"), Secret = secret };
+            invite = new Invite { Url = uri, Secret = secret, Pid = pid };
             return null;
         }
 
-        /// <summary>Why a run announced in brain.json isn't this project's, or null. The same rule and words as the Godot
-        /// and Unreal plugins: no `folders` (a brain before 0.1.1) is no filter; an unknown `match` is never a match.</summary>
-        public static string ForAnotherProject(Dictionary<string, object> said, string project, bool windowsPaths)
+        static byte[] Base64(object text)
         {
-            if (!said.TryGetValue("folders", out var folders) || folders == null || folders is List<object> none && none.Count == 0)
-                return null;
-            var match = said.TryGetValue("match", out var given) && given is string text ? text : "";
-            var named = new List<string>();
-            var separator = windowsPaths ? '\\' : '/';
-            var mine = windowsPaths ? Folder(project ?? "") : PosixFolder(project ?? "");
-            var found = false;
-            foreach (var entry in folders as List<object> ?? new List<object>())
+            try
             {
-                if (!(entry is string f)) continue;
-                named.Add($"\"{f}\"");
-                var theirs = windowsPaths ? Folder(f) : PosixFolder(f);
-                if (mine.Length == 0 || theirs.Length == 0) continue;
-                if (match == "exact") found |= mine == theirs;
-                else if (match == "related") found |= Within(mine, theirs, separator) || Within(theirs, mine, separator);
+                return text is string encoded ? Convert.FromBase64String(encoded) : null;
             }
-            if (found) return null;
-            return $"For another project: the run is for {(named.Count > 0 ? string.Join(" or ", named) : "no folder")} "
-                   + $"(match \"{match}\"), this project is \"{project}\"";
+            catch (FormatException)
+            {
+                return null;
+            }
         }
 
-        // Only ASCII letters are folded: each engine folds other letters its own way, and the three must compare alike.
-        static string Folder(string path)
-        {
-            var p = path.Replace('/', '\\');
-            if (p.Length < 3 || p[1] != ':' || p[2] != '\\' || !(p[0] >= 'A' && p[0] <= 'Z' || p[0] >= 'a' && p[0] <= 'z'))
-                return "";
-            while (p.Length > 3 && p[p.Length - 1] == '\\') p = p.Substring(0, p.Length - 1);
-            var folded = p.ToCharArray();
-            for (var i = 0; i < folded.Length; ++i)
-                if (folded[i] >= 'A' && folded[i] <= 'Z') folded[i] = (char)(folded[i] + 32);
-            return new string(folded);
-        }
-
-        static string PosixFolder(string path)
-        {
-            if (path.Length == 0 || path[0] != '/') return "";
-            while (path.Length > 1 && path[path.Length - 1] == '/') path = path.Substring(0, path.Length - 1);
-            return path;
-        }
-
-        static bool Within(string inner, string outer, char separator) =>
-            inner == outer || inner.StartsWith(outer[outer.Length - 1] == separator ? outer : outer + separator, StringComparison.Ordinal);
-
-        static bool Running(int pid)
+        public static bool Running(int pid)
         {
             if (pid <= 0) return false;
             try

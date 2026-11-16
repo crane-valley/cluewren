@@ -172,7 +172,7 @@ public sealed class Choice(Dictionary<string, string?> criteria) : Question
     }
 }
 
-public sealed class Noul : Question
+public sealed class YesNo : Question
 {
     public string? IfTrue { get; init; }
 

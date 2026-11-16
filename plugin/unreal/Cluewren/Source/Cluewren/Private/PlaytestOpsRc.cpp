@@ -24,7 +24,7 @@ namespace
 	{
 		if (PlaytestRefusal::DataPath(Path))
 		{
-			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under Saved/Cluewren is opened for rc"), *Path), Refusal);
+			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under .cluewren is opened for rc"), *Path), Refusal);
 			return nullptr;
 		}
 		UObject* Object = PlaytestJson::ResolveObject(Path);

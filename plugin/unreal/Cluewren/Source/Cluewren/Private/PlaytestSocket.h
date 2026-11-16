@@ -29,8 +29,11 @@ public:
 	~FPlaytestSocket();
 
 	EState GetState() const { return State; }
-	/** Why it closed, once Closed. */
-	FString GetCloseReason() const;
+	/** Why it closed, once Closed. The reason the other end gave is left out unless bWithItsWords: nothing it wrote is
+	 *  shown before it has proved itself. */
+	FString GetCloseReason(bool bWithItsWords) const;
+	/** The status the other end closed with, and its reason; 0 when it didn't close. */
+	int32 GetPeerClose(FString& OutReason) const;
 
 	/** Written to JSON on the writer thread. Any thread. */
 	void Send(const TSharedRef<FJsonObject>& Message);
@@ -79,6 +82,8 @@ private:
 
 	mutable FCriticalSection Lock;
 	FString CloseReason;
+	FString PeerReason;
+	int32 PeerCode = 0;
 	TArray<FOutgoing> Outbox;
 	TArray<TSharedPtr<FJsonObject>> Inbox;
 	// HINTERNETs: closing one is what wakes a thread blocked on it.

@@ -1,8 +1,8 @@
 // Modified by Crane Valley: renamed for Cluewren.
-// The CluewrenCodex commandlet's input assets (input/*.txt: input actions and mapping contexts) and data (data/*.txt:
+// The CluewrenExport commandlet's input assets (input/*.txt: input actions and mapping contexts) and data (data/*.txt:
 // user-defined enums and structs, curves and data assets; Main writes data tables and curve tables itself).
 
-#include "CluewrenCodexInternal.h"
+#include "CluewrenExportInternal.h"
 
 #include "Engine/UserDefinedEnum.h"
 #include "InputAction.h"
@@ -15,7 +15,7 @@
 #endif
 #include "UObject/UnrealType.h"
 
-namespace CluewrenCodex
+namespace CluewrenExport
 {
 	// ---------------------------------------------------------------- input and data
 

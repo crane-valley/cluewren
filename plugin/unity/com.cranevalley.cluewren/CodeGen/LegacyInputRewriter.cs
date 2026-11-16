@@ -1,5 +1,5 @@
 // Modified by Crane Valley: names renamed from Autopilot to Cluewren; an assembly that never names UnityEngine.Input is
-// passed over before it is read in full.
+// passed over before it is read in full; a Development build's assemblies are no longer rewritten for being one.
 // Points the game's calls to UnityEngine.Input's key, button, axis and mouse reads at Cluewren.LegacyInput
 // (Runtime/LegacyInput.cs), which answers as UnityEngine.Input would plus what the bridge's hands hold during a run.
 // The legacy Input Manager reads the operating system's own events, so nothing can be queued on it: this is the only way
@@ -7,7 +7,7 @@
 //
 // An IL post-processor: Unity runs it on each assembly it compiles, after the compiler (it finds post-processors only in
 // assemblies named Unity.*.CodeGen, hence this one's name). It rewrites only assemblies that get the bridge's runtime
-// too (its define constraint: the editor, Development builds, CLUEWREN_PLAYTEST), never Unity's own or the package's
+// too (its define constraint: the editor, or a project that defines CLUEWREN_PLAYTEST), never Unity's own or the package's
 // (Unity.*, UnityEngine.*, UnityEditor.*, Cluewren, Cluewren.*), and none with the scripting define CLUEWREN_NO_LEGACY_INPUT.
 // Each call keeps its arguments; only its target changes, to the member of LegacyInput with the same name and
 // signature. A rewritten assembly gets [assembly: LegacyInputRewritten(<calls>)], which hello and context count.
@@ -53,8 +53,7 @@ namespace Cluewren.CodeGen
             var defines = compiledAssembly.Defines ?? Array.Empty<string>();
             if (defines.Contains("CLUEWREN_NO_LEGACY_INPUT")) return false;
             // (the runtime's define constraint: where LegacyInput is compiled too)
-            if (!defines.Contains("UNITY_EDITOR") && !defines.Contains("DEVELOPMENT_BUILD") && !defines.Contains("CLUEWREN_PLAYTEST"))
-                return false;
+            if (!defines.Contains("UNITY_EDITOR") && !defines.Contains("CLUEWREN_PLAYTEST")) return false;
             return ReadsLegacyInput(compiledAssembly.InMemoryAssembly.PeData);
         }
 
@@ -85,7 +84,7 @@ namespace Cluewren.CodeGen
                 diagnostics.Add(new DiagnosticMessage
                 {
                     DiagnosticType = DiagnosticType.Warning,
-                    MessageData = $"Cluewren couldn't route {compiledAssembly.Name}'s UnityEngine.Input reads through the playtest bridge "
+                    MessageData = $"Cluewren couldn't route {compiledAssembly.Name}'s UnityEngine.Input reads through its bridge "
                                   + $"(its keys won't reach them): {e.GetType().Name}: {e.Message}",
                 });
                 return new ILPostProcessResult(compiledAssembly.InMemoryAssembly, diagnostics);

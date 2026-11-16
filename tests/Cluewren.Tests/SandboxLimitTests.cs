@@ -91,8 +91,8 @@ public sealed class SandboxLimitTests(ITestOutputHelper output) : IDisposable
     [Fact]
     public async Task A_start_that_fails_part_way_leaves_no_handle_open()
     {
-        var run = Directory.CreateDirectory(Path.Combine(_root, "run")).FullName;
-        File.WriteAllText(Path.Combine(run, "tmp"), "");
+        var work = Directory.CreateDirectory(Path.Combine(_root, "run", "work")).FullName;
+        File.WriteAllText(Path.Combine(work, "tmp"), "");
         await using var host = Host(SandboxMode.Contained);
         await Assert.ThrowsAsync<IOException>(() => host.ProbeAsync("1"));
         using var self = Process.GetCurrentProcess();

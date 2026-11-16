@@ -1,8 +1,8 @@
 // Modified by Crane Valley: renamed for Cluewren.
-// The CluewrenCodex commandlet's text helpers: how names, types and property values are written out, and the
+// The CluewrenExport commandlet's text helpers: how names, types and property values are written out, and the
 // properties that differ from a class's defaults (DiffProps).
 
-#include "CluewrenCodexInternal.h"
+#include "CluewrenExportInternal.h"
 
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
@@ -18,7 +18,7 @@
 #include "UObject/TextProperty.h"
 #include "UObject/UnrealType.h"
 
-namespace CluewrenCodex
+namespace CluewrenExport
 {
 	// ---------------------------------------------------------------- text helpers
 

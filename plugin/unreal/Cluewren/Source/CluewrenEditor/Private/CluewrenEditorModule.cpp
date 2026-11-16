@@ -27,12 +27,24 @@ namespace
 		return GEditor && GEditor->PlayWorld && World && World->HasBegunPlay();
 	}
 
-	/** Call Done once Condition holds (checked every tick), or with an error after the timeout. */
+	int32 SessionSerial()
+	{
+		const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
+		return Bridge ? Bridge->GetSessionSerial() : 0;
+	}
+
+	/** Call Done once Condition holds (checked every tick), or with an error after the timeout. Dropped without a call once
+	 *  the brain has begun another session: what was asked in one is never done or answered in the next. */
 	void WaitFor(TFunction<bool()> Condition, TFunction<void(const FString&)> Done)
 	{
 		const double Start = FPlatformTime::Seconds();
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Condition, Done, Start](float)
+		const int32 Serial = SessionSerial();
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Condition, Done, Start, Serial](float)
 		{
+			if (SessionSerial() != Serial)
+			{
+				return false;
+			}
 			if (Condition())
 			{
 				Done(FString());

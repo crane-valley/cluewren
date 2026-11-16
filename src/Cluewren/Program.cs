@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Text;
 using Cluewren.Bridge;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 using Cluewren.Mcp;
 using Cluewren.Sandbox;
@@ -105,15 +105,27 @@ async Task<int> RunHarness()
     var secret = Handshake.NewSecret();
     await using var server = await BridgeServer.StartAsync(secret, scope);
     server.Refusing += refusal => Console.WriteLine($"Refused an editor: {refusal}");
-    var announced = new Discovery(server.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow,
-        scope.Folders, scope.Match);
-    var path = DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder);
-
+    Invitation? invitation = null;
     try
     {
-        Console.WriteLine($"Waiting on {server.Url} for an editor whose project is {scope.Described}");
+        Console.WriteLine($"Looking for an editor whose project is {scope.Described}");
+        var chosen = await Rendezvous.ChooseAsync(Rendezvous.DefaultFolder, scope, BridgeServer.Protocol, Console.WriteLine,
+            cancel.Token);
+        server.Expect(ProjectScope.ExactlyThe(chosen.Folder));
+        var editor = chosen.Editor;
+        invitation = Rendezvous.Invite(Rendezvous.DefaultFolder, editor, server.Url, secret, BridgeServer.Protocol);
+        Console.WriteLine($"Invited the editor of {invitation.Editor.ProjectDir} ({invitation.Editor.Engine}) to {server.Url}");
         var link = await server.NextLinkAsync(cancel.Token);
         return await Cluewren.RunCommand.PlayAsync(link, positional[0], seconds, sandbox, cancel.Token);
+    }
+    catch (RendezvousException) when (cancel.IsCancellationRequested)
+    {
+        return 130;
+    }
+    catch (RendezvousException e)
+    {
+        Console.Error.WriteLine($"The run didn't start: {e.Message}");
+        return 1;
     }
     catch (OperationCanceledException)
     {
@@ -121,7 +133,8 @@ async Task<int> RunHarness()
     }
     finally
     {
-        DiscoveryFile.Withdraw(path, announced);
+        if (invitation is not null)
+            Rendezvous.Withdraw(invitation.Path, invitation.Invite);
     }
 }
 
@@ -135,10 +148,10 @@ namespace Cluewren
             try
             {
                 var key = ApiKeys.Find(ApiKeys.TypeSafeKey);
-                await using var jev = key is null ? null : new JevClient(new JevOptions(key));
+                await using var jev = key is null ? null : new JevClient(JevOptions.FromSettings(key));
                 await using var host = new HarnessHost(new HostOptions(link, runFolder)
                 {
-                    Jev = jev, Say = Console.WriteLine, Mode = sandbox,
+                    Decider = jev, Say = Console.WriteLine, Mode = sandbox,
                 });
                 var (map, problem) = await host.StartMapAsync(ct).ConfigureAwait(false);
                 if (problem is not null)
@@ -170,6 +183,11 @@ namespace Cluewren
             catch (SandboxException e)
             {
                 Console.Error.WriteLine($"The sandbox failed: {e.Message}");
+                return 1;
+            }
+            catch (DecisionException e)
+            {
+                Console.Error.WriteLine($"The run didn't start: {e.Message}");
                 return 1;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)

@@ -40,17 +40,11 @@ namespace
 		return (Name.StartsWith(TEXT("Set")) && Name.EndsWith(TEXT("PropertyByName"))) || Name == TEXT("SetCollisionProfileNameProperty");
 	}
 
-	bool ShortName(const FString& Part)
-	{
-		int32 Tilde = INDEX_NONE;
-		return Part.FindChar(TEXT('~'), Tilde) && Tilde >= 1 && Tilde <= 6 && Tilde + 1 < Part.Len() && FChar::IsDigit(Part[Tilde + 1]);
-	}
-
 	FString RefusedText(const FString& Text)
 	{
-		if ((Text.Contains(TEXT("/")) || Text.Contains(TEXT("\\"))) && DataPath(Text))
+		if (DataPath(Text))
 		{
-			return FString::Printf(TEXT("%s is refused: nothing under Saved/Cluewren is opened for rc"), *Text);
+			return FString::Printf(TEXT("%s is refused: nothing under .cluewren is opened for rc"), *Text);
 		}
 		return FString();
 	}
@@ -410,6 +404,102 @@ FString RefusedValue(const FProperty* Property, const void* ValuePtr)
 
 namespace
 {
+	// Windows drops dots and spaces from the end of a name, and name:stream or name::$INDEX_ALLOCATION opens the folder itself.
+	// A drive spec in front ("C:.cluewren") names that drive's current folder.
+	bool NamesData(FString Segment)
+	{
+		if (Segment.Len() >= 2 && Segment[0] < 128 && FChar::IsAlpha(Segment[0]) && Segment[1] == TEXT(':'))
+		{
+			Segment.RightChopInline(2);
+		}
+		int32 Colon = INDEX_NONE;
+		if (Segment.FindChar(TEXT(':'), Colon))
+		{
+			Segment.LeftInline(Colon);
+		}
+		while (Segment.EndsWith(TEXT(".")) || Segment.EndsWith(TEXT(" ")))
+		{
+			Segment.LeftChopInline(1);
+		}
+		if (Segment.Equals(TEXT(".cluewren"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+		// Any 8.3 name Windows could give the folder (CLUEWR~1 to ~4, then CL, four hex digits and ~N), without asking which
+		// one it gave: a few other names of that shape are refused too.
+		int32 Tilde = INDEX_NONE;
+		if (Segment.Len() > 8 || Segment.Contains(TEXT(".")) || !Segment.StartsWith(TEXT("CL"), ESearchCase::IgnoreCase)
+			|| !Segment.FindLastChar(TEXT('~'), Tilde) || Tilde + 1 >= Segment.Len())
+		{
+			return false;
+		}
+		for (int32 i = Tilde + 1; i < Segment.Len(); ++i)
+		{
+			if (Segment[i] < TEXT('0') || Segment[i] > TEXT('9'))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	int32 HexValue(ANSICHAR C)
+	{
+		if (C >= '0' && C <= '9')
+		{
+			return C - '0';
+		}
+		if (C >= 'a' && C <= 'f')
+		{
+			return C - 'a' + 10;
+		}
+		return C >= 'A' && C <= 'F' ? C - 'A' + 10 : -1;
+	}
+
+	// %00 stays as written: a NUL would end the decoded text before a segment after it.
+	FString PercentDecoded(const FString& Text)
+	{
+		const FTCHARToUTF8 Utf8(*Text);
+		const ANSICHAR* In = Utf8.Get();
+		TArray<ANSICHAR> Out;
+		Out.Reserve(Utf8.Length());
+		for (int32 i = 0; i < Utf8.Length(); ++i)
+		{
+			const int32 High = In[i] == '%' && i + 2 < Utf8.Length() ? HexValue(In[i + 1]) : -1;
+			const int32 Low = High >= 0 ? HexValue(In[i + 2]) : -1;
+			if (Low >= 0 && High * 16 + Low != 0)
+			{
+				Out.Add((ANSICHAR)(High * 16 + Low));
+				i += 2;
+			}
+			else
+			{
+				Out.Add(In[i]);
+			}
+		}
+		const FUTF8ToTCHAR Decoded(Out.GetData(), Out.Num());
+		return FString(Decoded.Length(), Decoded.Get());
+	}
+
+	bool Names(const FString& Text)
+	{
+		for (const FString& Form : {Text, Text.Contains(TEXT("%")) ? PercentDecoded(Text) : FString()})
+		{
+			TArray<FString> Segments;
+			Form.Replace(TEXT("\\"), TEXT("/")).ParseIntoArray(Segments, TEXT("/"));
+			for (const FString& Segment : Segments)
+			{
+				if (NamesData(Segment))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// By the names in the text alone, whatever comes before them: nothing the string names is opened, so no other name of
+	// the project's root and no share or device behind it is reached by the check.
 	bool DecidePath(const FString& Path)
 	{
 		FString Clean = Path.TrimStartAndEnd().Replace(TEXT("\\"), TEXT("/"));
@@ -418,11 +508,10 @@ namespace
 		{
 			Clean = Clean.Mid(Quote + 1, Clean.Len() - Quote - 2);
 		}
-		if (Clean.IsEmpty())
+		if (Names(Path) || Names(Clean))
 		{
-			return false;
+			return true;
 		}
-		FString File = Clean;
 		if (Clean.StartsWith(TEXT("/")) && !Clean.StartsWith(TEXT("//")))
 		{
 			// A package path walks out of its mount point only with .. or . parts, which no package name has.
@@ -433,28 +522,7 @@ namespace
 			FString Filename;
 			if (FPackageName::TryConvertLongPackageNameToFilename(FPackageName::ObjectPathToPackageName(Clean), Filename))
 			{
-				File = Filename;
-			}
-		}
-		const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
-		const FString Full = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), File);
-		const FString Data = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Cluewren"));
-		if (Full.Equals(Data, ESearchCase::IgnoreCase) || Full.StartsWith(Data + TEXT("/"), ESearchCase::IgnoreCase))
-		{
-			return true;
-		}
-		if (!Full.StartsWith(Root, ESearchCase::IgnoreCase))
-		{
-			return false;
-		}
-		// A Windows 8.3 short name (SAVED~1) names the same folder under another spelling.
-		TArray<FString> Parts;
-		Full.Mid(Root.Len()).ParseIntoArray(Parts, TEXT("/"));
-		for (const FString& Part : Parts)
-		{
-			if (ShortName(Part))
-			{
-				return true;
+				return Names(Filename);
 			}
 		}
 		return false;

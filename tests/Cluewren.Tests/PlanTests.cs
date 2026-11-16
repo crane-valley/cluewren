@@ -18,7 +18,7 @@ public sealed class RecordingJev(string likes) : IDecider
         }
     }
 
-    public Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+    public Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
     {
         using var state = JsonDocument.Parse(request.StateJson());
         lock (_calls)

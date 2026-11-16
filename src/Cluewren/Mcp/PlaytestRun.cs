@@ -5,7 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Cluewren.Bridge;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 using Cluewren.Sandbox;
 
@@ -26,7 +26,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     public const double DefaultBudget = 1800;
     public const double IdleSeconds = 1200;
     public const double PlayGrace = 90;
-    public const int MinJevDecisions = 3;
+    public const int MinDecisions = 3;
     const string DefaultExploreMinutes = "10";
     const int BriefFile = 12000;
     const int BriefRuns = 8;
@@ -84,28 +84,41 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     public string Opening { get; private set; } = "";
 
-    // A C# Godot project compiles every .cs it finds outside dot folders, which a run's harness.cs must not be part of.
-    public static string MemoryFolder(string project) => File.Exists(Path.Combine(project, "project.godot"))
-        ? Path.Combine(project, ".godot", "cluewren")
-        : IsUnreal(project) ? Path.Combine(project, "Saved", "Cluewren")
-        : Path.Combine(project, "UserSettings", "Cluewren");
+    // One place whatever the engine. A dot folder: no engine imports it, and a C# Godot project compiles every .cs it
+    // finds outside dot folders, which a run's harness.cs must not be part of.
+    public static string HomeFolder(string project) => Path.Combine(project, ".cluewren");
 
-    static bool IsUnreal(string project) => Directory.Exists(project) && Directory.EnumerateFiles(project, "*.uproject").Any();
+    public static string MemoryFolder(string project) => Path.Combine(HomeFolder(project), "memory");
 
-    public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IJevRelay jev, string client,
+    public static string RunsFolder(string project) => Path.Combine(HomeFolder(project), "runs");
+
+    public static string ExportFolder(string project) => Path.Combine(HomeFolder(project), "export");
+
+    // Requests, reports and the project as text stay out of the user's repository unless the user edits this file (to
+    // share memory/ with a team, say).
+    static void MakeHome(string project)
+    {
+        Directory.CreateDirectory(MemoryFolder(project));
+        var ignore = Path.Combine(HomeFolder(project), ".gitignore");
+        if (!File.Exists(ignore))
+            File.WriteAllText(ignore, "*\n", Utf8);
+    }
+
+    public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IDecisionRelay jev, string client,
         SandboxMode sandbox, CancellationToken ct = default)
     {
         var project = await StartGameAsync(link, request.Level, ct).ConfigureAwait(false);
+        MakeHome(project);
         var memory = MemoryFolder(project);
         var id = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
-        var runFolder = Path.Combine(memory, "runs", id);
+        var runFolder = Path.Combine(RunsFolder(project), id);
         Directory.CreateDirectory(runFolder);
         if (OperatingSystem.IsWindows())
-            WindowsContainer.RetireLeftovers(Path.Combine(memory, "runs"), runFolder);
+            WindowsContainer.RetireLeftovers(RunsFolder(project), runFolder);
         var recorder = new FrameRecorder(link);
         var host = new HarnessHost(new HostOptions(link, runFolder)
         {
-            Jev = jev, ProjectFolder = memory, Recorder = recorder, Mode = sandbox,
+            Decider = jev, ProjectFolder = memory, Recorder = recorder, Mode = sandbox,
         });
         if (!string.IsNullOrEmpty(request.Level))
             host.Game.Level = request.Level;
@@ -152,7 +165,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     async Task PrepareAsync(CancellationToken ct)
     {
-        await WaitForExportAsync(Path.Combine(_project, EngineTexts[_link.Engine].Export), ExportPatience, ct).ConfigureAwait(false);
+        await WaitForExportAsync(ExportFolder(_project), ExportPatience, ct).ConfigureAwait(false);
         _link.Send(json => json.WriteString("type", "run_started"));
         await _recorder.FilmAsync(ct: ct).ConfigureAwait(false);
         var opening = await _host.OpeningAsync(ct).ConfigureAwait(false);
@@ -200,25 +213,26 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     public static string SkillText() => Resource("Skill.md");
 
-    static readonly Dictionary<string, (string Code, string Export, string Contents, string Kit)> EngineTexts = new()
+    static readonly Dictionary<string, (string Code, string Contents, string Kit)> EngineTexts = new()
     {
-        [Unity.Id] = ("its code is under Assets/ and Packages/", "Library/CluewrenCodex",
+        [Unity.Id] = ("its code is under Assets/ and Packages/",
             "the project as text: summary.txt first, then scenes/, prefabs/, data/, scripts.txt, build_scenes.txt", "KIT-UNITY.md"),
-        [Godot.Id] = ("scripts, scenes (.tscn) and resources (.tres) are text files in it", ".godot/cluewren_codex",
+        [Godot.Id] = ("scripts, scenes (.tscn) and resources (.tres) are text files in it",
             "summary.txt: the main scene, autoloads, input actions, classes and each scene's nodes", "KIT-GODOT.md"),
-        [Unreal.Id] = ("C++ is under Source/ and settings under Config/; Blueprints are binary, so read them in the export", "Saved/CluewrenCodex",
+        [Unreal.Id] = ("C++ is under Source/ and settings under Config/; Blueprints are binary, so read them in the export",
             "the project as text: summary.txt first, then blueprints/, input/, data/, assets.txt, maps.txt", "KIT-UNREAL.md"),
     };
 
     string InstructionsText(string engine) => Resource("Instructions.md")
         .Replace("{engine}", CultureInfo.InvariantCulture.TextInfo.ToTitleCase(engine))
         .Replace("{code_folders}", EngineTexts[engine].Code)
-        .Replace("{export_folder}", EngineTexts[engine].Export)
+        .Replace("{export}", ExportFolder(_project))
         .Replace("{export_contents}", EngineTexts[engine].Contents)
-        .Replace("{project}", _project).Replace("{memory}", _memory).Replace("{run}", RunFolder)
+        .Replace("{project}", _project).Replace("{memory}", _memory).Replace("{runs}", RunsFolder(_project))
+        .Replace("{run}", RunFolder)
         .Replace("{probe_seconds}", ProbeSeconds.ToString(CultureInfo.InvariantCulture))
         .Replace("{research_minutes}", (ResearchSeconds / 60).ToString(CultureInfo.InvariantCulture))
-        .Replace("{min_decisions}", MinJevDecisions.ToString(CultureInfo.InvariantCulture))
+        .Replace("{min_decisions}", MinDecisions.ToString(CultureInfo.InvariantCulture))
         .Replace("{max_frames}", FrameRecorder.MaxFrames.ToString(CultureInfo.InvariantCulture))
         .Replace("{max_fps}", FrameRecorder.MaxFps.ToString(CultureInfo.InvariantCulture))
         .Replace("{kit}", Resource("KIT.md") + Environment.NewLine + Resource(EngineTexts[engine].Kit));
@@ -268,6 +282,11 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         }
     }
 
+    const string KitFile = "kit.txt";
+
+    // What lib.cs and a reused harness were written against: without the commit a build carries after the plus.
+    public static string KitVersion { get; } = BridgeServer.Version.Split('+')[0];
+
     string Briefing(string? levels, string opening)
     {
         var parts = new List<string>();
@@ -281,10 +300,14 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (notes is null && lib is null)
             parts.Add("## notes.md, lib.cs\nNone yet: the first request on this game.");
         var runs = EarlierRuns();
+        if (Read(Path.Combine(_memory, KitFile), 60) is { } kit && kit != KitVersion && (lib is not null || runs.Count > 0))
+            parts.Add($"## The kit changed\nlib.cs and the earlier harnesses were last used with kit {kit}; this is kit "
+                + $"{KitVersion}. What they call may have changed: when one doesn't compile, fix it against the kit in "
+                + "INSTRUCTIONS.md (lib.cs first: every harness and probe compiles with it).");
         if (runs.Count > 0)
             parts.Add("## Earlier runs (each folder keeps its harness versions, traces and report; use_harness copies one's harness here)\n"
                 + string.Join("\n", runs.TakeLast(BriefRuns)));
-        var hits = WordHits(_project, _request.Request);
+        var hits = WordHits(_project, _link.Engine, _request.Request);
         if (hits is not null)
             parts.Add("## Where the request's words appear in the project (files, with how often)\n" + string.Join("\n", hits));
         parts.Add($"## The live game now (looked at just before you started; it is paused)\n{opening}");
@@ -292,9 +315,9 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     }
 
     // The name comes from the model: it counts only if it is one of the folders listed, so it can't walk out of runs/.
-    public static string? EarlierHarness(string memory, string thisRun, string? run)
+    public static string? EarlierHarness(string runs, string thisRun, string? run)
     {
-        var folders = Directory.GetDirectories(Path.Combine(memory, "runs"));
+        var folders = Directory.GetDirectories(runs);
         var id = Path.GetFileName(run?.TrimEnd('/', '\\'));
         var folder = id == thisRun ? null : folders.FirstOrDefault(path => Path.GetFileName(path) == id);
         var harness = folder is null ? null : Path.Combine(folder, "harness.cs");
@@ -303,7 +326,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     List<string> EarlierRuns()
     {
-        var folder = Path.Combine(_memory, "runs");
+        var folder = RunsFolder(_project);
         var lines = new List<string>();
         foreach (var run in Directory.GetDirectories(folder).Order(StringComparer.Ordinal))
         {
@@ -353,13 +376,12 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         return count;
     }
 
-    public static IEnumerable<string> SearchedFiles(string project) =>
-        File.Exists(Path.Combine(project, "project.godot")) ? GodotFiles(project)
-        : IsUnreal(project) ? UnrealFiles(project) : UnityFiles(project);
+    public static IEnumerable<string> SearchedFiles(string project, string engine) =>
+        engine == Godot.Id ? GodotFiles(project) : engine == Unreal.Id ? UnrealFiles(project) : UnityFiles(project);
 
     static IEnumerable<string> UnrealFiles(string project)
     {
-        foreach (var folder in new[] { Path.Combine(project, "Source"), Path.Combine(project, "Saved", "CluewrenCodex") }.Where(Directory.Exists))
+        foreach (var folder in new[] { Path.Combine(project, "Source"), ExportFolder(project) }.Where(Directory.Exists))
             foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
                 if (UnrealText.Contains(Path.GetExtension(file)))
                     yield return file;
@@ -379,14 +401,14 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     static IEnumerable<string> UnityFiles(string project)
     {
         var folders = new[] { Path.Combine(project, "Assets") }
-            .Concat(SearchedExport.Select(name => Path.Combine(project, "Library", "CluewrenCodex", name)));
+            .Concat(SearchedExport.Select(name => Path.Combine(ExportFolder(project), name)));
         foreach (var folder in folders.Where(Directory.Exists))
             foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
                 if (file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
                     yield return file;
     }
 
-    public static List<string>? WordHits(string project, string prompt)
+    public static List<string>? WordHits(string project, string engine, string prompt)
     {
         var words = new List<string>();
         foreach (Match match in Words().Matches(prompt))
@@ -400,7 +422,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (words.Count == 0)
             return null;
         var files = new List<(string Rel, Dictionary<string, int> Hits, string Name)>();
-        foreach (var file in SearchedFiles(project))
+        foreach (var file in SearchedFiles(project, engine))
         {
             try
             {
@@ -538,7 +560,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
             case "probe":
                 return ToolResult.Say(await ProbeAsync(Text(args, "code") ?? "", ct).ConfigureAwait(false));
             case "use_harness":
-                if (EarlierHarness(_memory, RunId, Text(args, "run")) is not { } earlier)
+                if (EarlierHarness(RunsFolder(_project), RunId, Text(args, "run")) is not { } earlier)
                     return ToolResult.Say($"No earlier run {Text(args, "run")} with a harness: the briefing lists them.", true);
                 File.Copy(earlier, Path.Combine(RunFolder, "harness.cs"), true);
                 return ToolResult.Say($"harness.cs is now {earlier}'s. Edit what this request changes, or run it as it is.");
@@ -618,8 +640,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (_host.Episodes == 0 && upper != "INCONCLUSIVE")
             return "Not reported: no run_harness episode has been played yet. Write harness.cs and run it: the outcome must rest on an "
                 + "episode in which Jev played (probes only check assumptions). Report INCONCLUSIVE if the game can't be played at all.";
-        if (_host.MostDecisions < MinJevDecisions && upper != "INCONCLUSIVE")
-            return $"Not reported: in no episode did Jev make {MinJevDecisions} decisions (the most: {_host.MostDecisions}). Options that "
+        if (_host.MostDecisions < MinDecisions && upper != "INCONCLUSIVE")
+            return $"Not reported: in no episode did Jev make {MinDecisions} decisions (the most: {_host.MostDecisions}). Options that "
                 + "run alone are a script, not Jev playing. Give Jev real choices: at its decision points offer 2+ legal options that are "
                 + "each a sensible thing to do now (e.g. which target, approach or action next, or keep going vs. something else), then run again.";
         if (Flag(args, "visual", false) && _described == 0 && upper is "CONFIRMED" or "DENIED")
@@ -636,6 +658,10 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         return "Reported. You can stop now.";
     }
 
+    public void StopPlaying() => _host.EndEpisode();
+
+    public void ForgetStop() => _host.ForgetStop();
+
     public async Task WatchAsync(CancellationToken ct)
     {
         try
@@ -643,6 +669,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
             while (Ended is null)
             {
                 await Task.Delay(1000, ct).ConfigureAwait(false);
+                if (Ended is not null)
+                    break;
                 var why = _link.Closed is { } closed ? $"the game went away ({closed})"
                     : OutOfTime() ? $"its {_playSeconds!.Value / 60:0} minutes of play were up"
                     : Elapsed > _budget ? "timed out"
@@ -663,7 +691,9 @@ public sealed partial class PlaytestRun : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException)
+        // A run reported and disposed during the second this slept has nothing left to watch: its link reads as closed
+        // and its lock is gone.
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException)
         {
         }
     }
@@ -686,10 +716,12 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         report["episodes"] = _host.Episodes;
         report["stopped"] = stopped;
         report["client"] = _client;
+        report["kit"] = KitVersion;
         report["level_modified"] = inPlay;
         report["research_modified"] = research;
         File.WriteAllText(Path.Combine(RunFolder, "report.json"),
             report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), Utf8);
+        File.WriteAllText(Path.Combine(_memory, KitFile), KitVersion, Utf8);
         Ended = stopped ?? "reported";
         try
         {

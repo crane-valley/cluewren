@@ -1,4 +1,5 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren; DataPath names UserSettings/Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; DataPath tells a path that names a project's
+// .cluewren folder.
 // Object paths for the bridge (rc, find, transforms, watch, view...). Readable, stable for the life of the object,
 // unambiguous with duplicate names and with '/', '|', '@', ':' in names:
 //
@@ -19,7 +20,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using Object = UnityEngine.Object;
@@ -259,35 +259,53 @@ namespace Cluewren
 
         // -- reading paths ---------------------------------------------------------------------------------
 
-        static readonly Regex ShortName = new Regex("^[^~]{1,6}~[0-9]+");
+        public const string DataFolder = ".cluewren";
 
-        // UserSettings/Cluewren holds what harness code may write: rc and a restart never open a path into it. An 8.3 short
-        // name (USERSE~1) is the same folder under another spelling.
+        // <project>/.cluewren holds what harness code may write: rc and a restart never take a path that names it.
+        // Told by the text alone, wherever in the path the name stands and whatever stands before it: what a string
+        // from harness code names is not opened or looked up to see where it leads, which would have effects of its
+        // own (a connection to another machine in this user's name) and no end of cases. A link that leads into the
+        // folder under a name of its own is the user's, and is not looked for.
         public static bool DataPath(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
-            // An object path (Main:/Player) has its colon past a drive letter's: no file path does, and it is on every tick.
-            var colon = path.IndexOf(':');
-            if (colon >= 0 && colon != 1) return false;
-            string root, full;
-            try
+            if (NamesDataFolder(path)) return true;
+            // (file:///C:/p/%2Ecluewren/x)
+            return path.IndexOf('%') >= 0 && NamesDataFolder(Uri.UnescapeDataString(path));
+        }
+
+        static bool NamesDataFolder(string text)
+        {
+            var first = true;
+            foreach (var segment in text.Split('/', '\\'))
             {
-                root = Path.GetFullPath(Path.GetDirectoryName(Application.dataPath) ?? "").TrimEnd('\\', '/');
-                full = Path.GetFullPath(Path.Combine(root, path.Trim()));
+                var name = segment;
+                // (C:.cluewren is .cluewren in the folder the process is in on that drive)
+                if (first && name.Length >= 2 && name[1] == ':') name = name.Substring(2);
+                first = false;
+                // As Windows reads a name: a stream or an attribute after ':' (.cluewren::$INDEX_ALLOCATION) and
+                // dots and spaces at the end still name the folder itself.
+                var colon = name.IndexOf(':');
+                if (colon >= 0) name = name.Substring(0, colon);
+                name = name.TrimEnd('.', ' ');
+                if (string.Equals(name, DataFolder, StringComparison.OrdinalIgnoreCase) || ShortNameOfDataFolder(name)) return true;
             }
-            catch (PathTooLongException)
-            {
-                return true;
-            }
-            catch (Exception e) when (e is ArgumentException || e is NotSupportedException)
-            {
-                return false;
-            }
-            if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return false;
-            var parts = full.Substring(root.Length + 1).Split('\\', '/');
-            return parts.Any(part => ShortName.IsMatch(part))
-                   || parts.Length >= 2 && string.Equals(parts[0], "UserSettings", StringComparison.OrdinalIgnoreCase)
-                                       && string.Equals(parts[1], "Cluewren", StringComparison.OrdinalIgnoreCase);
+            return false;
+        }
+
+        // An 8.3 name Windows could have given the folder: CLUEWR~1 to ~4, then two letters, four hexadecimal digits
+        // and ~N. Which one it gave is not asked of the system, so every name of that shape is refused, and with it a
+        // few names of other things (CLIENT~1).
+        static bool ShortNameOfDataFolder(string name)
+        {
+            if (name.Length > 8 || name.IndexOf('.') >= 0) return false;
+            if (string.Compare(name, 0, DataFolder, 1, 2, StringComparison.OrdinalIgnoreCase) != 0) return false;
+            var tilde = name.LastIndexOf('~');
+            if (tilde < 2 || tilde == name.Length - 1) return false;
+            for (var i = tilde + 1; i < name.Length; ++i)
+                if (name[i] < '0' || name[i] > '9')
+                    return false;
+            return true;
         }
 
         /// <summary>What a path names: a GameObject, a Component, a Type (static), another Unity object, or null.</summary>

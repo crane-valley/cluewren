@@ -42,10 +42,17 @@ FPlaytestSocket::~FPlaytestSocket()
 	FPlatformProcess::ReturnSynchEventToPool(ReaderDone);
 }
 
-FString FPlaytestSocket::GetCloseReason() const
+FString FPlaytestSocket::GetCloseReason(bool bWithItsWords) const
 {
 	FScopeLock Locked(&Lock);
-	return CloseReason;
+	return bWithItsWords && !PeerReason.IsEmpty() ? CloseReason + TEXT(" ") + PeerReason : CloseReason;
+}
+
+int32 FPlaytestSocket::GetPeerClose(FString& OutReason) const
+{
+	FScopeLock Locked(&Lock);
+	OutReason = PeerReason;
+	return PeerCode;
 }
 
 void FPlaytestSocket::Send(const TSharedRef<FJsonObject>& Message)
@@ -123,7 +130,11 @@ bool FPlaytestSocket::Connect(const FString& Host, int32 Port, const FString& Pa
 	}
 	// Receive 0: a run can be quiet for as long as the brain likes.
 	WinHttpSetTimeouts(R, ConnectMilliseconds, ConnectMilliseconds, 0, 0);
-	if (!WinHttpSetOption(R, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)
+	// WinHTTP's defaults follow a redirect and answer an NTLM or Negotiate challenge with this user's logon: whatever
+	// listens on the invite's port could send the request elsewhere, or take the logon, before any welcome is verified.
+	DWORD Off = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_AUTHENTICATION | WINHTTP_DISABLE_COOKIES;
+	if (!WinHttpSetOption(R, WINHTTP_OPTION_DISABLE_FEATURE, &Off, sizeof(Off))
+		|| !WinHttpSetOption(R, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)
 		|| !WinHttpSendRequest(R, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
 		|| !WinHttpReceiveResponse(R, nullptr))
 	{
@@ -188,7 +199,10 @@ void FPlaytestSocket::ReadLoop(const FString& Host, int32 Port, const FString& P
 				BYTE Reason[123];
 				DWORD ReasonBytes = 0;
 				WinHttpWebSocketQueryCloseStatus(W, &Code, Reason, sizeof(Reason), &ReasonBytes);
-				Why = FString::Printf(TEXT("%u %s"), Code, *FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Reason), ReasonBytes)));
+				Why = FString::Printf(TEXT("%u"), Code);
+				FScopeLock Locked(&Lock);
+				PeerCode = Code;
+				PeerReason = FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Reason), ReasonBytes));
 			}
 			else
 			{

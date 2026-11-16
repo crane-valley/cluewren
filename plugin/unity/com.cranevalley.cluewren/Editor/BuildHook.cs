@@ -1,9 +1,10 @@
-// Modified by Crane Valley: a build no longer bakes in the editor's path, since a player no longer starts the editor.
-// Player builds: the bridge's runtime is compiled only into Development builds (or with the scripting define
-// CLUEWREN_PLAYTEST: its assembly's define constraint), so a release build has none of it. For a build that has it, the
-// first scene gets a hidden PlaytestBuildInfo: the project's productGUID (hello's project_id), and where the project
-// was, so the player can serve the codex when it runs on the build machine; and the legacy Input Manager's axes, for
-// LegacyInput.
+// Modified by Crane Valley: a build no longer bakes in the editor's path, since a player no longer starts the editor;
+// a Development build no longer has the bridge unless the project asks for it.
+// Player builds: the bridge's runtime is compiled only into a build of a project with the scripting define
+// CLUEWREN_PLAYTEST (its assembly's define constraint), Development or not, so any other build has none of it. For a
+// build that has it, the first scene gets a hidden PlaytestBuildInfo: the project's productGUID (hello's project_id),
+// and where the project was, which the player advertises and the brain matches with a run's project; and the legacy
+// Input Manager's axes, for LegacyInput.
 
 using System.Linq;
 using UnityEditor;
@@ -12,22 +13,40 @@ using UnityEditor.Build.Reporting;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Cluewren.Tests")]
+
 namespace Cluewren.Editor
 {
     sealed class BuildHook : IProcessSceneWithReport
     {
+        const string Define = "CLUEWREN_PLAYTEST";
+
         public int callbackOrder => 0;
+
+        // A dedicated server is a subtarget of the standalone platforms with scripting defines of its own.
+        internal static NamedBuildTarget NamedTarget(BuildTarget platform, int subtarget)
+        {
+            var group = BuildPipeline.GetBuildTargetGroup(platform);
+            return group == BuildTargetGroup.Standalone && subtarget == (int)StandaloneBuildSubtarget.Server
+                ? NamedBuildTarget.Server : NamedBuildTarget.FromBuildTargetGroup(group);
+        }
+
+        internal static bool Defined(string settings, string[] extra) =>
+            settings.Split(';').Contains(Define) || extra != null && extra.Contains(Define);
 
         public static bool Included(BuildReport report)
         {
-            if ((report.summary.options & BuildOptions.Development) != 0) return true;
-            var target = NamedBuildTarget.FromBuildTargetGroup(BuildPipeline.GetBuildTargetGroup(report.summary.platform));
-            return PlayerSettings.GetScriptingDefineSymbols(target).Split(';').Contains("CLUEWREN_PLAYTEST");
+            var summary = report.summary;
+            // (the defines a script gave this one build, BuildOptionsNote: only a player build has them)
+            var extra = summary.buildType == BuildType.Player && BuildOptionsNote.Platform == summary.platform ? BuildOptionsNote.ExtraDefines : null;
+            var standalone = BuildPipeline.GetBuildTargetGroup(summary.platform) == BuildTargetGroup.Standalone;
+            var subtarget = standalone ? (int)summary.GetSubtarget<StandaloneBuildSubtarget>() : 0;
+            return Defined(PlayerSettings.GetScriptingDefineSymbols(NamedTarget(summary.platform, subtarget)), extra);
         }
 
         public void OnProcessScene(Scene scene, BuildReport report)
         {
-            if (report == null || !Included(report)) return;  // (play mode in the editor, or a release build)
+            if (report == null || !Included(report)) return;  // (play mode in the editor, or a build without the bridge)
             var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
             if (first == null || first.path != scene.path) return;
             var go = new GameObject("CluewrenBuildInfo") { hideFlags = HideFlags.HideInHierarchy };
@@ -36,6 +55,21 @@ namespace Cluewren.Editor
             info.projectDir = EditorHost.ProjectDirOf(Application.dataPath);
             info.legacyAxes = Json.Write(LegacyAxes.Read());
             SceneManager.MoveGameObjectToScene(go, scene);
+        }
+    }
+
+    // BuildPlayerOptions.extraScriptingDefines compile a build with defines that no setting holds, and the report of
+    // the build doesn't tell them: they are noted here, where every player build passes before it starts.
+    sealed class BuildOptionsNote : BuildPlayerProcessor
+    {
+        public static BuildTarget Platform { get; private set; }
+        public static string[] ExtraDefines { get; private set; }
+
+        public override void PrepareForBuild(BuildPlayerContext buildPlayerContext)
+        {
+            var options = buildPlayerContext.BuildPlayerOptions;
+            Platform = options.target;
+            ExtraDefines = options.extraScriptingDefines;
         }
     }
 }

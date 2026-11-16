@@ -1,4 +1,4 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren; a restart never opens a scene in UserSettings/Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; a restart never opens a scene in the project's .cluewren folder.
 // The brain's requests (docs/protocol.md), handled on the main thread.
 
 using System;
@@ -223,14 +223,40 @@ namespace Cluewren
             return new Dictionary<string, object> { ["levels"] = levels, ["open"] = playing, ["playing"] = playing };
         }
 
+        public static bool RefusesScene(PlaytestClient client, long id, string scene)
+        {
+            if (!Paths.DataPath(scene)) return false;
+            client.RespondError(id, $"{scene} is refused: nothing in .cluewren is opened as a scene", 403);
+            return true;
+        }
+
+        // A session's map comes from harness code, and is a scene's name, a build index or a path below the project as
+        // Unity writes one (Assets/Scenes/Main.unity). What names a drive, a share, a device or a way out of the folder
+        // is no scene of the project and is answered so unseen: to ask the file system for it is already the effect (a
+        // share is on a machine, which is then connected to in this user's name).
+        public static bool MapOutsideProject(string map)
+        {
+            if (map.IndexOf(':') >= 0) return true;
+            var segments = map.Split('/', '\\');
+            if (segments.Length == 1) return false;
+            foreach (var segment in segments)
+                if (segment.TrimEnd('.', ' ').Length == 0)
+                    return true;
+            return false;
+        }
+
+        public static void NoScene(PlaytestClient client, long id, string map) =>
+            client.RespondError(id, $"No scene {map} in the project", 404);
+
         /// <summary>Reopen the launch scene (or `map`: a scene name, path or build index) and answer once it is loaded.</summary>
         public static void Restart(PlaytestClient client, long id, string map)
         {
             var target = string.IsNullOrEmpty(map) ? LaunchScene : map;
             if (string.IsNullOrEmpty(target)) target = SceneManager.GetActiveScene().path;
-            if (Paths.DataPath(target))
+            if (RefusesScene(client, id, target)) return;
+            if (!string.IsNullOrEmpty(map) && MapOutsideProject(map))
             {
-                client.RespondError(id, $"{target} is refused: nothing in UserSettings/Cluewren is opened as a scene", 403);
+                NoScene(client, id, map);
                 return;
             }
             Hands.ReleaseAll();

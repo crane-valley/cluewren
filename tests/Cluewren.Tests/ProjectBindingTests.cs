@@ -49,10 +49,10 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         Assert.Contains(foo, message);
         Assert.DoesNotContain(sibling, message);
         await AssertNoLinkAsync(server);
-        var text = McpServer.NoEditorText(server, 60);
-        Assert.Contains(foo, text);
+        var text = McpServer.NotConnectedText(server, new EditorAdvert(1, "a", "unity", foo, 2, 2), 60);
+        Assert.Contains($"The editor of {foo} (unity) was invited and didn't connect within 60 s", text);
         Assert.Contains($"{sibling}: another project", text);
-        Assert.Contains("own Cluewren window", text);
+        Assert.Contains("Its Cluewren window shows why", text);
     }
 
     [Fact]
@@ -70,19 +70,19 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
 
     // Regression: a 0.1.0 plugin, whose hello carries no project, was welcomed.
     [Fact]
-    public async Task A_hello_without_a_mac_gets_a_fixed_text()
+    public async Task A_hello_without_a_project_and_its_mac_gets_a_fixed_text()
     {
         var foo = Folder("Foo");
         await using var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(foo));
         var hello = new Dictionary<string, object?>
         {
-            ["type"] = "hello", ["protocol"] = 1, ["nonce"] = Convert.ToBase64String(Handshake.NewNonce()),
+            ["type"] = "hello", ["protocol"] = BridgeServer.Protocol, ["nonce"] = Convert.ToBase64String(Handshake.NewNonce()),
         };
-        Assert.Equal(BridgeServer.NoMac, await RefusedAsync(server.Url, hello));
+        Assert.Equal(BridgeServer.NotAuthenticated, await RefusedAsync(server.Url, hello));
         await AssertNoLinkAsync(server);
     }
 
-    // Regression: a peer that can't read brain.json (another user's process) made the brain open a folder it named, or
+    // Regression: a peer that can't read the invite (another user's process) made the brain open a folder it named, or
     // learnt the run's folder from the refusal.
     [Fact]
     public async Task A_hello_with_a_wrong_mac_touches_no_file_and_names_no_folder()
@@ -242,7 +242,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
-    public async Task A_junction_to_the_project_is_announced_and_matches_by_identity()
+    public async Task A_junction_to_the_project_matches_by_identity()
     {
         if (!OperatingSystem.IsWindows())
             return;
@@ -251,9 +251,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(0, await RunAsync("cmd.exe", "/c", "mklink", "/J", link, foo));
         try
         {
-            var scope = ProjectScope.Related(link);
-            Assert.Equal([link, foo], scope.Folders, StringComparer.OrdinalIgnoreCase);
-            foreach (var exact in new[] { ProjectScope.ExactlyAt(link), scope })
+            foreach (var exact in new[] { ProjectScope.ExactlyAt(link), ProjectScope.Related(link) })
             {
                 await using var server = await BridgeServer.StartAsync(Secret, exact);
                 await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
@@ -290,52 +288,43 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
-    public void The_announced_folders_are_full_paths_without_a_trailing_separator_or_prefix()
+    public void The_folder_a_scope_names_is_a_full_path_without_a_trailing_separator()
     {
         var foo = Folder(@"Games\Foo");
-        Assert.Equal([foo], Announced(foo + @"\"));
-        Assert.Equal([foo], Announced(foo.Replace('\\', '/')));
-        using (var exact = ProjectScope.ExactlyAt(foo))
-            Assert.Equal("exact", exact.Match);
-        using (var related = ProjectScope.Related(foo))
-            Assert.Equal("related", related.Match);
+        Assert.Equal(foo, Named(foo + @"\"));
+        Assert.Equal(foo, Named(foo.Replace('\\', '/')));
         var root = Path.GetPathRoot(foo)!;
-        Assert.Equal([root], Announced(root));
-        if (OperatingSystem.IsWindows() && ShortName(Folder("A long folder name")) is { } shortName
-            && !shortName.EndsWith("A long folder name", StringComparison.Ordinal))
-        {
-            var announced = Announced(shortName);
-            Assert.Equal([shortName, Path.Combine(_root, "A long folder name")], announced, StringComparer.OrdinalIgnoreCase);
-        }
-        else
-            output.WriteLine("8.3 names are off on this volume: the short-name announcement was not checked.");
-        Assert.All(Announced(foo), folder => Assert.False(folder.StartsWith(@"\\?\", StringComparison.Ordinal)));
+        Assert.Equal(root, Named(root));
+        using var exact = ProjectScope.ExactlyAt(foo);
+        Assert.Equal($"{foo} exactly", exact.Described);
+        using var chosen = ProjectScope.ExactlyThe(exact.Admit(foo + @"\")!);
+        Assert.Equal((foo, true), (chosen.Folder, chosen.Exact));
     }
 
-    static string[] Announced(string folder)
+    static string Named(string folder)
     {
         using var scope = ProjectScope.Related(folder);
-        return [.. scope.Folders];
+        return scope.Folder;
     }
 
     [Fact]
-    public void Brain_json_carries_the_folders_and_match()
+    public void An_editor_that_shows_the_short_name_of_the_project_is_admitted_by_identity()
     {
-        var foo = Folder("Foo");
-        using var scope = ProjectScope.ExactlyAt(foo);
-        var announced = new Discovery("ws://127.0.0.1:1/v1/bridge", "c2VjcmV0", 7, DateTimeOffset.UnixEpoch, scope.Folders,
-            scope.Match);
-        var path = DiscoveryFile.Write(announced, Folder("discovery"));
-        var json = JsonNode.Parse(File.ReadAllText(path))!;
-        Assert.Equal(foo, json["folders"]![0]!.GetValue<string>());
-        Assert.Equal("exact", json["match"]!.GetValue<string>());
-        Assert.Equal(announced, DiscoveryFile.Read(path));
+        if (!OperatingSystem.IsWindows() || ShortName(Folder("A long folder name")) is not { } shortName
+            || shortName.EndsWith("A long folder name", StringComparison.Ordinal))
+        {
+            output.WriteLine("8.3 names are off on this volume: the short name was not checked.");
+            return;
+        }
+        using var scope = ProjectScope.ExactlyAt(Path.Combine(_root, "A long folder name"));
+        using var admitted = scope.Admit(shortName);
+        Assert.NotNull(admitted);
     }
 
     [Fact]
     public async Task Start_run_takes_only_a_full_local_folder_as_project_before_opening_a_port()
     {
-        await using var server = new McpServer(new StringWriter()) { JevKey = "test-key" };
+        await using var server = new McpServer(new StringWriter()) { DecisionKey = "test-key" };
         foreach (var project in new[] { "Games\\Foo", Path.Combine(_root, "missing"), @"\\server\share\Foo", "" })
         {
             var result = await server.CallAsync("start_run",
@@ -369,7 +358,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
             await cluewren.WaitForExitAsync(limit.Token);
             Assert.Equal(2, cluewren.ExitCode);
             Assert.Contains("--project", await error);
-            Assert.DoesNotContain("Waiting", await said);
+            Assert.DoesNotContain("Looking", await said);
         }
         finally
         {
@@ -506,7 +495,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         }
         await plugin.AnswerNextAsync(new { project_dir = bar });
         Assert.Equal(1, await playing);
-        Assert.Empty(Directory.EnumerateFiles(runFolder, "trace*"));
+        Assert.Empty(Directory.EnumerateFiles(runFolder, "trace*", SearchOption.AllDirectories));
         await AssertNothingMoreAsync(plugin);
     }
 
@@ -618,7 +607,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         oversized["padding"] = new string('x', 64 * 1024);
         await RefusedAsync(server.Url, oversized);
         var otherProtocol = FakePlugin.Hello(Secret, Handshake.NewNonce(), foo);
-        otherProtocol["protocol"] = 2;
+        otherProtocol["protocol"] = 1;
         await RefusedAsync(server.Url, otherProtocol);
         using (var socket = new ClientWebSocket())
         {
@@ -631,12 +620,12 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
                 welcome.RootElement.GetProperty("nonce").GetBytesFromBase64());
             await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "proof", proof = Convert.ToBase64String(wrong) }),
                 WebSocketMessageType.Text, true, default);
-            using var refusal = await ReceiveAsync(socket);
-            Assert.Equal("error", refusal.RootElement.GetProperty("type").GetString());
+            Assert.Equal("proof", (await FakePlugin.RefusalAsync(socket)).Code);
         }
-        Assert.Equal(["an editor whose hello was too large", "an editor whose hello isn't one of protocol 1",
+        Assert.Equal(["an editor whose hello was too large",
+            "an editor whose Cluewren plugin doesn't speak protocol 2: install the plugin of this release",
             $"{foo}: failed the proof"], server.Refused);
-        Assert.Contains("failed the proof", McpServer.NoEditorText(server, 60));
+        Assert.Contains("failed the proof", McpServer.NotConnectedText(server, new EditorAdvert(1, "a", "unity", foo, 2, 2), 60));
     }
 
     // Regression: the start-map preflight child was relayed to the editor's link, so a harness could start the game
@@ -651,7 +640,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
             {
                 public A()
                 {
-                    var line = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"post\",\"op\":\"session\",\"args\":{\"action\":\"start\"}}\n");
+                    var line = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"post\",\"op\":\"key\",\"args\":{\"key\":\"W\",\"mode\":\"hold\"}}\n");
                     var output = System.Console.OpenStandardOutput();
                     output.Write(line, 0, line.Length);
                     output.Flush();
@@ -827,7 +816,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
     }
 
     // The brain marks the session suspended before it lets go of the socket.
-    static async Task DrainAsync(WebSocket socket)
+    internal static async Task DrainAsync(WebSocket socket)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         try
@@ -841,18 +830,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         }
     }
 
-    static async Task<string> RefusedAsync(string url, object hello)
-    {
-        using var socket = new ClientWebSocket();
-        await socket.ConnectAsync(new Uri(url), default);
-        await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(hello), WebSocketMessageType.Text, true, default);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var buffer = new byte[64 * 1024];
-        var result = await socket.ReceiveAsync(buffer, timeout.Token);
-        using var reply = JsonDocument.Parse(Encoding.UTF8.GetString(buffer, 0, result.Count));
-        Assert.True("error" == reply.RootElement.GetProperty("type").GetString(), reply.RootElement.GetRawText());
-        return reply.RootElement.GetProperty("message").GetString()!;
-    }
+    static async Task<string> RefusedAsync(string url, object hello) => (await FakePlugin.RefusedAsync(url, hello)).Message;
 
     static async Task AssertNoLinkAsync(BridgeServer server)
     {
@@ -867,7 +845,7 @@ public sealed class ProjectBindingTests(ITestOutputHelper output) : IDisposable
         return (pipe, pipe.WaitForConnectionAsync(), $@"\\.\pipe\{name}");
     }
 
-    static async Task<int> RunAsync(string file, params string[] arguments)
+    internal static async Task<int> RunAsync(string file, params string[] arguments)
     {
         var start = new ProcessStartInfo(file) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var argument in arguments)

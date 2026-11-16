@@ -1,6 +1,6 @@
 # 0015 A run takes only an editor whose project the agent is working in
 
-Status: accepted
+Status: superseded by 0017, except the hello's mac and the identity comparison, which 0017 keeps
 Date: 2026-11-12
 Amends: 0008
 

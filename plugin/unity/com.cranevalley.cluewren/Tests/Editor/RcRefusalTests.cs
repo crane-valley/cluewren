@@ -27,6 +27,16 @@ namespace Cluewren.Tests
 
         static Dictionary<string, object> Body(params (string, object)[] entries) => entries.ToDictionary(e => e.Item1, e => e.Item2);
 
+        sealed class NoHost : IPlaytestHost
+        {
+            public string HostName => "test";
+            public string ProjectDir => "";
+            public string ProjectId => "";
+            public bool SessionRunning => false;
+            public bool Session(PlaytestClient client, long id, string action, Dictionary<string, object> args) => false;
+            public void Exit(int code) { }
+        }
+
         static RcError Refuses(TestDelegate request)
         {
             var error = Assert.Throws<RcError>(request);
@@ -247,7 +257,7 @@ namespace Cluewren.Tests
         [Test]
         public void AValueNestedPastTheDepthCheckedIsRefused()
         {
-            object deep = "UserSettings/Cluewren/x.unity";
+            object deep = ".cluewren/x.unity";
             object flat = 1.0;
             for (var i = 0; i < 8; ++i)
             {
@@ -261,8 +271,8 @@ namespace Cluewren.Tests
         [Test]
         public void APathInsideAnObjectTypedArgumentIsRefused()
         {
-            RefusesCall("type:UnityEngine.Debug", "Log", ("message", Body(("path", "UserSettings/Cluewren/runs/x/evil.unity"))));
-            RefusesCall("type:UnityEngine.Debug", "Log", ("message", new List<object> { "UserSettings/Cluewren/x.unity" }));
+            RefusesCall("type:UnityEngine.Debug", "Log", ("message", Body(("path", ".cluewren/runs/x/evil.unity"))));
+            RefusesCall("type:UnityEngine.Debug", "Log", ("message", new List<object> { ".cluewren/x.unity" }));
         }
 
         [Test]
@@ -349,19 +359,268 @@ namespace Cluewren.Tests
             Refuses(() => Reflect.Describe(Body(("objectPath", "type:UnityEditor.PlayerSettings"))));
         }
 
-        [Test]
-        public void C9DataFolder()
+        [TestCase(".cluewren")]
+        [TestCase(".cluewren/runs/x/work/evil.unity")]
+        [TestCase("a/.CLUEWREN/x")]
+        [TestCase(@"C:\other\.cluewren\x")]
+        [TestCase(@"\\server\share\.cluewren\x")]
+        [TestCase(@"\\?\C:\other\.cluewren\x")]
+        [TestCase(@"C:.cluewren\x")]
+        [TestCase(".cluewren.")]
+        [TestCase(".cluewren ")]
+        [TestCase(@".cluewren.\x.unity")]
+        [TestCase(".cluewren::$INDEX_ALLOCATION")]
+        [TestCase(".cluewren:$I30:$INDEX_ALLOCATION")]
+        [TestCase(".cluewren:x")]
+        [TestCase(@".cluewren\x.unity::$DATA")]
+        [TestCase("Assets/../.cluewren/x.unity")]
+        [TestCase("Main:/../.cluewren/x.unity")]
+        [TestCase("file:///C:/p/%2Ecluewren/x")]
+        [TestCase("file:///C:/p/.cluewre%6e%2Fx")]
+        [TestCase("CLUEWR~1")]
+        [TestCase("a/cluewr~4/x")]
+        [TestCase("cl12ab~1")]
+        [TestCase(@"C:\other\CLUEW~12\x")]
+        [TestCase("CL~1")]
+        [TestCase("CLUEWR~1::$INDEX_ALLOCATION")]
+        public void C9APathWithASegmentThatNamesTheDataFolderIsRefused(string path)
         {
-            var root = Path.GetDirectoryName(Application.dataPath);
-            Assert.IsTrue(Paths.DataPath("UserSettings/Cluewren/runs/x/evil.unity"));
-            Assert.IsTrue(Paths.DataPath("userSETTINGS\\cluewren\\x.unity"));
-            Assert.IsTrue(Paths.DataPath("Assets/../UserSettings/Cluewren/x.unity"));
-            Assert.IsTrue(Paths.DataPath("USERSE~1/Cluewren/x.unity"));
-            Assert.IsTrue(Paths.DataPath(Path.Combine(root, "UserSettings", "Cluewren", "x.unity")));
-            Assert.IsFalse(Paths.DataPath("Assets/Scenes/Main.unity"));
-            Assert.IsFalse(Paths.DataPath("Main:/Player"));
-            Assert.IsFalse(Paths.DataPath("UserSettings/EditorUserSettings.asset"));
-            RefusesCall(Paths.Of(go), "CompareTag", ("tag", "UserSettings/Cluewren/runs/x/evil.unity"));
+            Assert.IsTrue(Paths.DataPath(path));
+            RefusesCall(Paths.Of(go), "CompareTag", ("tag", path));
+        }
+
+        [TestCase(".cluewrens/x")]
+        [TestCase("x.cluewren/y")]
+        [TestCase("my.cluewren")]
+        [TestCase("a/cluewren/b")]
+        [TestCase("Assets/NUL")]
+        [TestCase("Assets/Scenes/Main.unity")]
+        [TestCase("UserSettings/Cluewren/x.unity")]
+        [TestCase(@"C:\PROGRA~1\Game\Main.unity")]
+        [TestCase("Main:/Player|PlayerMover")]
+        [TestCase("/Level/Pickups/Gem@2")]
+        [TestCase("asset:Material/Red#4")]
+        [TestCase("100%/x")]
+        [TestCase("")]
+        [TestCase("CLUEWREN~1")]
+        [TestCase("CLUEWR~12")]
+        [TestCase("CLUEWR~1.txt")]
+        [TestCase("PROGRA~1")]
+        [TestCase("CL~")]
+        [TestCase("CLUEWR~1a")]
+        [TestCase("a/CLUEWR/x")]
+        public void C9OtherPathsAreLeftAlone(string path)
+        {
+            Assert.IsFalse(Paths.DataPath(path));
+        }
+
+#if UNITY_EDITOR_WIN
+        static string ShortNameOf(string folder)
+        {
+            var given = Path.GetFileName(TestFiles.ShortPath(folder));
+            return string.Equals(given, Path.GetFileName(folder), StringComparison.OrdinalIgnoreCase) ? null : given;
+        }
+
+        [Test]
+        public void C9TheShortNameWindowsGaveTheDataFolderNamesItToo()
+        {
+            var project = Path.GetDirectoryName(Application.dataPath);
+            var folder = Path.Combine(project, ".cluewren");
+            Directory.CreateDirectory(folder);
+            var given = ShortNameOf(folder);
+            if (given == null) Assert.Ignore("this volume gives no 8.3 short names");
+            Assert.IsTrue(Paths.DataPath(given), given);
+            Assert.IsTrue(Paths.DataPath(given + "/x.unity"), given);
+            Assert.IsTrue(Paths.DataPath(Path.Combine(project, given.ToLowerInvariant(), "runs", "x.unity")), given);
+            Assert.IsTrue(Paths.DataPath(@"D:\elsewhere\" + given + @"\x"), given);
+        }
+
+        [Test]
+        public void C9SoDoesTheOneItGivesWhenTheFirstIsTaken()
+        {
+            var project = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + "-a-project-folder");
+            // (made first, it takes the short name the data folder would have got)
+            Directory.CreateDirectory(Path.Combine(project, ".cluewren-made-first"));
+            Directory.CreateDirectory(Path.Combine(project, ".cluewren"));
+            try
+            {
+                var given = ShortNameOf(Path.Combine(project, ".cluewren"));
+                if (given == null) Assert.Ignore("this volume gives no 8.3 short names");
+                Assert.AreNotEqual(ShortNameOf(Path.Combine(project, ".cluewren-made-first")), given);
+                Assert.IsTrue(Paths.DataPath(given + "/x.unity"), given);
+                var ancestor = TestFiles.ShortPath(project);
+                Assert.IsTrue(Paths.DataPath(Path.Combine(ancestor, given, "x.unity")), ancestor);
+                Assert.IsFalse(Paths.DataPath(Path.Combine(ancestor, "Assets", "Main.unity")), ancestor);
+            }
+            finally
+            {
+                Directory.Delete(project, true);
+            }
+        }
+#endif
+
+        [Test]
+        public void C9AnObjectNamedAsTheDataFolderIsNoTarget()
+        {
+            var named = new GameObject(".cluewren");
+            try
+            {
+                Refuses(() => Reflect.Call(Body(("objectPath", Paths.Of(named)), ("functionName", "SetActive"), ("parameters", Body(("value", false)))), null));
+                Assert.IsTrue(named.activeSelf);
+                Refuses(() => Reflect.Property(Body(("objectPath", Paths.Of(named)), ("propertyName", "name"))));
+                Refuses(() => Reflect.Describe(Body(("objectPath", Paths.Of(named)))));
+                Refuses(() => Reflect.Describe(Body(("objectPath", "Main:/.cluewren"))));
+            }
+            finally
+            {
+                Object.DestroyImmediate(named);
+            }
+        }
+
+        [TestCase(".cluewren")]
+        [TestCase(".cluewren::$INDEX_ALLOCATION")]
+        [TestCase("%2Ecluewren%2Fruns%2Fx")]
+        [TestCase("CLUEWR~1")]
+        public void C9AStringWithNoSeparatorIsJudgedAsAnyOther(string text)
+        {
+            RefusesCall(Paths.Of(go), "CompareTag", ("tag", text));
+            Refuses(() => Reflect.Property(Body(("objectPath", Paths.Of(go)), ("propertyName", "name"), ("propertyValue", Body(("name", text))))));
+            Assert.AreEqual("RcRefusalProbe", go.name);
+            RefusesCall("type:UnityEngine.Debug", "Log", ("message", text));
+            RefusesCall("type:UnityEngine.Debug", "Log", ("message", Body(("path", text))));
+            RefusesCall("type:UnityEngine.Debug", "Log", ("message", new List<object> { text }));
+        }
+
+        [TestCase("start")]
+        [TestCase("restart")]
+        public void C9ASessionStartsWithNoSceneInTheDataFolder(string action)
+        {
+            const string map = ".cluewren/runs/rc-refusal-test/work/evil.unity";
+            var run = Path.Combine(Path.GetDirectoryName(Application.dataPath), ".cluewren", "runs", "rc-refusal-test");
+            Directory.CreateDirectory(Path.Combine(run, "work"));
+            File.WriteAllText(Path.Combine(run, "work", "evil.unity"), "");
+            var said = new List<string>();
+            var client = new PlaytestClient(Cluewren.Editor.EditorHost.Instance) { TestWire = said.Add };
+            try
+            {
+                client.TestConnected(true);
+                Assert.IsTrue(Cluewren.Editor.EditorHost.Instance.Session(client, 7, action, Body(("map", map))));
+                Assert.IsFalse(UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode);
+                Assert.AreEqual(1, said.Count);
+                var answer = Json.ParseObject(said[0]);
+                Assert.AreEqual(7.0, answer["id"]);
+                Assert.AreEqual(403.0, answer["status"]);
+                Assert.AreEqual(map + " is refused: nothing in .cluewren is opened as a scene", answer["error"]);
+            }
+            finally
+            {
+                // Without the refusal the editor is on its way into play mode, and would take this test run with it.
+                if (UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode) UnityEditor.EditorApplication.ExitPlaymode();
+                client.Shutdown();
+                Directory.Delete(run, true);
+            }
+        }
+
+        [Test]
+        public void C9ARestartOpensNoSceneInTheDataFolder()
+        {
+            var said = new List<string>();
+            var client = new PlaytestClient(new NoHost()) { TestWire = said.Add };
+            try
+            {
+                client.TestConnected(true);
+                Ops.Restart(client, 7, ".cluewren/runs/x/work/evil.unity");
+                var answer = Json.ParseObject(said.Single());
+                Assert.AreEqual(7.0, answer["id"]);
+                Assert.AreEqual(403.0, answer["status"]);
+                Assert.AreEqual(".cluewren/runs/x/work/evil.unity is refused: nothing in .cluewren is opened as a scene", answer["error"]);
+            }
+            finally
+            {
+                client.Shutdown();
+            }
+        }
+
+        [TestCase("Main")]
+        [TestCase("Main.unity")]
+        [TestCase("3")]
+        [TestCase("Assets/Scenes/Main.unity")]
+        [TestCase(@"Assets\Scenes\Main.unity")]
+        [TestCase("Packages/com.example.game/Scenes/Demo.unity")]
+        [TestCase("Scenes/Main")]
+        public void AMapIsASceneOfTheProjectByNameIndexOrPath(string map)
+        {
+            Assert.IsFalse(Ops.MapOutsideProject(map));
+        }
+
+        [TestCase(@"\\host\share\x.unity")]
+        [TestCase(@"\\?\C:\other\x.unity")]
+        [TestCase(@"C:\other\x.unity")]
+        [TestCase("C:x.unity")]
+        [TestCase("/x.unity")]
+        [TestCase("Assets/../x.unity")]
+        [TestCase(@"Assets\.. \x.unity")]
+        [TestCase("file:///C:/other/x.unity")]
+        public void ARestartLooksForNoSceneOutsideTheProject(string map)
+        {
+            var said = new List<string>();
+            var client = new PlaytestClient(new NoHost()) { TestWire = said.Add };
+            var active = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            try
+            {
+                client.TestConnected(true);
+                Ops.Restart(client, 7, map);
+                var answer = Json.ParseObject(said.Single());
+                Assert.AreEqual(7.0, answer["id"]);
+                Assert.AreEqual(404.0, answer["status"]);
+                Assert.AreEqual("No scene " + map + " in the project", answer["error"]);
+                Assert.AreEqual(active, UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+            }
+            finally
+            {
+                client.Shutdown();
+            }
+        }
+
+        [Test]
+        public void ASessionLooksForNoSceneOutsideTheProject(
+            [Values("start", "restart")] string action, [Values("drive", "device", "share", "above", "drive's folder", "rooted")] string kind)
+        {
+            var project = Path.GetDirectoryName(Application.dataPath);
+            var outside = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".unity");
+            var above = "outside-" + Path.GetRandomFileName() + ".unity";
+            File.WriteAllText(outside, "");
+            File.WriteAllText(Path.Combine(project, above), "");
+            // (scene files that are there: looked for, they would be found, and the session would go on with them)
+            var map = kind == "drive" ? outside
+                : kind == "device" ? @"\\?\" + outside
+                : kind == "share" ? @"\\localhost\" + outside[0] + "$" + outside.Substring(2)
+                : kind == "above" ? "Assets/../" + above
+                : kind == "drive's folder" ? project.Substring(0, 2) + above
+                : "/" + above;
+            var said = new List<string>();
+            var client = new PlaytestClient(Cluewren.Editor.EditorHost.Instance) { TestWire = said.Add };
+            var active = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            try
+            {
+                client.TestConnected(true);
+                Assert.IsTrue(Cluewren.Editor.EditorHost.Instance.Session(client, 7, action, Body(("map", map))));
+                Assert.IsFalse(UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode, map);
+                Assert.AreEqual(1, said.Count, map);
+                var answer = Json.ParseObject(said[0]);
+                Assert.AreEqual(7.0, answer["id"]);
+                Assert.AreEqual(404.0, answer["status"], map);
+                Assert.AreEqual("No scene " + map + " in the project", answer["error"]);
+                Assert.AreEqual(active, UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+            }
+            finally
+            {
+                // Without the answer the editor is on its way into play mode, and would take this test run with it.
+                if (UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode) UnityEditor.EditorApplication.ExitPlaymode();
+                client.Shutdown();
+                File.Delete(outside);
+                File.Delete(Path.Combine(project, above));
+            }
         }
 
         static readonly HashSet<string> PathWords = new HashSet<string>

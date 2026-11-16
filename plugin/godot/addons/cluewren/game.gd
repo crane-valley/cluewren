@@ -1,12 +1,13 @@
-# Modified by Crane Valley: the game connects only with --playtest-connect, through brain.json and the mutual handshake;
-# the run requested on the command line, report files, token, sharing, preferences and codex ops are removed; the addon
-# stays idle until a brain is there, does nothing in a release build, and keeps its per-frame path free of allocation;
-# a restart never opens a scene under res://.godot/.
+# Modified by Crane Valley: renamed from playtest.gd; the game connects only with --cluewren-connect, through the
+# brain's invite and the mutual handshake; the run requested on the command line, report files, token, sharing,
+# preferences and codex ops are removed; the addon stays idle until a brain is there, does nothing in a release build,
+# and keeps its per-frame path free of allocation; a restart never opens a scene under res://.godot/ or res://.cluewren/.
 ## Cluewren: the game-side bridge (an autoload, /root/Cluewren). Runs inside the game process, in the editor's
 ## play sessions and in debug builds alike, and keeps working while the game is paused (process_mode ALWAYS).
 ##
 ## It is idle until one of these:
-##  - the command line asks for it (`-- --playtest-connect`): it connects out to the brain itself (hello host "game");
+##  - the command line asks for it (`-- --cluewren-connect`): it advertises itself and connects out to the brain that
+##    invites it (hello host "game");
 ##  - the editor attaches to this play session over the editor's debugger connection: editor_bridge.gd holds the one
 ##    link to the brain (hello host "editor") and relays requests here, and this answers them back the same way.
 ## Ops: find/transforms/pose/movement, `record` and `capture` (the game's picture) in lib/media.gd, and the rest below.
@@ -18,7 +19,7 @@ const Rc = preload("lib/rc.gd")
 const World = preload("lib/world.gd")
 const Sight = preload("lib/sight.gd")
 const Ui = preload("lib/ui.gd")
-const Codex = preload("lib/codex.gd")
+const Export = preload("lib/export.gd")
 const Detectors = preload("lib/detectors.gd")
 const Link = preload("lib/link.gd")
 const Discovery = preload("lib/discovery.gd")
@@ -51,14 +52,15 @@ var _held := {}  # key name -> {"spec", "value", "rate", "renewed"}
 var _expired := []
 var _lease := 1.0
 var _pressed_actions := {}  # actions move pressed (Input.action_press), released with the keys
+var _held_actions := {}  # actions an `input` hold pressed (as events), released with the keys
 var _heartbeat_at := 0.0
 var _last_real := 0.0
-var _timestep_saved = null
+var _max_fps_saved := -1  # Engine.max_fps from before a fixed timestep (-1: none is on)
 var _summary_task := -1
 
 var cli_connect := false
-var cli_map := ""  # --playtest-map: the scene to start in (a res:// path or a scene file's name)
-var cli_connect_timeout := 120.0  # --playtest-connect-timeout: seconds to wait for the welcome
+var cli_map := ""  # --cluewren-map: the scene to start in (a res:// path or a scene file's name)
+var cli_connect_timeout := 120.0  # --cluewren-connect-timeout: seconds to wait for the welcome
 var _cli_deadline := 0.0
 var _exiting := false
 
@@ -81,11 +83,16 @@ func _ready() -> void:
 		link.on_welcomed = _on_welcomed
 		link.on_closed = _on_closed
 		link.on_refused = _on_refused
+		var unadvertised := Discovery.write_advert("game")
+		if unadvertised != "":
+			_exit_failed(unadvertised)
+			return
 		link.open()
 		_cli_deadline = _now() + cli_connect_timeout
-		print("Cluewren: connecting to the brain")
-	if cli_map != "":
-		var scene := Codex.find_scene(cli_map)
+		print("Cluewren: waiting for the brain's invite")
+	# Only with the connect flag: without it this game does nothing of Cluewren's, whatever else its command line says.
+	if cli_connect and cli_map != "":
+		var scene := Export.find_scene(cli_map)
 		if scene == "":
 			push_warning("Cluewren: no scene %s to start in" % cli_map)
 		else:
@@ -113,6 +120,7 @@ func _exit_tree() -> void:
 		detectors.shutdown()
 	if link:
 		link.close()
+		Discovery.remove_advert()
 	if EngineDebugger.is_active() and EngineDebugger.has_capture(CAPTURE):
 		EngineDebugger.unregister_message_capture(CAPTURE)
 	if _summary_task >= 0:
@@ -136,39 +144,24 @@ func _prepare_headless() -> void:
 
 
 func _parse_command_line() -> void:
-	var args := OS.get_cmdline_user_args()
-	if args.is_empty():
-		args = OS.get_cmdline_args()
-	# Both spellings: --playtest-connect-timeout=... (Godot style) and -PlaytestConnectTimeout=... (as Unity's plugin takes)
-	for a in args:
+	for a in OS.get_cmdline_user_args():
 		var s := str(a)
 		var name := s.get_slice("=", 0)
-		var key := name.lstrip("-").to_lower().replace("-", "").replace("_", "")
-		if not key.begins_with("playtest"):
-			continue
-		var value := s.substr(name.length() + 1) if "=" in s else ""
-		value = value.trim_prefix("\"").trim_suffix("\"")
-		match key:
-			"playtestconnect":
+		var value := s.substr(name.length() + 1).trim_prefix("\"").trim_suffix("\"")
+		match name:
+			"--cluewren-connect":
 				cli_connect = true
-			"playtestmap":
+			"--cluewren-map":
 				cli_map = value
-			"playtestconnecttimeout":
+			"--cluewren-connect-timeout":
 				if value.is_valid_float() and float(value) > 0.0:
 					cli_connect_timeout = float(value)
 				else:
-					push_warning("Cluewren: --playtest-connect-timeout wants a number of seconds (got \"%s\")" % value)
-
-
-static func plugin_version() -> String:
-	var cfg := ConfigFile.new()
-	if cfg.load("res://addons/cluewren/plugin.cfg") == OK:
-		return str(cfg.get_value("plugin", "version", "0.1.2"))
-	return "0.1.2"
+					push_warning("Cluewren: --cluewren-connect-timeout wants a number of seconds (got \"%s\")" % value)
 
 
 func _hello() -> Dictionary:
-	return {"plugin_version": plugin_version(), "engine": "godot", "engine_version": Engine.get_version_info().string,
+	return {"plugin_version": Discovery.plugin_version(), "engine": "godot", "engine_version": Engine.get_version_info().string,
 		"project": str(ProjectSettings.get_setting("application/config/name", "")), "host": "game",
 		# what this addon does beyond the protocol's first version: the brain falls back for one without them
 		"features": ["timed_hold", "levels", "media"] if Media.can_capture() else ["timed_hold", "levels"]}
@@ -250,8 +243,8 @@ func _on_editor_message(message: String, data: Array) -> bool:
 			return true
 		"detach":
 			if _begun:
-				_release_all()
 				media.stop()
+				_drop_work()
 			active = false
 			return true
 		"release":
@@ -298,7 +291,8 @@ func _process(delta: float) -> void:
 	if link:
 		link.poll()
 		if cli_connect and not _exiting and not link.connected and link.session == "" and _cli_deadline > 0.0 and now > _cli_deadline:
-			_exit_failed("no welcome from the brain within %d s (%s)" % [int(cli_connect_timeout), link.problem])
+			_exit_failed("no welcome from the brain within %d s (%s)" % [int(cli_connect_timeout),
+					link.problem if link.problem != "" else "no invite came"])
 	if not active:
 		if not _events.is_empty():
 			_events.clear()
@@ -332,10 +326,17 @@ func _on_welcomed(resumed: bool) -> void:
 	active = true
 	_cli_deadline = 0.0
 	if not resumed:
-		_pending.clear()
+		_drop_work()
 		media.stop()  # (a new connection: no recording goes on from the one before)
 	_write_summary()
 	print("Cluewren: connected (%s)" % link.role)
+
+
+## The brain's session is over: a request id counts from 1 again in the next, so nothing owed to this one answers it.
+func _drop_work() -> void:
+	_release_all()
+	_pending.clear()
+	media.drop_stills()
 
 
 func _on_closed(was_connected: bool) -> void:
@@ -368,10 +369,6 @@ func _on_brain_frame(frame: Dictionary, _text: String) -> void:
 			_handle_request(frame)
 		"status":
 			print("Cluewren: %s" % frame.get("text", ""))
-		"finding":
-			var f = frame.get("finding", {})
-			if typeof(f) == TYPE_DICTIONARY:
-				print("Cluewren: finding: %s" % f.get("summary", ""))
 
 
 ## The agent reads this with its own tools, so it is there before the agent is told about the run.
@@ -380,7 +377,13 @@ func _write_summary() -> void:
 		if not WorkerThreadPool.is_task_completed(_summary_task):
 			return
 		WorkerThreadPool.wait_for_task_completion(_summary_task)
-	_summary_task = WorkerThreadPool.add_task(Codex.write_summary, false, "Cluewren summary")
+	_summary_task = WorkerThreadPool.add_task(_export, false, "Cluewren export")
+
+
+func _export() -> void:
+	var why := Export.write_summary()
+	if why != "":
+		push_warning("Cluewren: " + why)
 
 
 # --- requests ---------------------------------------------------------------------------------------
@@ -412,7 +415,7 @@ func dispatch(id, op: String, args: Dictionary):
 		"session":
 			return session(id, args)
 		"levels":
-			return [true, {"levels": Codex.scenes(), "open": str(ProjectSettings.get_setting("application/run/main_scene", "")), "playing": _scene_path()}]
+			return [true, {"levels": Export.scenes(), "open": str(ProjectSettings.get_setting("application/run/main_scene", "")), "playing": _scene_path()}]
 		"pause":
 			get_tree().paused = bool(args.get("paused", false))
 			return [true, {"paused": get_tree().paused}]
@@ -485,16 +488,20 @@ func session(id, args: Dictionary):
 	if action != "restart":
 		return [true, {"running": get_tree().current_scene != null}]
 	var target := ""
+	var refused := Export.refused_scene(str(args.get("map", "")))
+	if refused != "":
+		return [false, refused, 403]
 	if str(args.get("map", "")) != "":
-		target = Codex.find_scene(str(args.map))
+		target = Export.find_scene(str(args.map))
 		if target == "":
-			return [false, "No scene %s" % args.map]
+			return [false, "No scene %s" % args.map, 404]
 	else:
 		target = _launch_scene if _launch_scene != "" else _scene_path()
 	if target == "":
 		return [false, "No scene to restart"]
-	if Codex.data_path(target):
-		return [false, "%s is refused: nothing under res://.godot/ is opened as a scene" % target, 403]
+	refused = Export.refused_scene(target)
+	if refused != "":
+		return [false, refused, 403]
 	_release_all()
 	if args.get("fresh", false):
 		_reset_autoloads()
@@ -543,14 +550,14 @@ func _reset_autoloads() -> void:
 
 func timestep(args: Dictionary):
 	if args.get("fixed", false):
-		if _timestep_saved == null:
-			_timestep_saved = [Engine.max_fps, Engine.physics_ticks_per_second]
+		if _max_fps_saved < 0:
+			_max_fps_saved = Engine.max_fps
 		var fps := maxi(1, int(args.get("fps", 30)))
 		Engine.max_fps = fps
 		return [true, {"note": "Godot has no runtime fixed frame time: the frame rate is capped at %d" % fps}]
-	if _timestep_saved != null:
-		Engine.max_fps = _timestep_saved[0]
-		_timestep_saved = null
+	if _max_fps_saved >= 0:
+		Engine.max_fps = _max_fps_saved
+		_max_fps_saved = -1
 	return [true, {}]
 
 
@@ -683,11 +690,13 @@ func key_op(id, args: Dictionary):
 	_send_key(spec, true, value)
 	var started := _now()
 	var frame := Engine.get_process_frames()
-	_pending.append({"id": id, "op": "key", "tick": func(now: float) -> bool:
-		if now - started < KEY_TAP_SECONDS or Engine.get_process_frames() < frame + KEY_TAP_FRAMES:
-			return false
+	var release := func():
 		if not _held.has(name):
 			_send_key(spec, false)
+	_pending.append({"id": id, "op": "key", "release": release, "tick": func(now: float) -> bool:
+		if now - started < KEY_TAP_SECONDS or Engine.get_process_frames() < frame + KEY_TAP_FRAMES:
+			return false
+		release.call()
 		respond(id, {})
 		return true})
 	return null
@@ -713,12 +722,21 @@ func _tick_keys(now: float, dt: float) -> void:
 	_expired.clear()
 
 
+## Every input the brain's requests hold down, those of a tap or a move still on its way included, let go the way it was
+## pressed: a game that keeps what its _input saw sees each release.
 func _release_all() -> void:
+	for p in _pending:
+		if p.has("release"):
+			p.release.call()
 	for name in _held:
 		var h: Dictionary = _held[name]
 		if not Keys.is_axis(h.spec) or h.spec.kind == "joy_axis":
 			_send_key(h.spec, false)
 	_held.clear()
+	for a in _held_actions:
+		if InputMap.has_action(a):
+			_send_key({"kind": "action", "action": a}, false)
+	_held_actions.clear()
 	for a in _pressed_actions:
 		if InputMap.has_action(a):
 			Input.action_release(a)
@@ -741,16 +759,19 @@ func input_op(id, args: Dictionary):
 	var spec := {"kind": "action", "action": action}
 	if mode == "release":
 		_send_key(spec, false)
+		_held_actions.erase(action)
 		return [true, {}]
 	_send_key(spec, true, strength)
 	if mode == "hold":
+		_held_actions[action] = true
 		return [true, {}]
 	var started := _now()
 	var frame := Engine.get_process_frames()
-	_pending.append({"id": id, "op": "input", "tick": func(now: float) -> bool:
+	var release := func(): _send_key(spec, false)
+	_pending.append({"id": id, "op": "input", "release": release, "tick": func(now: float) -> bool:
 		if now - started < KEY_TAP_SECONDS or Engine.get_process_frames() < frame + KEY_TAP_FRAMES:
 			return false
-		_send_key(spec, false)
+		release.call()
 		respond(id, {})
 		return true})
 	return null
@@ -785,7 +806,8 @@ func move_op(id, args: Dictionary):
 	var started := _now()
 	var keys_down := {}
 	var pid := player.get_instance_id()  # (never capture a node: it may be freed meanwhile)
-	_pending.append({"id": id, "op": "move", "tick": func(now: float) -> bool:
+	var release := func(): _drive(0.0, 0.0, actions, keys_down)
+	_pending.append({"id": id, "op": "move", "release": release, "tick": func(now: float) -> bool:
 		var p = instance_from_id(pid)
 		var alive: bool = p != null and is_instance_valid(p) and p.is_inside_tree()
 		if alive and now - started < seconds:

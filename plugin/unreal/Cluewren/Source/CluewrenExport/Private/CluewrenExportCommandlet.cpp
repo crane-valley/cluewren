@@ -1,12 +1,12 @@
 // Modified by Crane Valley: renamed for Cluewren; the -progress file went with the panel that showed it.
-// The CluewrenCodex commandlet (see CluewrenCodexCommandlet.h): Main finds the project's assets and writes the export.
-// What each kind of asset reads as: CluewrenCodexBlueprints.cpp, CluewrenCodexInputData.cpp, CluewrenCodexMaps.cpp; the
-// shared text helpers: CluewrenCodexText.cpp.
+// The CluewrenExport commandlet (see CluewrenExportCommandlet.h): Main finds the project's assets and writes the export.
+// What each kind of asset reads as: CluewrenExportBlueprints.cpp, CluewrenExportInputData.cpp, CluewrenExportMaps.cpp; the
+// shared text helpers: CluewrenExportText.cpp.
 
-#include "CluewrenCodexCommandlet.h"
+#include "CluewrenExportCommandlet.h"
 #include "Misc/EngineVersionComparison.h"
 
-#include "CluewrenCodexInternal.h"
+#include "CluewrenExportInternal.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -45,9 +45,9 @@
 #include "WorldPartition/WorldPartitionActorDesc.h"
 #include "WorldPartition/WorldPartitionActorDescUtils.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogCluewrenCodex, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogCluewrenExport, Log, All);
 
-UCluewrenCodexCommandlet::UCluewrenCodexCommandlet()
+UCluewrenExportCommandlet::UCluewrenExportCommandlet()
 {
 	IsClient = false;
 	IsEditor = true;
@@ -64,7 +64,7 @@ UCluewrenCodexCommandlet::UCluewrenCodexCommandlet()
 // ---------------------------------------------------------------- crash guard
 
 #if PLATFORM_WINDOWS
-namespace CluewrenCodexSeh
+namespace CluewrenExportSeh
 {
 	static void Invoke(void* Ctx)
 	{
@@ -89,7 +89,7 @@ namespace CluewrenCodexSeh
 static bool Guarded(TFunctionRef<void()> F)
 {
 #if PLATFORM_WINDOWS
-	return CluewrenCodexSeh::Call(&CluewrenCodexSeh::Invoke, &F);
+	return CluewrenExportSeh::Call(&CluewrenExportSeh::Invoke, &F);
 #else
 	F();
 	return true;
@@ -98,15 +98,15 @@ static bool Guarded(TFunctionRef<void()> F)
 
 // ---------------------------------------------------------------- commandlet
 
-int32 UCluewrenCodexCommandlet::Main(const FString& Params)
+int32 UCluewrenExportCommandlet::Main(const FString& Params)
 {
-	using namespace CluewrenCodex;
+	using namespace CluewrenExport;
 	const double Start = FPlatformTime::Seconds();
 
 	FString OutDir;
 	if (!FParse::Value(*Params, TEXT("out="), OutDir) || OutDir.IsEmpty())
 	{
-		UE_LOG(LogCluewrenCodex, Error, TEXT("CluewrenCodex: -out=<dir> is required"));
+		UE_LOG(LogCluewrenExport, Error, TEXT("CluewrenExport: -out=<dir> is required"));
 		return 1;
 	}
 	OutDir = FPaths::ConvertRelativePathToFull(OutDir);
@@ -192,7 +192,7 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 		Write(TEXT("assets.txt"), FString::Join(Lines, TEXT("\n")) + TEXT("\n"));
 		Counts.Add(TEXT("assets"), Assets.Num());
 	}
-	UE_LOG(LogCluewrenCodex, Display, TEXT("CluewrenCodex: %d assets under %s"), Assets.Num(), *FString::Join(Roots, TEXT(",")));
+	UE_LOG(LogCluewrenExport, Display, TEXT("CluewrenExport: %d assets under %s"), Assets.Num(), *FString::Join(Roots, TEXT(",")));
 
 	// Resolve each asset's class (loading Blueprint classes for Blueprint-derived data assets).
 	TMap<FTopLevelAssetPath, UClass*> ClassCache;
@@ -261,7 +261,7 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 	}
 	const int32 Total = ToExport.Num() + (bNoMaps ? 0 : FMath::Min(Maps.Num(), FMath::Max(MaxMaps, 0)));
 	int32 Done = 0;
-	UE_LOG(LogCluewrenCodex, Display, TEXT("CluewrenCodex: %d files to export"), Total);
+	UE_LOG(LogCluewrenExport, Display, TEXT("CluewrenExport: %d files to export"), Total);
 
 	for (const FAssetData& A : ToExport)
 	{
@@ -345,7 +345,7 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 		++Done;
 		if (Done % 200 == 0)
 		{
-			UE_LOG(LogCluewrenCodex, Display, TEXT("CluewrenCodex: %d/%d files"), Done, Total);
+			UE_LOG(LogCluewrenExport, Display, TEXT("CluewrenExport: %d/%d files"), Done, Total);
 		}
 	}
 	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
@@ -365,7 +365,7 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 				continue;
 			}
 			const FString Pkg = A.PackageName.ToString();
-			UE_LOG(LogCluewrenCodex, Display, TEXT("CluewrenCodex: map %s"), *Pkg);
+			UE_LOG(LogCluewrenExport, Display, TEXT("CluewrenExport: map %s"), *Pkg);
 			FString LevelBpText;
 			const bool bNoCrash = Guarded([&]()
 			{
@@ -552,7 +552,7 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 	const double Seconds = FPlatformTime::Seconds() - Start;
 	FOut Summary;
 	Summary.Max = 100000;
-	Summary.Add(0, TEXT("CluewrenCodex export"));
+	Summary.Add(0, TEXT("Cluewren export"));
 	Summary.Add(0, TEXT("Project: ") + FString(FApp::GetProjectName()));
 	Summary.Add(0, TEXT("Roots: ") + FString::Join(Roots, TEXT(", ")));
 	Summary.Add(0, FString::Printf(TEXT("Time: %.1f s"), Seconds));
@@ -588,6 +588,6 @@ int32 UCluewrenCodexCommandlet::Main(const FString& Params)
 		}
 	}
 	Write(TEXT("summary.txt"), Summary.Join());
-	UE_LOG(LogCluewrenCodex, Display, TEXT("CluewrenCodex: done in %.1f s, %d failures, output in %s"), Seconds, Failures.Num(), *OutDir);
+	UE_LOG(LogCluewrenExport, Display, TEXT("CluewrenExport: done in %.1f s, %d failures, output in %s"), Seconds, Failures.Num(), *OutDir);
 	return 0;
 }

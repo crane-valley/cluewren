@@ -1,9 +1,10 @@
-// Modified by Crane Valley: no token on the command line, a player no longer starts the editor for the codex export, and
-// the command line only connects: the brain starts a run.
-// Starting the bridge. In a player build: only with -PlaytestConnect on the command
-// line; otherwise the bridge stays off (it opens no port and connects nowhere). In the editor the Playtest window (and
-// the editor's batch mode, Editor/Headless.cs) starts it. Either way it is ticked once per frame from the player loop
-// while the game plays.
+// Modified by Crane Valley: no token on the command line, a player no longer starts the editor for the project export,
+// and the command line only connects: the brain starts a run, and its address comes from its invite alone.
+// Starting the bridge. A player build has it only when the project defines CLUEWREN_PLAYTEST (the runtime assembly's
+// define constraint), and then starts it only with -CluewrenConnect on the command line; otherwise the bridge stays
+// off (it writes no advert, opens no port and connects nowhere). In the editor the editor's host (Editor/EditorHost.cs,
+// and Editor/Headless.cs in batch mode) starts it. Either way it is ticked once per frame from the player loop while
+// the game plays.
 
 using System;
 using System.Collections;
@@ -60,25 +61,29 @@ namespace Cluewren
             if (Application.isBatchMode && Application.targetFrameRate <= 0)
                 Application.targetFrameRate = 60;  // (headless: no vsync to hold the frame rate)
             if (Application.isEditor) return;  // (the editor's own host starts it)
-            if (!PlaytestClient.Flag("PlaytestConnect")) return;
-            var url = PlaytestClient.Arg("PlaytestUrl");
-            var client = new PlaytestClient(new PlayerHost())
+            if (!PlaytestClient.Flag("CluewrenConnect")) return;
+            var host = new PlayerHost();
+            var client = new PlaytestClient(host)
             {
                 ExitOnFailure = true,
                 ConnectTimeout = PlaytestClient.CommandLineConnectTimeout(),
             };
-            // -PlaytestMap: the scene to play (a name, path or build index) in place of the build's first; restart
+            // -CluewrenMap: the scene to play (a name, path or build index) in place of the build's first; restart
             // reopens it
-            var map = PlaytestClient.Arg("PlaytestMap");
-            if (string.IsNullOrEmpty(map)) map = PlaytestClient.Arg("PlaytestScene");
+            var map = PlaytestClient.Arg("CluewrenMap");
             if (!string.IsNullOrEmpty(map))
             {
                 Ops.LaunchScene = map;
                 pendingMap = map;  // (opened at the first frame: the build's first scene is loading now)
             }
-            Application.quitting += client.Shutdown;
-            Debug.Log($"[Cluewren] Connecting as asked on the command line -> {url}");
-            client.Connect(url);
+            unannounced = host;  // (advertised at the first frame: the project's folder is in the first scene, loading now)
+            Application.quitting += () =>
+            {
+                Discovery.Withdraw();
+                client.Shutdown();
+            };
+            Debug.Log("[Cluewren] Waiting for a run to invite this game, as asked on the command line");
+            client.Connect();
         }
 
         /// <summary>Tick the bridge at the start of each frame's Update (in a player, and in the editor's play mode).</summary>
@@ -102,9 +107,15 @@ namespace Cluewren
         }
 
         static string pendingMap;
+        static PlayerHost unannounced;
 
         static void Tick()
         {
+            if (unannounced != null)
+            {
+                Discovery.Advertise(Discovery.NewId(), unannounced.ProjectDir, unannounced.HostName);
+                unannounced = null;
+            }
             if (pendingMap != null)
             {
                 var map = pendingMap;
@@ -134,7 +145,7 @@ namespace Cluewren
     }
 
     /// <summary>What a player build bakes in (Editor/BuildHook.cs adds it, hidden, to the first scene of a build the
-    /// bridge is in): the project's GUID and where its project was, for the codex.</summary>
+    /// bridge is in): the project's GUID and where its project was, which the brain matches a run's project with.</summary>
     [AddComponentMenu("")]
     public sealed class PlaytestBuildInfo : MonoBehaviour
     {
@@ -172,7 +183,7 @@ namespace Cluewren
         {
             get
             {
-                var given = PlaytestClient.Arg("PlaytestProject");
+                var given = PlaytestClient.Arg("CluewrenProject");
                 if (!string.IsNullOrEmpty(given)) return Path.GetFullPath(given);
                 var info = PlaytestBuildInfo.Get();
                 return info != null && Directory.Exists(info.projectDir) ? info.projectDir : "";

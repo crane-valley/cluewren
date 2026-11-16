@@ -9,7 +9,7 @@ namespace Cluewren.Sandbox.Child;
 // The bodies upstream keeps in Session: what must run beside the harness, so its code never runs in the parent.
 sealed class Runner
 {
-    const int MinJevDecisions = 3;
+    const int MinDecisions = 3;
 
     static readonly JsonSerializerOptions Snake = new()
     {
@@ -20,26 +20,26 @@ sealed class Runner
     readonly ProxyLink _link;
     readonly LineWriter _out;
     readonly ConsoleRouter _console;
-    readonly string _runFolder;
+    readonly string _workFolder;
     readonly Game _game;
     readonly IDecider? _jev;
     readonly int _maxDecisions;
     readonly string _carry;
+    bool _carried;
     readonly CancellationTokenSource _stop = new();
     volatile bool _stopped;
 
-    public Runner(ProxyLink link, LineWriter output, ConsoleRouter console, string runFolder, string? level, bool jev,
+    public Runner(ProxyLink link, LineWriter output, ConsoleRouter console, string runFolder, string workFolder, string? level, bool jev,
         int maxDecisions)
     {
         _link = link;
         _out = output;
         _console = console;
-        _runFolder = runFolder;
+        _workFolder = workFolder;
         _game = new Game(link) { Level = level };
-        _jev = jev ? new RemoteJev(link) : null;
+        _jev = jev ? new RemoteDecider(link) : null;
         _maxDecisions = maxDecisions;
-        _carry = Path.Combine(runFolder, "carry.json");
-        Carry.Load(_game, _carry);
+        _carry = Path.Combine(workFolder, "carry.json");
         AssemblyLoadContext.Default.Resolving += (context, name) =>
         {
             var path = Path.Combine(runFolder, "bin", name.Name + ".dll");
@@ -62,6 +62,13 @@ sealed class Runner
         string? error = null;
         try
         {
+            // Not before the first call is answered: what an earlier child left in the work folder must not be what
+            // decides whether this one starts.
+            if (method != "ping" && !_carried)
+            {
+                _carried = true;
+                Carry.Load(_game, _carry);
+            }
             value = method switch
             {
                 "ping" => "pong",
@@ -72,7 +79,17 @@ sealed class Runner
                 _ => throw new InvalidOperationException($"unknown call {method}"),
             };
             if (method is not ("ping" or "start_map"))
-                Carry.Save(_game, _carry);
+            {
+                try
+                {
+                    Carry.Save(_game, _carry);
+                }
+                // What the call found is its answer whether or not the next child gets what this one learned.
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    Console.Error.WriteLine($"carry.json not written: {e.Message}");
+                }
+            }
         }
         catch (Exception e)
         {
@@ -161,14 +178,22 @@ sealed class Runner
                 capture.Append('\n');
             }
         });
+        const string stopped = "\nTHE PROBE WAS STOPPED HERE: the keys were let go and the game paused; what it printed "
+                               + "until then is above.";
         try
         {
             await _game.Pause(false, ct).ConfigureAwait(false);
             var limit = Task.Delay(TimeSpan.FromSeconds(seconds), ct);
             if (await Task.WhenAny(work, limit).ConfigureAwait(false) != work)
-                late = $"\nTHE PROBE TOOK MORE THAN {Fmt.F(seconds, 0)} s AND WAS CUT OFF HERE: the keys were let go and "
-                       + "the game paused; what it printed until then is above. Keep a probe to one question's worth; "
-                       + "what takes long (whole walks, a fight to the end) belongs in run_harness.";
+                late = ct.IsCancellationRequested ? stopped
+                    : $"\nTHE PROBE TOOK MORE THAN {Fmt.F(seconds, 0)} s AND WAS CUT OFF HERE: the keys were let go and "
+                      + "the game paused; what it printed until then is above. Keep a probe to one question's worth; "
+                      + "what takes long (whole walks, a fight to the end) belongs in run_harness.";
+        }
+        // A stop that comes before the game has answered the unpause still gives back what the probe printed.
+        catch (OperationCanceledException)
+        {
+            late = stopped;
         }
         finally
         {
@@ -226,7 +251,7 @@ sealed class Runner
         var restart = args.GetProperty("restart").GetBoolean();
         var pawnSeen = args.GetProperty("pawn_seen").GetBoolean();
         var mostDecisions = args.GetProperty("most_decisions").GetInt32();
-        var trace = Path.Combine(_runFolder, $"trace{n}.jsonl");
+        var trace = Path.Combine(_workFolder, $"trace{n}.jsonl");
         Harness harness;
         try
         {
@@ -307,7 +332,7 @@ sealed class Runner
             _link.Status("Looking at the results");
         }
         var summary = Runtime.Summarize(trace, errorLog: true);
-        await File.WriteAllTextAsync(Path.Combine(_runFolder, $"trace{n}_summary.txt"), summary).ConfigureAwait(false);
+        await File.WriteAllTextAsync(Path.Combine(_workFolder, $"trace{n}_summary.txt"), summary).ConfigureAwait(false);
         result.Progress.Episode = n;
         mostDecisions = Math.Max(mostDecisions, result.Decisions);
         try
@@ -319,9 +344,9 @@ sealed class Runner
         catch (Exception e) when (e is GameException or GameDisconnectedException)
         {
         }
-        if (mostDecisions < MinJevDecisions)
+        if (mostDecisions < MinDecisions)
             note += $"Note: Jev made {result.Decisions} decisions in this episode; a report needs an episode with at least "
-                    + $"{MinJevDecisions} (decisions among 2+ options), so this one can't settle the request.\n";
+                    + $"{MinDecisions} (decisions among 2+ options), so this one can't settle the request.\n";
         return new Dictionary<string, object?>
         {
             ["text"] = note, ["summary"] = summary, ["played"] = true, ["started"] = true, ["reason"] = result.Reason,
@@ -392,7 +417,8 @@ static class Carry
                 game.NavMaps[world] = map;
             }
         }
-        catch (Exception e) when (e is JsonException or IOException or InvalidOperationException or FormatException)
+        // Whatever is wrong with it: an earlier child wrote it, and it must not be what stops this one.
+        catch (Exception e)
         {
             Console.Error.WriteLine($"carry.json ignored: {e.Message}");
         }

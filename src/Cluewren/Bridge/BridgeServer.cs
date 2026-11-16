@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -16,15 +17,16 @@ namespace Cluewren.Bridge;
 
 public sealed class BridgeServer : IAsyncDisposable
 {
-    public const int Protocol = 1;
-    public const string NoMac = "update the Cluewren plugin in this project";
+    public const int Protocol = 2;
     public const string NotAuthenticated = "not authenticated";
+
+    public static string Version { get; } = typeof(BridgeServer).Assembly
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
 
     const int MaxHelloBytes = 64 * 1024;
     const int MaxHandshakes = 8;
     const int MaxRefusals = 8;
     const int MaxRefusedChars = 260;
-    const int MaxCloseBytes = 123;
 
     // Unity closes with this code when it reloads scripts on entering play mode, and comes back with the same session.
 
@@ -40,14 +42,20 @@ public sealed class BridgeServer : IAsyncDisposable
     BridgeServer(byte[] secret, ProjectScope scope, TimeSpan resumeWindow, WebApplication app)
     {
         _secret = secret;
-        Scope = scope;
+        _scope = scope;
         _resumeWindow = resumeWindow;
         _app = app;
     }
 
     public string Url { get; private set; } = "";
 
-    public ProjectScope Scope { get; }
+    volatile ProjectScope _scope;
+
+    public ProjectScope Scope => _scope;
+
+    // Once an editor is invited the run is that editor's project and no other: an editor of another project inside the
+    // folder the agent works in is refused like any other. The server owns the new scope from here on.
+    public void Expect(ProjectScope chosen) => Interlocked.Exchange(ref _scope, chosen).Dispose();
 
     public IReadOnlyList<string> Refused
     {
@@ -192,7 +200,7 @@ public sealed class BridgeServer : IAsyncDisposable
             var (first, tooLarge) = await ReceiveHelloAsync(socket, deadline.Token).ConfigureAwait(false);
             if (tooLarge)
             {
-                await RefuseAsync(socket, "hello too large", deadline.Token, "an editor whose hello was too large")
+                await RefuseAsync(socket, "hello", "hello too large", deadline.Token, "an editor whose hello was too large")
                     .ConfigureAwait(false);
                 return null;
             }
@@ -202,38 +210,39 @@ public sealed class BridgeServer : IAsyncDisposable
             var root = hello.RootElement;
             if (!IsHello(root) || !TryNonce(root, "nonce", out var pluginNonce))
             {
-                await RefuseAsync(socket, $"expected hello with protocol {Protocol}", deadline.Token,
-                    $"an editor whose hello isn't one of protocol {Protocol}").ConfigureAwait(false);
+                await RefuseAsync(socket, "hello", "expected a hello", deadline.Token, "a peer that sent no hello")
+                    .ConfigureAwait(false);
+                hello.Dispose();
+                return null;
+            }
+            if (!SpeaksProtocol(root))
+            {
+                await RefuseAsync(socket, "protocol", $"this cluewren speaks protocol {Protocol}", deadline.Token,
+                    $"an editor whose Cluewren plugin doesn't speak protocol {Protocol}: install the plugin of this release")
+                    .ConfigureAwait(false);
                 hello.Dispose();
                 return null;
             }
             // Until its mac is checked the peer may be another user's process, which reaches this port but can't read
-            // brain.json: nothing it sent touches the file system or a message before that.
-            if (!root.TryGetProperty("mac", out _))
-            {
-                await RefuseAsync(socket, NoMac, deadline.Token,
-                    "an editor with an older Cluewren plugin: update the plugin in its project").ConfigureAwait(false);
-                hello.Dispose();
-                return null;
-            }
+            // the invite: nothing it sent touches the file system or a message before that.
             if (!TryText(root, "project_dir", out var project) || !TryBytes(root, "mac", out var mac)
                 || !Handshake.VerifyHello(_secret, pluginNonce, project, mac))
             {
-                await RefuseAsync(socket, NotAuthenticated, deadline.Token, "an editor that did not authenticate")
+                await RefuseAsync(socket, "not_authenticated", NotAuthenticated, deadline.Token, "an editor that did not authenticate")
                     .ConfigureAwait(false);
                 hello.Dispose();
                 return null;
             }
             if (!ProjectScope.IsLocalPath(project))
             {
-                await RefuseAsync(socket, @"the project folder isn't a full local path (like C:\Games\Foo)", deadline.Token,
+                await RefuseAsync(socket, "project", @"the project folder isn't a full local path (like C:\Games\Foo)", deadline.Token,
                     $"{Shown(project)}: not a full local path").ConfigureAwait(false);
                 hello.Dispose();
                 return null;
             }
             if ((opened = Scope.Admit(project)) is not { } verified)
             {
-                await RefuseAsync(socket, $"this agent's run is for another project: {Scope.Described}", deadline.Token,
+                await RefuseAsync(socket, "project", $"this agent's run is for another project: {Scope.Described}", deadline.Token,
                     $"{Shown(project)}: another project").ConfigureAwait(false);
                 hello.Dispose();
                 return null;
@@ -244,7 +253,7 @@ public sealed class BridgeServer : IAsyncDisposable
             if (resumable is not null
                 && (EngineOf(root) != resumable.Engine || resumable.Project is not { } held || !held.Is(verified)))
             {
-                await RefuseAsync(socket, "the session it resumes is of another project or engine", deadline.Token,
+                await RefuseAsync(socket, "resume", "the session it resumes is of another project or engine", deadline.Token,
                     $"{Shown(project)}: resumed a session of another project or engine").ConfigureAwait(false);
                 hello.Dispose();
                 return null;
@@ -257,7 +266,7 @@ public sealed class BridgeServer : IAsyncDisposable
             using var answer = await BridgeLink.ReceiveAsync(socket, deadline.Token).ConfigureAwait(false);
             if (answer is null || !IsProof(answer.RootElement, pluginNonce, brainNonce))
             {
-                await RefuseAsync(socket, "bad proof", deadline.Token, $"{Shown(project)}: failed the proof")
+                await RefuseAsync(socket, "proof", "bad proof", deadline.Token, $"{Shown(project)}: failed the proof")
                     .ConfigureAwait(false);
                 hello.Dispose();
                 return null;
@@ -311,9 +320,10 @@ public sealed class BridgeServer : IAsyncDisposable
 
     static bool IsHello(JsonElement root) =>
         root.ValueKind == JsonValueKind.Object
-        && root.TryGetProperty("type", out var type) && type.ValueEquals("hello")
-        && root.TryGetProperty("protocol", out var protocol) && protocol.TryGetInt32(out var version)
-        && version == Protocol;
+        && root.TryGetProperty("type", out var type) && type.ValueEquals("hello");
+
+    static bool SpeaksProtocol(JsonElement hello) =>
+        hello.TryGetProperty("protocol", out var protocol) && protocol.TryGetInt32(out var version) && version == Protocol;
 
     bool IsProof(JsonElement root, byte[] pluginNonce, byte[] brainNonce) =>
         root.ValueKind == JsonValueKind.Object
@@ -353,7 +363,7 @@ public sealed class BridgeServer : IAsyncDisposable
             ["type"] = "welcome",
             ["role"] = "service",
             ["session"] = session,
-            ["features"] = Array.Empty<string>(),
+            ["brain_version"] = Version,
             ["nonce"] = Convert.ToBase64String(nonce),
             ["proof"] = Convert.ToBase64String(proof),
         });
@@ -378,17 +388,19 @@ public sealed class BridgeServer : IAsyncDisposable
         }
     }
 
-    async Task RefuseAsync(WebSocket socket, string message, CancellationToken ct, string noted)
+    // The plugin shows a text of its own for the code: before the proof it has no reason to show what this side wrote.
+    async Task RefuseAsync(WebSocket socket, string code, string message, CancellationToken ct, string noted)
     {
         Note(noted);
         var frame = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, string>
         {
             ["type"] = "error",
+            ["code"] = code,
             ["message"] = message,
         });
         await socket.SendAsync(frame, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
-        var reason = Encoding.UTF8.GetByteCount(message) <= MaxCloseBytes ? message : "refused";
-        await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation, reason, ct).ConfigureAwait(false);
+        // The code is the close's reason too: Godot's socket drops a text frame that arrives in the same poll as the close.
+        await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation, code, ct).ConfigureAwait(false);
     }
 
     void Note(string refusal)
@@ -414,7 +426,7 @@ public sealed class BridgeServer : IAsyncDisposable
         }
         finally
         {
-            Scope.Dispose();
+            _scope.Dispose();
             _stopping.Dispose();
         }
     }

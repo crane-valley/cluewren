@@ -1,11 +1,11 @@
 // Modified by Crane Valley: renamed for Cluewren.
-// Shared by the CluewrenCodex commandlet's files:
+// Shared by the CluewrenExport commandlet's files:
 //
-//   CluewrenCodexCommandlet.cpp   Main: finds the project's assets, writes each export file and summary.txt
-//   CluewrenCodexText.cpp         text helpers: names, types and property values as text, DiffProps
-//   CluewrenCodexBlueprints.cpp   blueprints/*.txt: a Blueprint and its graphs as pseudo-code
-//   CluewrenCodexInputData.cpp    input/*.txt and data/*.txt: input assets, enums, structs, curves, data assets
-//   CluewrenCodexMaps.cpp         maps.txt: the actors placed in each map
+//   CluewrenExportCommandlet.cpp   Main: finds the project's assets, writes each export file and summary.txt
+//   CluewrenExportText.cpp         text helpers: names, types and property values as text, DiffProps
+//   CluewrenExportBlueprints.cpp   blueprints/*.txt: a Blueprint and its graphs as pseudo-code
+//   CluewrenExportInputData.cpp    input/*.txt and data/*.txt: input assets, enums, structs, curves, data assets
+//   CluewrenExportMaps.cpp         maps.txt: the actors placed in each map
 
 #pragma once
 
@@ -22,7 +22,7 @@ class UObject;
 class UUserDefinedEnum;
 class UUserDefinedStruct;
 
-namespace CluewrenCodex
+namespace CluewrenExport
 {
 	// ---------------------------------------------------------------- limits
 
@@ -40,7 +40,7 @@ namespace CluewrenCodex
 	constexpr int32 MaxActorProps = 8;
 	constexpr int32 GcEvery = 20;
 
-	// --- text helpers (CluewrenCodexText.cpp) ------------------------------------------------------------------------
+	// --- text helpers (CluewrenExportText.cpp) ------------------------------------------------------------------------
 
 	/** At most Max characters, "..." added when cut. */
 	FString Cap(const FString& S, int32 Max);
@@ -116,16 +116,16 @@ namespace CluewrenCodex
 
 	// --- what each kind of asset reads as ---------------------------------------------------------------------------
 
-	FString ExportBlueprint(UBlueprint* BP, const FString& DisplayPath);  // CluewrenCodexBlueprints.cpp
+	FString ExportBlueprint(UBlueprint* BP, const FString& DisplayPath);  // CluewrenExportBlueprints.cpp
 
-	// CluewrenCodexInputData.cpp
+	// CluewrenExportInputData.cpp
 	FString ExportInputAction(UInputAction* IA, const FString& Path);
 	FString ExportMappingContext(UInputMappingContext* IMC, const FString& Path);
 	FString ExportUserEnum(UUserDefinedEnum* E, const FString& Path);
 	FString ExportUserStruct(UUserDefinedStruct* S, const FString& Path);
 	FString ExportGenericObject(UObject* O, const FString& Kind, const FString& Path);
 
-	// CluewrenCodexMaps.cpp: a map's actors, one row each
+	// CluewrenExportMaps.cpp: a map's actors, one row each
 	struct FActorRow
 	{
 		FString Class;

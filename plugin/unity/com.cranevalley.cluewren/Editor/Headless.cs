@@ -1,17 +1,17 @@
-// Modified by Crane Valley: no token; the brain comes from brain.json unless -PlaytestUrl names one on this machine; the
-// brain starts a run, so nothing here asks for one or reports one.
+// Modified by Crane Valley: no token; the brain's address comes from its invite alone; the brain starts a run, so
+// nothing here asks for one or reports one.
 // The editor in batch mode as a headless game (CI, scripted runs):
 //
 //   Unity.exe -batchmode -nographics -projectPath <project> -executeMethod Cluewren.Editor.Headless.Run
-//       [-PlaytestUrl=ws://127.0.0.1:...] [-PlaytestMap=<scene>] [-logFile <log>]
+//       [-CluewrenMap=<scene>] [-CluewrenConnectTimeout=<seconds>] [-logFile <log>]
 //
-// (never with -quit: the editor stays up for the brain). With -PlaytestEditMode it connects in edit mode and
-// waits for the brain to enter play mode (session start), as the Playtest window does. It opens the scene (-PlaytestMap, else the build's
-// first), writes the codex export when it is missing or stale, enters play mode, and connects once the scripts have
-// reloaded for it. Without -executeMethod, -PlaytestConnect on a batch-mode editor does the same.
+// (never with -quit: the editor stays up for the brain). With -CluewrenEditMode it connects in edit mode and waits for
+// the brain to enter play mode (session start), as an editor with its window does. It advertises itself, opens the
+// scene (-CluewrenMap, else the build's first), writes the project export when it is missing or stale, enters play
+// mode, and connects once the scripts have reloaded for it and a brain has invited it. Without -executeMethod,
+// -CluewrenConnect on a batch-mode editor does the same.
 
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -31,10 +31,9 @@ namespace Cluewren.Editor
         {
             if (SessionState.GetBool(EditorHost.HeadlessKey, false)) return;
             SessionState.SetBool(EditorHost.HeadlessKey, true);
-            var url = PlaytestClient.Arg("PlaytestUrl");
+            EditorHost.Advertise();
             var state = new Dictionary<string, object>
             {
-                ["url"] = url,
                 ["want"] = true,
                 ["session"] = "",
                 ["run_active"] = false,
@@ -42,14 +41,12 @@ namespace Cluewren.Editor
                 ["connect_timeout"] = PlaytestClient.CommandLineConnectTimeout(),
                 ["welcomed"] = false,
             };
-            Debug.Log($"[Cluewren] Headless editor -> {(string.IsNullOrEmpty(url) ? "brain.json" : url)}");
-            var map = PlaytestClient.Arg("PlaytestMap");
-            if (string.IsNullOrEmpty(map)) map = PlaytestClient.Arg("PlaytestScene");
-            var project = Directory.GetParent(Application.dataPath).FullName;
+            Debug.Log("[Cluewren] Headless editor: waiting for a run to invite it");
+            var map = PlaytestClient.Arg("CluewrenMap");
+            var project = EditorHost.ProjectDirOf(Application.dataPath);
             try
             {
-                if (CodexExport.Needed(project) != null)
-                    CodexExport.Export(Path.Combine(project, "Library", "CluewrenCodex"));
+                if (ProjectExport.Needed(project) != null) ProjectExport.Export(project);
             }
             catch (System.Exception e)
             {
@@ -66,13 +63,13 @@ namespace Cluewren.Editor
                 var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
                 if (first != null) EditorSceneManager.OpenScene(first.path, OpenSceneMode.Single);
             }
-            if (PlaytestClient.Flag("PlaytestEditMode"))
+            if (PlaytestClient.Flag("CluewrenEditMode"))
             {
-                // Connect now, in edit mode, as the Playtest window does: the brain enters play mode (session start)
+                // Connect now, in edit mode, as an editor with its window does: the brain enters play mode (session start)
                 var client = EditorHost.Ensure();
                 client.ExitOnFailure = true;
                 client.ConnectTimeout = PlaytestClient.CommandLineConnectTimeout();
-                client.Connect(url);
+                client.Connect();
                 return;
             }
             // The client connects after the scripts reload for play mode (EditorHost.Restore); the wait for the brain's

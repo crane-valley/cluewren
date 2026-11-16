@@ -1,5 +1,5 @@
 // Modified by Crane Valley: rc reaches only project and Unity members, never a refused namespace, editor-only assembly
-// or named member (Refused, docs/adr/0014), nor a path into UserSettings/Cluewren; resolved members are cached; ToJson enumerates arrays and materialized collections, never a lazy iterator; assembly-qualified type names aren't loaded.
+// or named member (Refused, docs/adr/0014), nor a path into the project's .cluewren folder; resolved members are cached; ToJson enumerates arrays and materialized collections, never a lazy iterator; assembly-qualified type names aren't loaded.
 // rc: Remote Control compatible calls over C# reflection (docs/protocol.md, `rc`; the Unity notes in this package's
 // README). call / property (read, write) / describe on GameObjects, components, types (static members) and other Unity
 // objects. Values are native: Unity's axes, metres, vectors as lowercase {"x","y","z"}.
@@ -456,6 +456,7 @@ namespace Cluewren
 
         static Target Resolve(string path)
         {
+            if (Paths.DataPath(path)) throw new RcError($"{path} is refused: nothing in .cluewren is opened for rc", 403);
             var o = Paths.Resolve(path);
             if (o == null || (o is Object uo && uo == null))
                 throw new RcError($"Object {path} does not exist");
@@ -1127,8 +1128,7 @@ namespace Cluewren
             switch (json)
             {
                 case string text:
-                    return (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0) && Paths.DataPath(text)
-                        ? $"{text} is refused: nothing in UserSettings/Cluewren is opened for rc" : null;
+                    return Paths.DataPath(text) ? $"{text} is refused: nothing in .cluewren is opened for rc" : null;
                 case IDictionary dict:
                     foreach (DictionaryEntry e in dict)
                         if ((RefusedPathIn(e.Key, depth + 1) ?? RefusedPathIn(e.Value, depth + 1)) is { } found) return found;
@@ -1153,8 +1153,8 @@ namespace Cluewren
         static object ConvertJson(object json, Type type, object current)
         {
             if (RefusedType(type)) throw new RcError($"{TypeName(type)} is refused", 403);
-            if (json is string text && (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0) && Paths.DataPath(text))
-                throw new RcError($"{text} is refused: nothing in UserSettings/Cluewren is opened for rc", 403);
+            if (json is string text && Paths.DataPath(text))
+                throw new RcError($"{text} is refused: nothing in .cluewren is opened for rc", 403);
             if (type == typeof(object))
             {
                 var inside = RefusedPathIn(json, 0);

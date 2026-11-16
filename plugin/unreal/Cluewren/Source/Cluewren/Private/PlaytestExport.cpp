@@ -1,7 +1,7 @@
 // Modified by Crane Valley: the export starting and staleness parts of upstream's PlaytestCodex.cpp; the codex_manifest and
 // codex_read ops, hashing, progress and stopping are removed (ADR 0003), and a run start triggers it.
-// Keeps Saved/CluewrenCodex fresh: the Blueprint export the CluewrenCodex commandlet writes, run as a child
-// process, never in this one: it loads every asset.
+// Keeps .cluewren/export in the project fresh: the Blueprint export the CluewrenExport commandlet writes, run as a
+// child process, never in this one: it loads every asset.
 
 #include "PlaytestInternal.h"
 
@@ -11,6 +11,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
 namespace PlaytestExport
@@ -23,7 +24,8 @@ namespace
 	struct FRoots
 	{
 		FString Project;  // the project's directory
-		FString Export;   // <ProjectSavedDir>/CluewrenCodex
+		FString Kept;     // <Project>/.cluewren
+		FString Export;   // <Project>/.cluewren/export
 		FString Content;  // the project's Content/
 		FString Plugins;  // the project's Plugins/
 	};
@@ -39,7 +41,8 @@ namespace
 	{
 		FRoots Roots;
 		Roots.Project = Clean(FPaths::ProjectDir());
-		Roots.Export = Clean(FPaths::ProjectSavedDir() / TEXT("CluewrenCodex"));
+		Roots.Kept = Roots.Project / TEXT(".cluewren");
+		Roots.Export = Roots.Kept / TEXT("export");
 		Roots.Content = Clean(FPaths::ProjectContentDir());
 		Roots.Plugins = Clean(FPaths::ProjectPluginsDir());
 		return Roots;
@@ -174,23 +177,29 @@ namespace
 		const FString Cmd = FindEditorCmd();
 		if (Cmd.IsEmpty())
 		{
-			UE_LOG(LogPlaytest, Warning, TEXT("[Cluewren] UnrealEditor-Cmd wasn't found next to %s: no Blueprint export"), FPlatformProcess::ExecutablePath());
+			UE_LOG(LogCluewren, Warning, TEXT("[Cluewren] UnrealEditor-Cmd wasn't found next to %s: no Blueprint export"), FPlatformProcess::ExecutablePath());
 			return;
 		}
 		const FRoots Roots = GetRoots();
+		// Whoever makes .cluewren first keeps it out of the game's repository, the brain or this.
+		const FString Ignore = Roots.Kept / TEXT(".gitignore");
+		if (!FPaths::FileExists(Ignore))
+		{
+			FFileHelper::SaveStringToFile(TEXT("*\n"), *Ignore, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		}
 		const FString UProject = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
-		const FString Log = Roots.Project / TEXT("Saved/Logs/CluewrenCodexExport.log");
-		const FString Params = FString::Printf(TEXT("\"%s\" -run=CluewrenCodex -out=\"%s\" -unattended -nullrhi -nosplash -nop4 -abslog=\"%s\""), *UProject, *Roots.Export, *Log);
+		const FString Log = Clean(FPaths::ProjectLogDir() / TEXT("CluewrenExport.log"));
+		const FString Params = FString::Printf(TEXT("\"%s\" -run=CluewrenExport -out=\"%s\" -unattended -nullrhi -nosplash -nop4 -abslog=\"%s\""), *UProject, *Roots.Export, *Log);
 		uint32 ProcessId = 0;
 		// Hidden, below normal priority: the game keeps its frames
 		Export = FPlatformProcess::CreateProc(*Cmd, *Params, false, true, true, &ProcessId, -1, nullptr, nullptr);
 		if (Export.IsValid())
 		{
-			UE_LOG(LogPlaytest, Display, TEXT("[Cluewren] Exporting Blueprints to %s (process %u)"), *Roots.Export, ProcessId);
+			UE_LOG(LogCluewren, Display, TEXT("[Cluewren] Exporting Blueprints to %s (process %u)"), *Roots.Export, ProcessId);
 		}
 		else
 		{
-			UE_LOG(LogPlaytest, Warning, TEXT("[Cluewren] Couldn't start %s"), *Cmd);
+			UE_LOG(LogCluewren, Warning, TEXT("[Cluewren] Couldn't start %s"), *Cmd);
 		}
 	}
 }
@@ -231,7 +240,7 @@ void Tick()
 		FPlatformProcess::GetProcReturnCode(Export, &Code);
 		FPlatformProcess::CloseProc(Export);
 		Export = FProcHandle();
-		UE_LOG(LogPlaytest, Display, TEXT("[Cluewren] Blueprint export ended with code %d"), Code);
+		UE_LOG(LogCluewren, Display, TEXT("[Cluewren] Blueprint export ended with code %d"), Code);
 	}
 }
 

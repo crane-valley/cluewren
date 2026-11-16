@@ -53,6 +53,7 @@ namespace Cluewren
             public long N;        // a recording's frame: its number
             public int RecGen;
             public int ConnGen;
+            public int Session;   // a still: the session its request came in
             public int MaxDim;
             public int Quality;
             public double Started;
@@ -173,9 +174,10 @@ namespace Cluewren
                 Quality = (int)Clamp(Json.Num(args, "quality", 90), 1, 100),
                 Started = PlaytestClient.Now,
                 ConnGen = client.ConnectionGeneration,
+                Session = client.SessionSerial,
             };
             host.StartCoroutine(Grab(client, job));
-            // (answered by the worker; this only answers when the picture never came: the game stopped first)
+            // (answered once the worker has encoded it; this only answers when the picture never came: the game stopped first)
             client.AddPending(new Pending
             {
                 Id = id,
@@ -315,7 +317,7 @@ namespace Cluewren
         static void FailStill(PlaytestClient client, Job job, int status, string error)
         {
             if (!job.Still || Interlocked.CompareExchange(ref job.State, 1, 0) != 0) return;
-            MainThread.Post(() => client.RespondError(job.Id, error, status));
+            client.InSession(job.Session, () => client.RespondError(job.Id, error, status));
         }
 
 #if CLUEWREN_SCREENCAPTURE && CLUEWREN_IMAGECONVERSION
@@ -434,8 +436,9 @@ namespace Cluewren
                 var jpeg = ImageConversion.EncodeArrayToJPG(pixels, GraphicsFormat.R8G8B8A8_UNorm, (uint)job.W, (uint)job.H, 0, job.Quality);
                 if (job.Still)
                 {
-                    if (Interlocked.CompareExchange(ref job.State, 1, 0) == 0)
-                        client.SendResponseText(StillJson(job.Id, job.W, job.H, job.T, Convert.ToBase64String(jpeg)));
+                    if (Interlocked.CompareExchange(ref job.State, 1, 0) != 0) return;
+                    var answer = StillJson(job.Id, job.W, job.H, job.T, Convert.ToBase64String(jpeg));
+                    client.InSession(job.Session, () => client.SendResponseText(answer));
                     return;
                 }
                 var message = FrameMessage(job.N, job.T, job.Wall, job.W, job.H, jpeg);

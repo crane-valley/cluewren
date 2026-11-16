@@ -18,7 +18,7 @@ lists the script's own variables, constants and functions first. Engine singleto
 are Input, InputMap, Engine, Time, Performance, Geometry2D/3D and the physics, navigation, audio, translation and rendering
 servers, with getters alone of OS, ProjectSettings and DisplayServer (`OS.get_name`, `ProjectSettings.get_setting`,
 `DisplayServer.window_get_size`...). Files, the network, processes, threads, code (a script's source, `call`/`set` by name),
-the clipboard, the environment, the editor and anything under `res://.godot/` answer 403 "... is refused": read the
+the clipboard, the environment, the editor and anything under `res://.godot/` or `res://.cluewren/` answer 403 "... is refused": read the
 project's files with your own tools. Values are
 Godot's own: metres, x right, y up, -z forward, vectors `{"x","y","z"}`, a node as its path, a resource as its `res://`
 path, an enum as its name, a `rotation` in radians. Turn a position or velocity into the kit's frame with

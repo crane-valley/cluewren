@@ -1,21 +1,29 @@
-# Modified by Crane Valley: the brain is found through brain.json and must prove itself with a mutual HMAC handshake, a
+# Modified by Crane Valley: the brain is found through its invite and must prove itself with a mutual HMAC handshake, a
 # dropped connection resumes its session, and the bearer token, default URL and hosted-service paths are removed.
 ## The connection out to the brain: one WebSocket (WebSocketPeer) carrying JSON text frames. Polled every frame by its
-## owner; reconnects with a backoff (1 s doubling to 15 s) while wanted. The address and the secret are read again at
-## every attempt: a brain that restarts has another port and secret.
+## owner. While wanted and not connected it looks for the brain's invite once a second, and after a connection that
+## failed it tries again with a backoff (1 s doubling to 15 s). The address and the secret are the invite's at every
+## attempt: each run has its own.
 @tool
 extends RefCounted
 
 const Discovery = preload("discovery.gd")
 const Handshake = preload("handshake.gd")
-const PROTOCOL := 1
 const MAX_BACKOFF := 15.0
-const FILE_POLL_SECONDS := 2.0
+const LOOK_SECONDS := 1.0
 const CONNECT_SECONDS := 10.0
 const MAX_HELD := 200
 const CLOSE_NORMAL := 1000
 const CLOSE_POLICY := 1008
 const CLOSE_RELOAD := 1012
+const REFUSED := "The brain refused the connection"
+# A brain that refuses a hello has not proved itself: its code picks one of these texts, and its own words are not shown.
+const REFUSALS := {
+	"protocol": Discovery.OTHER_RELEASE,
+	"not_authenticated": "The brain did not accept this editor's proof of the invite",
+	"project": "The run is for another project than this editor's",
+	"resume": "The session this editor tried to resume belongs to another project or engine",
+}
 
 var url := ""
 var ws: WebSocketPeer = null
@@ -25,8 +33,6 @@ var role := ""  # the brain's role from its welcome ("" until welcomed)
 var session := ""  # the brain's session, kept across a drop to ask for it back
 var received := 0  # the newest request taken: on a resume, the brain sends again what came after it
 var problem := ""  # what went wrong last, in words
-var problem_code := 0  # the code of the error frame the brain refused with (0: none)
-var refused_stamp := -1  # brain.json's time when its brain was refused: only a new brain is tried again
 var backoff := 1.0
 var next_try := 0.0
 var hello_fields: Callable  # () -> Dictionary: what the host says in its hello
@@ -43,44 +49,43 @@ var _said_hello := false
 var _asked_resume := ""
 var _deadline := 0.0
 var _held := PackedStringArray()
+var _refused := false  # the problem is a brain's refusal: it stays shown when that brain takes its invite away
 static var _control_chars := RegEx.create_from_string("[\\x00-\\x1f]")
+static var _code_shape := RegEx.create_from_string("^[a-z0-9_]{1,32}$")
 
 
 func _now() -> float:
 	return Time.get_ticks_msec() / 1000.0
 
 
+static func refusal_text(code: String) -> String:
+	return REFUSALS.get(code, "%s (%s)" % [REFUSED, code])
+
+
 func open() -> void:
 	want = true
 	backoff = 1.0
 	problem = ""
-	problem_code = 0
+	_refused = false
 	_connect()
 
 
 func _connect() -> void:
 	close_socket()
-	var path := Discovery.file_path()
-	var why := _discovery.check(path)
-	if why == Discovery.PENDING:
+	var invite := _discovery.look()
+	if invite.has("pending"):
 		next_try = _now() + 0.05
 		return
-	if why != "":
-		problem = why
-		next_try = _now() + FILE_POLL_SECONDS
+	if not invite.has("url"):
+		if invite.has("problem"):
+			problem = invite.problem
+		elif invite.has("absent") and not _refused:
+			problem = ""
+		next_try = _now() + LOOK_SECONDS
 		return
-	var brain := Discovery.read(path, Discovery.project_dir())
-	if brain.has("error"):
-		problem = brain.error
-		next_try = _now() + FILE_POLL_SECONDS
-		return
-	url = brain.url
-	why = Discovery.check_url(url)
-	if why != "":
-		problem = why
-		next_try = _now() + FILE_POLL_SECONDS
-		return
-	_secret = brain.secret
+	_refused = false
+	url = invite.url
+	_secret = invite.secret
 	ws = WebSocketPeer.new()
 	ws.inbound_buffer_size = 16 * 1024 * 1024
 	ws.outbound_buffer_size = 64 * 1024 * 1024
@@ -129,8 +134,10 @@ func _forget_socket() -> void:
 	_deadline = 0.0
 
 
+## After a connection that failed or ended. The invite is validated again before the next one: its brain may be gone.
 func _schedule() -> void:
 	_forget_socket()
+	_discovery.forget()
 	if want:
 		next_try = _now() + backoff
 		backoff = minf(backoff * 2.0, MAX_BACKOFF)
@@ -140,7 +147,7 @@ func _send_hello() -> void:
 	_nonce = Handshake.new_nonce()
 	var h: Dictionary = hello_fields.call()
 	h.type = "hello"
-	h.protocol = PROTOCOL
+	h.protocol = Discovery.PROTOCOL
 	h.nonce = Marshalls.raw_to_base64(_nonce)
 	h.project_dir = Discovery.project_dir()
 	h.mac = Marshalls.raw_to_base64(Handshake.hello_mac(_secret, _nonce, h.project_dir))
@@ -181,13 +188,19 @@ func poll() -> void:
 func _closed() -> void:
 	var was := connected
 	var code := ws.get_close_code()
+	if not was and code == CLOSE_POLICY:
+		# The brain refuses with an error frame and then this close, and WebSocketPeer drops a frame that comes in the
+		# same poll as the close. The refusal counts all the same; its code is known when the close's reason carries it.
+		var reason := ws.get_close_reason()
+		_refuse("Refused: " + (refusal_text(reason) if _code_shape.search(reason) else REFUSED), CLOSE_POLICY)
+		return
 	if was:
 		problem = "Connection closed (%d %s)" % [code, ws.get_close_reason()]
 		if code == CLOSE_NORMAL:
 			session = ""
 			received = 0
 			_held.clear()
-	elif problem_code == 0:
+	else:
 		problem = "Can't reach the brain at %s. Trying again..." % url
 	_schedule()
 	if on_closed.is_valid():
@@ -196,20 +209,22 @@ func _closed() -> void:
 
 func _take(text: String) -> void:
 	var frame = _json.data if _json.parse(text) == OK else null
+	var type := str(frame.get("type", "")) if typeof(frame) == TYPE_DICTIONARY else ""
 	if not connected:
-		if typeof(frame) == TYPE_DICTIONARY and frame.get("type") == "welcome" and _proved(frame):
+		if type == "welcome" and _proved(frame):
 			_welcomed(frame)
+		elif type == "error" and typeof(frame.get("code")) == TYPE_STRING and _code_shape.search(frame.code):
+			_refuse("Refused: " + refusal_text(frame.code), CLOSE_NORMAL)
 		else:
 			_refuse("Refused %s: it didn't prove it is this machine's brain" % url, CLOSE_POLICY)
 		return
 	if typeof(frame) != TYPE_DICTIONARY:
 		push_warning("Cluewren: unreadable message from the brain")
 		return
-	match frame.get("type"):
+	match type:
 		"request":
 			received = maxi(received, int(frame.get("id", 0)))
 		"error":
-			problem_code = int(frame.get("code", 0))
 			_refuse(str(frame.get("message", "the brain gave up")), CLOSE_NORMAL)
 			return
 	on_frame.call(frame, text)
@@ -241,7 +256,6 @@ func _welcomed(frame: Dictionary) -> void:
 		_held.clear()
 	backoff = 1.0
 	problem = ""
-	problem_code = 0
 	connected = true
 	for held in _held:
 		ws.send_text(held)
@@ -249,17 +263,17 @@ func _welcomed(frame: Dictionary) -> void:
 	on_welcomed.call(resumed)
 
 
-## No reconnect: whatever answers here doesn't know this machine's secret, and asking again won't change that. Only a new
-## brain.json is tried.
+## No reconnect: asking the same brain again won't change its answer. Only an invite that changed is taken up.
 func _refuse(why: String, code: int) -> void:
-	want = false
 	session = ""
 	received = 0
 	_held.clear()
 	problem = why
-	refused_stamp = FileAccess.get_modified_time(Discovery.file_path())
+	_refused = true
+	_discovery.refuse()
 	ws.close(code, "refused")
 	_forget_socket()
+	next_try = _now() + LOOK_SECONDS
 	if on_refused.is_valid():
 		on_refused.call()
 

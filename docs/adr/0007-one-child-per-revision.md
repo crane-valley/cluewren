@@ -1,6 +1,6 @@
 # 0007 What one child per harness revision keeps, and how it is granted
 
-Status: accepted
+Status: accepted, the run folder's grant amended by 0018
 Date: 2026-10-31
 
 ## Context

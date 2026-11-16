@@ -1,8 +1,8 @@
 // Modified by Crane Valley: renamed for Cluewren.
-// The CluewrenCodex commandlet's Blueprints (blueprints/*.txt): a Blueprint's components, variables, widgets and
+// The CluewrenExport commandlet's Blueprints (blueprints/*.txt): a Blueprint's components, variables, widgets and
 // class defaults, and its graphs as pseudo-code (FGraphRenderer).
 
-#include "CluewrenCodexInternal.h"
+#include "CluewrenExportInternal.h"
 
 #include "Animation/WidgetAnimation.h"
 #include "Blueprint/WidgetTree.h"
@@ -39,7 +39,7 @@
 #include "UObject/UnrealType.h"
 #include "WidgetBlueprint.h"
 
-namespace CluewrenCodex
+namespace CluewrenExport
 {
 	// ---------------------------------------------------------------- graph renderer
 

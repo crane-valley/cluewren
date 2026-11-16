@@ -8,7 +8,7 @@
 extends RefCounted
 
 const Values = preload("values.gd")
-const Codex = preload("codex.gd")
+const Export = preload("export.gd")
 
 const FULL_SINGLETONS := ["Input", "InputMap", "Engine", "Time", "Performance", "PhysicsServer2D", "PhysicsServer3D",
 	"NavigationServer2D", "NavigationServer3D", "AudioServer", "TranslationServer", "RenderingServer", "Geometry2D",
@@ -55,6 +55,7 @@ const REFUSED_MEMBERS := {
 }
 
 var host: Node  # the autoload: for the tree
+var _own: String  # the addon's folder
 var _methods := {}  # script or class name -> {method name: info}
 var _properties := {}  # script or class name -> {property name: info}
 var _classes := {}  # class_name -> script path
@@ -63,10 +64,15 @@ var _declared := {}  # script -> {member: true}
 var _verdicts := {}  # "class|member|op" -> why, "" when allowed
 var _class_verdicts := {}  # class -> why the class is refused whole, "" when it isn't
 var _class_properties := {}  # class -> {property name: true}
+var _own_sources := {}  # sha256 of each of the addon's scripts' text -> true
+var _sources := {}  # script -> whether its source is one of the addon's
 
 
 func _init(owner_node: Node) -> void:
 	host = owner_node
+	var folder := (get_script() as Script).resource_path.get_base_dir().get_base_dir()
+	_own = Export.resolved(folder) + "/"
+	_hash_sources(folder)
 	for s in Engine.get_singleton_list():
 		var o = Engine.get_singleton(s)
 		if o:
@@ -82,6 +88,11 @@ func missing(path: String) -> String:
 func refused(obj: Object, member: String, op: String) -> String:
 	if obj == null:
 		return ""
+	# The autoload holds the link to the brain, and the addon's scripts read the invite and its secret.
+	if obj == host:
+		return "%s is refused: the Cluewren addon's own node is out of rc's reach" % host.get_path()
+	if obj is Script and (addon_file(obj.resource_path) or _addon_script(obj)):
+		return OWN % obj.resource_path
 	var singleton: String = _singletons.get(obj.get_instance_id(), "")
 	if singleton != "" and singleton not in FULL_SINGLETONS:
 		if not LISTED_SINGLETONS.has(singleton):
@@ -167,12 +178,45 @@ func declares(script: Script, member: String) -> bool:
 
 
 func refused_arguments(json, values) -> String:
-	var flat := str(json)
-	var why := _refused_paths(json, 0) if "/" in flat or "\\" in flat else ""
+	var why := _refused_paths(json, 0)
 	return why if why != "" else _refused_values(values, 0)
 
 
 const TOO_DEEP := "A value nested more than %d deep is refused: rc can't check it" % Values.MAX_DEPTH
+const DATA := "%s is refused: nothing under res://.godot/ or res://.cluewren/ is loaded for rc"
+const OWN := "%s is refused: the Cluewren addon's own scripts are out of rc's reach"
+
+
+## Whether a path names a file of the addon, however it is spelled (Windows opens any case of it).
+func addon_file(path: String) -> bool:
+	return path != "" and (Export.resolved(path) + "/").begins_with(_own)
+
+
+# A junction or a copy reaches the addon's scripts under a path of its own: once loaded they are known by what they hold.
+func _hash_sources(dir: String) -> void:
+	var d := DirAccess.open(dir)
+	if d == null:
+		return
+	for f in d.get_files():
+		if f.get_extension() == "gd":
+			_own_sources[FileAccess.get_file_as_string(dir.path_join(f)).sha256_text()] = true
+	for sub in d.get_directories():
+		_hash_sources(dir.path_join(sub))
+
+
+## What the script in memory holds: nothing is read for it.
+func _addon_script(script: Script) -> bool:
+	if not _sources.has(script):
+		var text: String = script.source_code
+		_sources[script] = text != "" and _own_sources.has(text.sha256_text())
+	return _sources[script]
+
+
+# By the text alone: rc opens nothing a string names to decide about it.
+func _refused_text(text: String) -> String:
+	if Export.data_path(text):
+		return DATA % text
+	return OWN % text if addon_file(text) else ""
 
 
 func _refused_paths(j, depth: int) -> String:
@@ -180,8 +224,7 @@ func _refused_paths(j, depth: int) -> String:
 		return TOO_DEEP
 	match typeof(j):
 		TYPE_STRING:
-			if ("/" in j or "\\" in j) and Codex.data_path(j):
-				return "%s is refused: nothing under res://.godot/ is loaded for rc" % j
+			return _refused_text(j)
 		TYPE_ARRAY:
 			for x in j:
 				var why := _refused_paths(x, depth + 1)
@@ -203,9 +246,7 @@ func _refused_values(v, depth: int) -> String:
 		TYPE_OBJECT:
 			return refused(v, "", "argument") if is_instance_valid(v) else ""
 		TYPE_STRING, TYPE_STRING_NAME, TYPE_NODE_PATH:
-			var text := str(v)
-			if ("/" in text or "\\" in text) and Codex.data_path(text):
-				return "%s is refused: nothing under res://.godot/ is loaded for rc" % text
+			return _refused_text(str(v))
 		TYPE_ARRAY, TYPE_PACKED_STRING_ARRAY:
 			for x in v:
 				var t := typeof(x)
@@ -237,7 +278,7 @@ func resolve(path: String) -> Object:
 	if path.begins_with("/"):
 		return root.get_node_or_null(NodePath(path))
 	if path.begins_with("res://") or path.begins_with("uid://"):
-		if not Codex.data_path(path) and ResourceLoader.exists(path):
+		if _refused_text(path) == "" and ResourceLoader.exists(path):
 			return load(path)
 		return null
 	if Engine.has_singleton(path):
@@ -252,12 +293,15 @@ func resolve(path: String) -> Object:
 	if _classes.is_empty():
 		for c in ProjectSettings.get_global_class_list():
 			_classes[str(c.get("class", ""))] = str(c.get("path", ""))
-	return load(_classes[path]) if _classes.has(path) and not Codex.data_path(_classes[path]) else null
+	if not _classes.has(path) or _refused_text(_classes[path]) != "":
+		return null
+	return load(_classes[path])
 
 
 func _target(path: String, op: String) -> Array:
-	if (path.begins_with("res://") or path.begins_with("uid://")) and Codex.data_path(path):
-		return [null, "%s is refused: nothing under res://.godot/ is loaded for rc" % path, 403]
+	var named := _refused_text(path)
+	if named != "":
+		return [null, named, 403]
 	if Engine.has_singleton(path) and _editor_class(path):
 		return [null, "%s is refused: the editor's classes are out of rc's reach" % path, 403]
 	var obj := resolve(path)

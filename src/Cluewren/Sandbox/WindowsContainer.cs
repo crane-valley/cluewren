@@ -120,7 +120,7 @@ public sealed class WindowsContainer : ISandboxProcess
         return sid;
     }
 
-    static void Grant(string folder, string sid)
+    static void Grant(string folder, string sid, FileSystemRights rights)
     {
         var identity = new SecurityIdentifier(sid);
         var info = new DirectoryInfo(folder);
@@ -128,7 +128,7 @@ public sealed class WindowsContainer : ISandboxProcess
         foreach (FileSystemAccessRule rule in security.GetAccessRules(true, false, typeof(SecurityIdentifier)))
             if (rule.IdentityReference.Equals(identity))
                 return;
-        security.AddAccessRule(new FileSystemAccessRule(identity, FileSystemRights.Modify | FileSystemRights.Synchronize,
+        security.AddAccessRule(new FileSystemAccessRule(identity, rights | FileSystemRights.Synchronize,
             InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         info.SetAccessControl(security);
     }
@@ -186,10 +186,15 @@ public sealed class WindowsContainer : ISandboxProcess
                 throw new Win32Exception(result);
             var identity = new SecurityIdentifier(SidOf(sid));
             FreeSid(sid);
-            var info = new DirectoryInfo(runFolder);
-            var security = info.GetAccessControl();
-            security.PurgeAccessRules(identity);
-            info.SetAccessControl(security);
+            foreach (var folder in new[] { Path.Combine(runFolder, "work"), runFolder })
+            {
+                var info = new DirectoryInfo(folder);
+                if (!info.Exists && folder != runFolder)
+                    continue;
+                var security = info.GetAccessControl();
+                security.PurgeAccessRules(identity);
+                info.SetAccessControl(security);
+            }
             purged = true;
         }
         catch (DirectoryNotFoundException)
@@ -245,7 +250,10 @@ public sealed class WindowsContainer : ISandboxProcess
             if (contained)
             {
                 sid = Profile(spec.ContainerName);
-                Grant(spec.RunFolder, SidOf(sid));
+                // What the brain and the agent wrote for this run the child reads and loads; it writes only under work.
+                Grant(spec.RunFolder, SidOf(sid), FileSystemRights.ReadAndExecute);
+                Directory.CreateDirectory(spec.WorkFolder);
+                Grant(spec.WorkFolder, SidOf(sid), FileSystemRights.Modify);
             }
             job = NewJob(spec.MemoryLimitBytes, processes: 1);
             var uncapped = CapCpu(job);
@@ -286,7 +294,7 @@ public sealed class WindowsContainer : ISandboxProcess
                 lpAttributeList = list,
             };
             if (!CreateProcess(spec.Dotnet, new StringBuilder(spec.CommandLine), IntPtr.Zero, IntPtr.Zero, true,
-                    ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment, environment, spec.RunFolder,
+                    ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment, environment, spec.WorkFolder,
                     ref startup, out var created))
                 throw new Win32Exception();
             process = created.hProcess;

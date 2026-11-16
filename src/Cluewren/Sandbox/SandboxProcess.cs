@@ -32,6 +32,10 @@ public sealed class SandboxException(string message) : Exception(message);
 
 public sealed record ChildSpec(string Dotnet, string ChildDll, string RunFolder, long MemoryLimitBytes)
 {
+    // The one folder under the run's that harness code may write: what it traces, what it carries to the next child, its
+    // temporary files. The rest of the run's folder is the brain's and the agent's.
+    public string WorkFolder => Path.Combine(RunFolder, "work");
+
     public string ContainerName => ContainerNameOf(RunFolder);
 
     public static string ContainerNameOf(string runFolder)
@@ -56,7 +60,7 @@ public sealed record ChildSpec(string Dotnet, string ChildDll, string RunFolder,
                  })
             if (System.Environment.GetEnvironmentVariable(name) is { } value)
                 environment[name] = value;
-        var temporary = Path.Combine(RunFolder, "tmp");
+        var temporary = Path.Combine(WorkFolder, "tmp");
         Directory.CreateDirectory(temporary);
         environment["TEMP"] = temporary;
         environment["TMP"] = temporary;
@@ -311,7 +315,7 @@ public sealed class PlainChild : ISandboxProcess
         var start = new ProcessStartInfo
         {
             FileName = wrapper is { Count: > 0 } ? wrapper[0] : spec.Dotnet,
-            WorkingDirectory = spec.RunFolder,
+            WorkingDirectory = spec.WorkFolder,
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -368,41 +372,15 @@ public static class SandboxStarter
         _ => null,
     };
 
-    // Absolute entries only: a relative or empty one names a different folder depending on where the brain was started.
-    public static string? FindBubblewrap(string? path) =>
-        path?.Split(Path.PathSeparator).Where(Path.IsPathFullyQualified)
-            .Select(folder => Path.GetFullPath(Path.Combine(folder, "bwrap"))).FirstOrDefault(File.Exists);
-
-    static string[]? Bubblewrap(ChildSpec spec)
-    {
-        if (FindBubblewrap(Environment.GetEnvironmentVariable("PATH")) is not { } bwrap)
-            return null;
-        var command = new List<string>
-        {
-            bwrap, "--unshare-all", "--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-            "--tmpfs", "/tmp", "--tmpfs", DiscoveryFile.DefaultFolder, "--bind", spec.RunFolder, spec.RunFolder,
-            "--chdir", spec.RunFolder, "--clearenv",
-        };
-        foreach (var (name, value) in spec.Environment())
-            command.AddRange(["--setenv", name, value]);
-        command.AddRange(["--setenv", "HOME", "/tmp", "--"]);
-        return [.. command];
-    }
-
-    public static (ISandboxProcess Process, string? Note, string? Uncapped) Start(ChildSpec spec, SandboxMode mode)
+    // keepContained: a container held this run's earlier children. What stops the next one from being made may be what
+    // harness code left behind, so no child is started outside it.
+    public static (ISandboxProcess Process, string? Note, string? Uncapped) Start(ChildSpec spec, SandboxMode mode,
+        bool keepContained = false)
     {
         if (OperatingSystem.IsWindows())
-            return StartOnWindows(spec, mode);
+            return StartOnWindows(spec, mode, keepContained);
         if (mode == SandboxMode.Process)
             return (PlainChild.Start(spec), null, null);
-        if (OperatingSystem.IsLinux())
-        {
-            if (Bubblewrap(spec) is { } wrapper)
-                return (PlainChild.Start(spec, wrapper, "bwrap"), null, null);
-            if (mode == SandboxMode.Contained)
-                throw new SandboxException("bubblewrap isn't available");
-            return (PlainChild.Start(spec), Downgraded("bubblewrap isn't available"), null);
-        }
         const string none = "this platform has no container for harness code";
         if (mode == SandboxMode.Contained)
             throw new SandboxException(none);
@@ -410,7 +388,8 @@ public static class SandboxStarter
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    static (ISandboxProcess Process, string? Note, string? Uncapped) StartOnWindows(ChildSpec spec, SandboxMode mode)
+    static (ISandboxProcess Process, string? Note, string? Uncapped) StartOnWindows(ChildSpec spec, SandboxMode mode,
+        bool keepContained)
     {
         string? note = null;
         if (mode != SandboxMode.Process)
@@ -422,7 +401,7 @@ public static class SandboxStarter
             }
             catch (Exception e) when (e is System.ComponentModel.Win32Exception or SandboxException or UnauthorizedAccessException)
             {
-                if (mode == SandboxMode.Contained)
+                if (mode == SandboxMode.Contained || keepContained)
                     throw new SandboxException($"the container couldn't be created: {e.Message}");
                 note = Downgraded(e.Message);
             }
