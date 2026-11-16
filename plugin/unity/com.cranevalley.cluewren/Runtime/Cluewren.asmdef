@@ -13,7 +13,7 @@
     "precompiledReferences": [],
     "autoReferenced": false,
     "defineConstraints": [
-        "UNITY_EDITOR || DEVELOPMENT_BUILD || CLUEWREN_PLAYTEST"
+        "UNITY_EDITOR || CLUEWREN_PLAYTEST"
     ],
     "versionDefines": [
         {

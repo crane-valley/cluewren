@@ -1,4 +1,4 @@
-// Modified by Crane Valley: names renamed from Autopilot to Cluewren.
+// Modified by Crane Valley: names renamed from Autopilot to Cluewren; the reader refuses input nested more than 64 deep.
 // A small JSON reader and writer (no dependencies): objects are Dictionary<string, object>, arrays List<object>,
 // numbers double (or long when integral), strings, bools and null.
 
@@ -12,6 +12,8 @@ namespace Cluewren
 {
     public static class Json
     {
+        const int MaxDepth = 64;
+
         public static object Parse(string text)
         {
             var reader = new Reader(text);
@@ -130,7 +132,7 @@ namespace Cluewren
 
         static void WriteValue(StringBuilder sb, object value, int depth)
         {
-            if (depth > 64)
+            if (depth > MaxDepth)
             {
                 sb.Append("null");
                 return;
@@ -341,6 +343,7 @@ namespace Cluewren
         {
             readonly string s;
             int i;
+            int depth;
 
             public Reader(string text)
             {
@@ -360,8 +363,15 @@ namespace Cluewren
                 var c = s[i];
                 switch (c)
                 {
-                    case '{': return Object();
-                    case '[': return Array();
+                    case '{':
+                    case '[':
+                    {
+                        // The reader recurses, and it reads frames from a peer that has proved nothing yet.
+                        if (++depth > MaxDepth) throw new FormatException($"JSON nested more than {MaxDepth} deep");
+                        var nested = c == '{' ? (object)Object() : Array();
+                        --depth;
+                        return nested;
+                    }
                     case '"': return String();
                     case 't': Expect("true"); return true;
                     case 'f': Expect("false"); return false;

@@ -21,7 +21,7 @@ namespace Cluewren.Editor
         void OnGUI()
         {
             var client = EditorHost.Client;
-            var wanted = client != null && client.WantConnected;
+            var wanted = EditorHost.Wanted;
             GUILayout.Label(State(client), EditorStyles.wordWrappedLabel);
             using (new EditorGUI.DisabledScope(wanted))
                 if (GUILayout.Button("Connect"))
@@ -35,8 +35,8 @@ namespace Cluewren.Editor
         {
             if (client != null && client.Connected) return "Connected";
             if (client != null && !string.IsNullOrEmpty(client.Problem)) return client.Problem;
-            if (client != null && client.WantConnected) return "Connecting";
-            return EditorHost.Unusable ?? "Disconnected";
+            if (client != null && client.Connecting) return "Connecting";
+            return EditorHost.Unusable ?? (EditorHost.Wanted ? "Waiting for a run" : "Disconnected");
         }
     }
 }

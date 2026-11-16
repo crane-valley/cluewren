@@ -1,9 +1,9 @@
-// Modified by Crane Valley: the check for a stale export moved here from Runtime/Codex.cs, which is removed.
-// The project as readable text for the brain's codex (Library/CluewrenCodex/): what Unity keeps in binary-ish YAML with
+// Modified by Crane Valley: the check for a stale export moved here from Runtime/Codex.cs, which is removed; renamed
+// from CodexExport, and the export goes to <project>/.cluewren/export and nowhere else.
+// The project as readable text for the agent (<project>/.cluewren/export/): what Unity keeps in binary-ish YAML with
 // GUIDs and file IDs, written out with names. Run in the editor (before play mode, when it is needed), or headless:
 //
-//   Unity.exe -batchmode -nographics -quit -projectPath <project>
-//       -executeMethod Cluewren.Editor.CodexExport.Run -out <project>/Library/CluewrenCodex
+//   Unity.exe -batchmode -nographics -quit -projectPath <project> -executeMethod Cluewren.Editor.ProjectExport.Run
 //
 // Files:
 //   summary.txt          the project at a glance (written last: the export is complete when it is there)
@@ -30,20 +30,18 @@ using Object = UnityEngine.Object;
 
 namespace Cluewren.Editor
 {
-    public static class CodexExport
+    public static class ProjectExport
     {
         const int MaxFileChars = 2 * 1024 * 1024;
         const int MaxArray = 32;
         const int MaxDepth = 4;
 
-        /// <summary>-executeMethod Cluewren.Editor.CodexExport.Run -out &lt;dir&gt;</summary>
+        /// <summary>-executeMethod Cluewren.Editor.ProjectExport.Run</summary>
         public static void Run()
         {
-            var dir = PlaytestClient.Arg("out");
-            if (string.IsNullOrEmpty(dir)) dir = Path.Combine(Directory.GetParent(Application.dataPath).FullName, "Library", "CluewrenCodex");
             try
             {
-                Export(dir);
+                Export(EditorHost.ProjectDirOf(Application.dataPath));
                 EditorApplication.Exit(0);
             }
             catch (Exception e)
@@ -56,7 +54,7 @@ namespace Cluewren.Editor
         /// <summary>Why the export should run ("missing", "stale"), or null when it is up to date.</summary>
         public static string Needed(string project)
         {
-            var summary = Path.Combine(project, "Library", "CluewrenCodex", "summary.txt");
+            var summary = Path.Combine(Folder(project), "summary.txt");
             if (!File.Exists(summary)) return "missing";
             return Newer(Path.Combine(project, "Assets"), File.GetLastWriteTimeUtc(summary)) ? "stale" : null;
         }
@@ -94,10 +92,27 @@ namespace Cluewren.Editor
             return false;
         }
 
-        public static void Export(string dir)
+        public static string Folder(string project) => Path.Combine(project, Paths.DataFolder, "export");
+
+        public static string MakeFolder(string project)
+        {
+            var home = Path.Combine(project, Paths.DataFolder);
+            if (!Directory.Exists(home))
+            {
+                // What is kept here stays out of the user's repository unless the user edits this file, so whoever
+                // makes the folder (this export or the brain) writes it.
+                Directory.CreateDirectory(home);
+                File.WriteAllText(Path.Combine(home, ".gitignore"), "*\n", new UTF8Encoding(false));
+            }
+            var dir = Folder(project);
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        public static void Export(string project)
         {
             var started = DateTime.Now;
-            Directory.CreateDirectory(dir);
+            var dir = MakeFolder(project);
             var summaryPath = Path.Combine(dir, "summary.txt");
             if (File.Exists(summaryPath)) File.Delete(summaryPath);
             var counts = new Dictionary<string, int>();
@@ -212,7 +227,7 @@ namespace Cluewren.Editor
 
             // The summary, last
             var summary = new StringBuilder();
-            summary.AppendLine($"# {PlayerSettings.productName}: the Unity project at a glance (Cluewren codex export)");
+            summary.AppendLine($"# {PlayerSettings.productName}: the Unity project at a glance (Cluewren export)");
             summary.AppendLine();
             summary.AppendLine($"product: {PlayerSettings.productName} by {PlayerSettings.companyName}");
             summary.AppendLine($"productGUID: {PlayerSettings.productGUID}");

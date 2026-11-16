@@ -1,7 +1,7 @@
-// Modified by Crane Valley: the editor connects by itself once brain.json announces a brain for this project (unless it
-// was disconnected in the window, and never in batch mode), and when asked (the window, the command line); the agent
-// service, sign-in, uninstall and preferences paths are removed, and a command line asks for a connection, never a run;
-// rc is told which assemblies the editor alone compiles.
+// Modified by Crane Valley: the editor advertises itself to the brain and connects by itself once a brain invites it
+// (unless it was disconnected in the window; in batch mode only when the command line asks); the agent service,
+// sign-in, uninstall and preferences paths are removed, and a command line asks for a connection, never a run; rc is
+// told which assemblies the editor alone compiles.
 // The bridge in the editor: one client for the editor's life, in edit mode and play mode alike (play mode is the
 // session: the brain's `session start` enters it, as Unreal's Play In Editor). Ticked by the editor's update while
 // the game isn't playing (or is paused), by the player loop while it plays.
@@ -33,7 +33,9 @@ namespace Cluewren.Editor
         const string EditSceneKey = "Cluewren.EditScene";
         public const string HeadlessKey = "Cluewren.Headless";
         const string DisconnectedKey = "Cluewren.Disconnected";
-        const double AutoConnectSeconds = 2;
+        const string IdKey = "Cluewren.EditorId";
+        const string RefusedKey = "Cluewren.RefusedInvite";
+        const double AutoConnectSeconds = 1;
         static double nextAutoConnect;
         static bool restored;
 
@@ -56,7 +58,14 @@ namespace Cluewren.Editor
             EditorApplication.update += Update;
             AssemblyReloadEvents.beforeAssemblyReload += BeforeReload;
             EditorApplication.playModeStateChanged += OnPlayMode;
-            EditorApplication.quitting += () => Client?.Shutdown();
+            EditorApplication.quitting += () =>
+            {
+                Discovery.Withdraw();
+                Client?.Shutdown();
+            };
+            // A batch-mode editor is a build, an import or a test run unless its command line asks for a connection.
+            if (!Application.isBatchMode || PlaytestClient.Flag("CluewrenConnect") || SessionState.GetBool(HeadlessKey, false))
+                Advertise();
             Bootstrap.InstallTick();
             Ops.EditorLevels = Levels;
             Ops.EditorLoad = LoadInPlayMode;
@@ -78,12 +87,38 @@ namespace Cluewren.Editor
         {
             if (Client != null) return Client;
             Client = new PlaytestClient(Instance);
+            Client.SessionEnded += waits.Clear;
             return Client;
         }
+
+        // Kept across script reloads: with a new id the editor would pass over the invite of the run it is in.
+        public static string EditorId()
+        {
+            var id = SessionState.GetString(IdKey, "");
+            if (id.Length == 0)
+            {
+                id = Discovery.NewId();
+                SessionState.SetString(IdKey, id);
+            }
+            return id;
+        }
+
+        public static void Advertise()
+        {
+            if (Discovery.Id != null) return;
+            Discovery.Advertise(EditorId(), Instance.ProjectDir, Instance.HostName);
+            if (long.TryParse(SessionState.GetString(RefusedKey, ""), out var refused))
+                Discovery.Invites.Refused = new DateTime(refused, DateTimeKind.Utc);
+        }
+
+        public static bool Wanted =>
+            Client != null && Client.WantConnected || !Application.isBatchMode && !SessionState.GetBool(DisconnectedKey, false);
 
         public static void Connect()
         {
             SessionState.EraseBool(DisconnectedKey);
+            Unusable = null;
+            Advertise();
             Ensure().Connect();
         }
 
@@ -101,13 +136,12 @@ namespace Cluewren.Editor
             if (Application.isBatchMode || EditorApplication.timeSinceStartup < nextAutoConnect) return;
             nextAutoConnect = EditorApplication.timeSinceStartup + AutoConnectSeconds;
             if (SessionState.GetBool(DisconnectedKey, false)) return;
-            // A brain that failed its proof is refused until the user asks again.
-            if (Client != null && (Client.WantConnected || !string.IsNullOrEmpty(Client.Problem))) return;
-            var path = Discovery.FilePath();
-            var why = Discovery.Read(path, Instance.ProjectDir, out _);
-            // (shown in the window: a brain is announced, and this editor doesn't take it)
-            Unusable = why != null && File.Exists(path) ? why : null;
-            if (why == null) Connect();
+            // (a client that wants a connection looks for the invite itself)
+            if (Client != null && Client.WantConnected) return;
+            var invite = Discovery.Invites.Look();
+            // (shown in the window: an invite is there, and this editor doesn't take it)
+            Unusable = Discovery.Invites.Problem;
+            if (invite != null) Connect();
         }
 
         public static string Unusable { get; private set; }
@@ -129,6 +163,7 @@ namespace Cluewren.Editor
                 }
                 if (state != null && Json.Bool(state, "want", false))
                 {
+                    Advertise();
                     var client = Ensure();
                     client.ExitOnFailure = Json.Bool(state, "exit_on_failure", false);
                     var pendingText = SessionState.GetString(PendingKey, "");
@@ -150,17 +185,22 @@ namespace Cluewren.Editor
                     var session = Json.Str(state, "session");
                     // (a recording the brain asked for goes on over the resumed connection, once the game runs)
                     if (!string.IsNullOrEmpty(session)) Media.RestoreState(Json.Obj(state, "record"));
-                    client.Resume(Json.Str(state, "url"), string.IsNullOrEmpty(session) ? null : session,
+                    client.Resume(string.IsNullOrEmpty(session) ? null : session,
                         Json.Bool(state, "run_active", false), Json.Num(state, "connect_timeout", 0), Json.Num(state, "connect_since", 0), Json.Bool(state, "welcomed", false), (long)Json.Num(state, "received", 0));
                     return;
                 }
             }
-            if (Application.isBatchMode && PlaytestClient.Flag("PlaytestConnect") && !SessionState.GetBool(HeadlessKey, false))
+            if (Application.isBatchMode && PlaytestClient.Flag("CluewrenConnect") && !SessionState.GetBool(HeadlessKey, false))
                 Headless.Start();
         }
 
         static void BeforeReload()
         {
+            // A reload that takes this package out of the project runs none of its code afterwards, and the advert of a
+            // living editor would stay for a brain to pick. The code that does load writes it again, with the same id.
+            Discovery.Withdraw();
+            if (Discovery.Invites != null)
+                SessionState.SetString(RefusedKey, Discovery.Invites.Refused.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture));
             if (Client == null) return;
             var state = Client.SaveState();
             if (Json.Bool(state, "want", false))
@@ -220,7 +260,9 @@ namespace Cluewren.Editor
 
         static void TickWaits(PlaytestClient client)
         {
-            if (waits.Count == 0) return;
+            // Not while there is no connection: whether the session these wait in goes on is known only by the next
+            // welcome, and a step taken before it (into play mode again) can't be taken back.
+            if (waits.Count == 0 || !client.Connected) return;
             var now = EditorApplication.timeSinceStartup;
             foreach (var w in waits.ToList())
             {
@@ -279,10 +321,17 @@ namespace Cluewren.Editor
         public bool Session(PlaytestClient client, long id, string action, Dictionary<string, object> args)
         {
             var map = Json.Str(args, "map");
-            if (!string.IsNullOrEmpty(map) && action != "stop" && ScenePath(map) == null)
+            if (!string.IsNullOrEmpty(map) && action != "stop")
             {
-                client.RespondError(id, $"No scene {map} in the project", 404);  // (before anything changes)
-                return true;
+                // Before anything changes, and before the 404: what is in .cluewren is not told apart from what isn't.
+                if (Ops.RefusesScene(client, id, map)) return true;
+                var scene = MapScene(map);
+                if (scene == null)
+                {
+                    Ops.NoScene(client, id, map);
+                    return true;
+                }
+                if (Ops.RefusesScene(client, id, scene)) return true;
             }
             switch (action)
             {
@@ -329,14 +378,13 @@ namespace Cluewren.Editor
 
         static void EnterPlayMode(PlaytestClient client, string map)
         {
-            // The project's export for the codex, while scenes can still be opened (edit mode)
+            // The project as text for the agent, while scenes can still be opened (edit mode)
             try
             {
-                var dir = Path.Combine(Instance.ProjectDir, "Library", "CluewrenCodex");
-                if (CodexExport.Needed(Instance.ProjectDir) != null)
+                if (ProjectExport.Needed(Instance.ProjectDir) != null)
                 {
                     client.Status("Indexing the project (scenes, prefabs, input)");
-                    CodexExport.Export(dir);
+                    ProjectExport.Export(Instance.ProjectDir);
                 }
             }
             catch (Exception e)
@@ -363,7 +411,7 @@ namespace Cluewren.Editor
         /// scenes open in the editor stay as they are, and the editor's own Play plays them again once play mode ends.</summary>
         public static bool SetStartScene(string map)
         {
-            var path = ScenePath(map);
+            var path = MapScene(map);
             var asset = string.IsNullOrEmpty(path) ? null : AssetDatabase.LoadAssetAtPath<SceneAsset>(path);
             EditorSceneManager.playModeStartScene = asset;
             if (asset == null) Debug.LogWarning($"[Cluewren] No scene {map}: play mode starts with the open scene");
@@ -395,11 +443,14 @@ namespace Cluewren.Editor
         /// <summary>A scene of the project loaded in play mode, in the build list or not (Ops.Restart's `map`).</summary>
         static bool LoadInPlayMode(string map)
         {
-            var path = ScenePath(map);
+            var path = MapScene(map);
             if (string.IsNullOrEmpty(path) || !EditorApplication.isPlaying) return false;
             EditorSceneManager.LoadSceneInPlayMode(path, new LoadSceneParameters(LoadSceneMode.Single));
             return true;
         }
+
+        // A session's map: ScenePath itself also takes what the user's command line names, a scene file anywhere.
+        static string MapScene(string map) => string.IsNullOrEmpty(map) || Ops.MapOutsideProject(map) ? null : ScenePath(map);
 
         public static string ScenePath(string map)
         {
@@ -414,7 +465,11 @@ namespace Cluewren.Editor
 
         public void Exit(int code)
         {
-            EditorApplication.delayCall += () => EditorApplication.Exit(code);
+            EditorApplication.delayCall += () =>
+            {
+                Discovery.Withdraw();
+                EditorApplication.Exit(code);
+            };
         }
     }
 }

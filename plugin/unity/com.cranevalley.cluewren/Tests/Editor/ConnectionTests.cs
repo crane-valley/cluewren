@@ -11,12 +11,13 @@ namespace Cluewren.Tests
     {
         sealed class Host : IPlaytestHost
         {
+            public int? Exited;
             public string HostName => "test";
-            public string ProjectDir => "";
+            public string ProjectDir => @"C:\Games\Foo";
             public string ProjectId => "";
             public bool SessionRunning => false;
             public bool Session(PlaytestClient client, long id, string action, Dictionary<string, object> args) => false;
-            public void Exit(int code) { }
+            public void Exit(int code) => Exited = code;
         }
 
         static byte[] Range(int from) => Enumerable.Range(from, 32).Select(i => (byte)i).ToArray();
@@ -67,37 +68,6 @@ namespace Cluewren.Tests
             Assert.IsNull(uri);
         }
 
-        static string WriteBrain(string dir, int pid, string secret)
-        {
-            var path = Path.Combine(dir, "brain.json");
-            File.WriteAllText(path, Json.Write(new Dictionary<string, object>
-            {
-                ["url"] = "ws://127.0.0.1:1/v1/bridge", ["secret"] = secret, ["pid"] = pid, ["started"] = "2026-10-31T00:00:00+00:00",
-            }));
-            TestFiles.MakeMine(dir, path);
-            return path;
-        }
-
-        [Test]
-        public void BrainJsonIsReadOnlyWhenItsBrainRuns()
-        {
-            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(dir);
-            try
-            {
-                var secret = Convert.ToBase64String(Range(0));
-                Assert.IsNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, secret), dir, out var brain));
-                Assert.AreEqual(Range(0), brain.Secret);
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, 0, secret), dir, out _));
-                Assert.IsNotNull(Discovery.Read(WriteBrain(dir, Process.GetCurrentProcess().Id, "short"), dir, out _));
-                Assert.IsNotNull(Discovery.Read(Path.Combine(dir, "missing.json"), dir, out _));
-            }
-            finally
-            {
-                Directory.Delete(dir, true);
-            }
-        }
-
 #if UNITY_EDITOR_WIN
         [Test]
         public void AFileOfAnotherOwnerIsNotTrusted()
@@ -117,9 +87,73 @@ namespace Cluewren.Tests
         }
 #endif
 
+        [Test]
+        public void TheHelloSpeaksProtocol2AndBindsItsProjectFolderToTheSecret()
+        {
+            var sent = new List<string>();
+            var client = new PlaytestClient(new Host()) { TestWire = sent.Add };
+            try
+            {
+                client.Connect();
+                client.TestOpen(Range(0));
+                var hello = Json.ParseObject(sent.Single());
+                Assert.AreEqual("hello", hello["type"]);
+                Assert.AreEqual(2.0, hello["protocol"]);
+                Assert.AreEqual("0.2.0", hello["plugin_version"]);
+                Assert.AreEqual("unity", hello["engine"]);
+                Assert.AreEqual("test", hello["host"]);
+                Assert.AreEqual(@"C:\Games\Foo", hello["project_dir"]);
+                CollectionAssert.IsSubsetOf(new[] { "timed_hold", "pointer", "levels" }, (List<object>)hello["features"]);
+                var nonce = Convert.FromBase64String((string)hello["nonce"]);
+                Assert.AreEqual(Handshake.NonceBytes, nonce.Length);
+                Assert.AreEqual(Convert.ToBase64String(Handshake.HelloMac(Range(0), nonce, @"C:\Games\Foo")), hello["mac"]);
+                Assert.IsFalse(hello.ContainsKey("resume"));
+                Assert.IsFalse(hello.ContainsKey("received"));
+            }
+            finally
+            {
+                client.Shutdown();
+            }
+        }
+
+        [TestCase("protocol", "The cluewren command and this plugin are of different releases: install the same release of both")]
+        [TestCase("not_authenticated", "The brain did not accept this editor's proof of the invite")]
+        [TestCase("project", "The run is for another project than this editor's")]
+        [TestCase("resume", "The session this editor tried to resume belongs to another project or engine")]
+        [TestCase("hello", "The brain refused the connection (hello)")]
+        [TestCase("proof", "The brain refused the connection (proof)")]
+        [TestCase("something_new", "The brain refused the connection (something_new)")]
+        public void ARefusalIsShownByItsCodeAndNeverInTheBrainsWords(string code, string text)
+        {
+            var sent = new List<string>();
+            var host = new Host();
+            var client = new PlaytestClient(host) { TestWire = sent.Add, ExitOnFailure = true };
+            try
+            {
+                client.Connect();
+                client.TestOpen(Range(0));
+                sent.Clear();
+                client.TestReceive(Json.Write(new Dictionary<string, object> { ["type"] = "error", ["code"] = code, ["message"] = "the brain's own words" }));
+                Assert.AreEqual("Refused: " + text, client.Problem);
+                Assert.AreEqual(client.Problem, client.LastStatus);
+                Assert.IsFalse(client.Connected);
+                Assert.IsFalse(client.WantConnected);
+                Assert.AreEqual(1, host.Exited);
+                Assert.IsEmpty(sent);
+            }
+            finally
+            {
+                client.Shutdown();
+            }
+        }
+
         [TestCase("{\"type\":\"request\",\"id\":1,\"op\":\"ping\",\"args\":{}}")]
         [TestCase("{\"type\":\"welcome\",\"role\":\"service\",\"session\":\"s\",\"nonce\":\"AAAA\",\"proof\":\"AAAA\"}")]
         [TestCase("{\"type\":\"welcome\"}")]
+        [TestCase("{\"type\":\"error\",\"message\":\"no code\"}")]
+        [TestCase("{\"type\":\"error\",\"code\":4403,\"message\":\"a number\"}")]
+        [TestCase("{\"type\":\"error\",\"code\":\"Not a plain word\",\"message\":\"shown nowhere\"}")]
+        [TestCase("{\"type\":\"error\",\"code\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"message\":\"33 characters\"}")]
         [TestCase("not json")]
         public void NothingIsActedOnBeforeTheProofAndARefusalIsFinal(string frame)
         {
@@ -128,11 +162,113 @@ namespace Cluewren.Tests
             try
             {
                 client.Connect();
+                client.TestOpen(Range(0));
+                sent.Clear();
                 client.TestReceive(frame);
                 Assert.IsFalse(client.Connected);
                 Assert.IsFalse(client.WantConnected);
-                Assert.IsNotEmpty(client.Problem);
+                StringAssert.EndsWith("it didn't prove it is this machine's brain", client.Problem);
                 Assert.IsEmpty(sent);
+            }
+            finally
+            {
+                client.Shutdown();
+            }
+        }
+
+        const string Editor = "0123456789abcdef0123456789abcdef";
+
+        static void Invite(string path, int age)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            int self;
+            using (var process = Process.GetCurrentProcess()) self = process.Id;
+            File.WriteAllText(path, Json.Write(new Dictionary<string, object>
+            {
+                ["url"] = "ws://127.0.0.1:1/v1/bridge", ["secret"] = Convert.ToBase64String(Range(0)), ["pid"] = self,
+                ["protocol"] = 2, ["editor_id"] = Editor,
+            }));
+            File.SetLastWriteTimeUtc(path, new DateTime(2026, 11, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(age));
+            TestFiles.MakeMine(Path.GetDirectoryName(path), path);
+        }
+
+        [Test]
+        public void ARefusedInviteIsLeftAloneUntilItChanges()
+        {
+            var folder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            var path = Discovery.InvitePath(folder, 4321);
+            var watch = new InviteWatch(path, Editor);
+            var client = new PlaytestClient(new Host()) { TestWire = _ => { }, TestInvites = watch };
+            try
+            {
+                Invite(path, 0);
+                Assert.IsNotNull(watch.Look());
+                client.Connect();
+                client.TestOpen(Range(0));
+                client.TestReceive("{\"type\":\"error\",\"code\":\"project\",\"message\":\"\"}");
+                Assert.IsNull(watch.Look());
+                Invite(path, 1);
+                Assert.IsNotNull(watch.Look());
+            }
+            finally
+            {
+                client.Shutdown();
+                Directory.Delete(folder, true);
+            }
+        }
+
+        [TestCase("project", "Refused: The run is for another project than this editor's")]
+        [TestCase("protocol", "Refused: The cluewren command and this plugin are of different releases: install the same release of both")]
+        [TestCase("busy_2", "Refused: The brain refused the connection (busy_2)")]
+        [TestCase("Not a plain word", null)]
+        [TestCase("", null)]
+        public void APolicyCloseBeforeTheWelcomeIsTheRefusalItsReasonNames(string reason, string text)
+        {
+            var folder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            var path = Discovery.InvitePath(folder, 4321);
+            var watch = new InviteWatch(path, Editor);
+            var sent = new List<string>();
+            var host = new Host();
+            var client = new PlaytestClient(host) { TestWire = sent.Add, TestInvites = watch, ExitOnFailure = true };
+            try
+            {
+                Invite(path, 0);
+                Assert.IsNotNull(watch.Look());
+                client.Connect();
+                client.TestOpen(Range(0));
+                sent.Clear();
+                client.Closed(1008, reason);
+                if (text != null) Assert.AreEqual(text, client.Problem);
+                else StringAssert.EndsWith("it didn't prove it is this machine's brain", client.Problem);
+                Assert.AreEqual(client.Problem, client.LastStatus);
+                Assert.IsFalse(client.WantConnected);
+                Assert.AreEqual(1, host.Exited);
+                Assert.IsNull(watch.Look(), "the invite it refused");
+                Assert.IsEmpty(sent);
+            }
+            finally
+            {
+                client.Shutdown();
+                Directory.Delete(folder, true);
+            }
+        }
+
+        [Test]
+        public void JsonNestedTooDeepIsUnreadable()
+        {
+            Assert.IsNotNull(Json.Parse(new string('[', 64) + new string(']', 64)));
+            Assert.Throws<FormatException>(() => Json.Parse(new string('[', 65) + new string(']', 65)));
+            var deep = string.Concat(Enumerable.Repeat("{\"a\":", 100000)) + "1" + new string('}', 100000);
+            Assert.Throws<FormatException>(() => Json.Parse(deep));
+
+            var client = new PlaytestClient(new Host()) { TestWire = _ => { } };
+            try
+            {
+                client.Connect();
+                client.TestOpen(Range(0));
+                client.TestReceive(deep);
+                Assert.IsFalse(client.WantConnected);
+                StringAssert.EndsWith("it didn't prove it is this machine's brain", client.Problem);
             }
             finally
             {

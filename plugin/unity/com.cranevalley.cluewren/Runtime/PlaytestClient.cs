@@ -1,10 +1,12 @@
-// Modified by Crane Valley: the brain is found through brain.json and must prove itself with a mutual HMAC handshake; the
-// link, token, account, usage, memory, steering and window plumbing is removed, and the brain alone starts a run: the
-// command line only connects; a message over the brain's 16 MB limit closes the link.
+// Modified by Crane Valley: the brain is found through the invite it writes for this process (Discovery.cs) and must
+// prove itself with a mutual HMAC handshake; a refusal before that is shown by its code, never in the brain's words; a
+// welcome that resumes nothing starts the request count and the held answers afresh; the link, token, account, usage,
+// memory, steering and window plumbing is removed, and the brain alone starts a run: the command line only connects;
+// a message over the brain's 16 MB limit closes the link.
 // The bridge to the brain (docs/protocol.md): one WebSocket out to the brain, JSON text frames. The socket lives on
 // background threads; everything that touches the game runs on the main thread, in Tick() (every frame), where all
 // requests that arrived since the last frame are handled, many per frame. Deferred answers (move, watch, key taps,
-// codex, session changes) are Pending entries ticked each frame until they answer.
+// session changes) are Pending entries ticked each frame until they answer.
 
 using System;
 using System.Buffers;
@@ -79,9 +81,10 @@ namespace Cluewren
 
     public sealed class PlaytestClient
     {
-        public const int Protocol = 1;
-        public const string PluginVersion = "0.1.2";
+        public const int Protocol = 2;
+        public const string PluginVersion = "0.2.0";
         const double MaxBackoff = 30.0;
+        const double LookSeconds = 1.0;
         const double HandshakeSeconds = 10.0;
         const int MaxLogEventsPerFrame = 50;
 
@@ -92,17 +95,20 @@ namespace Cluewren
         public string Url { get; private set; } = "";
         public bool Connected { get; private set; }
         public bool WantConnected { get; private set; }
-        public string BrainRole { get; private set; }
+        public bool Connecting => socket != null && !Connected;
         public string SessionId { get; private set; }
         public bool RunActive { get; private set; }
         public string Problem { get; private set; } = "";
-        public int ProblemCode { get; private set; }
         public string LastStatus { get; private set; } = "";
+
+        // The session is over (its connection lost or closed, a refusal, a disconnect, a welcome to another one): what
+        // waited to answer in it has nobody to answer. Not for the editor's own close when it reloads its scripts.
+        public event Action SessionEnded;
 
         // A command-line start exits with 1 when the brain refuses it, nobody being there to read the refusal.
         public bool ExitOnFailure;
-        // A command-line start (-PlaytestConnectTimeout, default 120 s; 0 for none): with no welcome from the brain in
-        // this long, log the error and exit 1 instead of retrying for ever
+        // A command-line start (-CluewrenConnectTimeout, default 120 s; 0 for none): with no welcome from the brain in
+        // this long, log the error and exit 1 instead of waiting for ever
         public double ConnectTimeout;
         public const double DefaultConnectTimeout = 120.0;
         // When this client first tried to connect (wall clock, kept across the editor's script reloads), and whether
@@ -112,7 +118,6 @@ namespace Cluewren
         bool gaveUp;
         string lastFailure = "";
 
-        string givenUrl = "";
         byte[] secret;
         byte[] pluginNonce;
         double handshakeDeadline;
@@ -124,7 +129,8 @@ namespace Cluewren
         ClientWebSocket socket;
         CancellationTokenSource cancel;
 
-        readonly ConcurrentQueue<(int gen, string kind, string text)> incoming = new ConcurrentQueue<(int, string, string)>();
+        // (close: the status of the close frame that ended a connection, 0 when it ended without one)
+        readonly ConcurrentQueue<(int gen, string kind, string text, int close)> incoming = new ConcurrentQueue<(int, string, string, int)>();
         readonly BlockingCollection<Outgoing> outgoing = new BlockingCollection<Outgoing>(new ConcurrentQueue<Outgoing>());
         readonly List<object> events = new List<object>();
         readonly List<Pending> pending = new List<Pending>();
@@ -151,21 +157,17 @@ namespace Cluewren
 
         // -- connecting ------------------------------------------------------------------------------------
 
-        /// <summary>Connect to the brain brain.json announces, or to <paramref name="url"/> (-PlaytestUrl); either way the
-        /// secret comes from brain.json, read again at every attempt: a brain that restarts has another port and secret.</summary>
-        public void Connect(string url = null)
+        public void Connect()
         {
-            givenUrl = url ?? "";
             WantConnected = true;
             backoff = 1.0;
             Problem = "";
-            ProblemCode = 0;
             if (connectSince <= 0) connectSince = WallNow;
             OpenSocket();
         }
 
         /// <summary>Connect again after the editor reloaded its scripts: the same brain session goes on.</summary>
-        public void Resume(string url, string session, bool runActive, double connectTimeout = 0, double since = 0, bool welcomedAlready = false, long received = 0)
+        public void Resume(string session, bool runActive, double connectTimeout = 0, double since = 0, bool welcomedAlready = false, long received = 0)
         {
             resumeSession = session;
             lastRequest = received;
@@ -173,15 +175,15 @@ namespace Cluewren
             ConnectTimeout = connectTimeout;
             connectSince = since;
             welcomed = welcomedAlready;
-            Connect(url);
+            Connect();
         }
 
         static double WallNow => DateTime.UtcNow.Subtract(DateTime.UnixEpoch).TotalSeconds;
 
-        /// <summary>-PlaytestConnectTimeout=seconds (default 120; 0 waits for ever).</summary>
+        /// <summary>-CluewrenConnectTimeout=seconds (default 120; 0 waits for ever).</summary>
         public static double CommandLineConnectTimeout()
         {
-            var v = Arg("PlaytestConnectTimeout");
+            var v = Arg("CluewrenConnectTimeout");
             return !string.IsNullOrEmpty(v) && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var s) && s >= 0
                 ? s : DefaultConnectTimeout;
         }
@@ -191,9 +193,8 @@ namespace Cluewren
         {
             if (gaveUp || welcomed || ConnectTimeout <= 0 || connectSince <= 0 || WallNow - connectSince < ConnectTimeout) return;
             gaveUp = true;
-            var why = ProblemCode != 0 && !string.IsNullOrEmpty(Problem) ? Problem
-                : !string.IsNullOrEmpty(lastFailure) ? lastFailure : "no welcome from it";
-            var error = $"Couldn’t connect to the playtest service at {Url} within {ConnectTimeout:0.#} s ({why})";
+            var why = !string.IsNullOrEmpty(Problem) ? Problem : !string.IsNullOrEmpty(lastFailure) ? lastFailure : "no run invited this process";
+            var error = $"Couldn’t connect to Cluewren within {ConnectTimeout:0.#} s ({why})";
             WantConnected = false;
             CloseSocket(WebSocketCloseStatus.NormalClosure, "connect timeout");
             SetConnected(false);
@@ -208,12 +209,13 @@ namespace Cluewren
             WantConnected = false;
             RunActive = false;
             Problem = "";
-            ProblemCode = 0;
             handshakeDeadline = 0;
+            resumeSession = null;
             CloseSocket(WebSocketCloseStatus.NormalClosure, "disconnect");
             SetConnected(false);
             Hands.ReleaseAll();
             Media.Stop();
+            SessionEnded?.Invoke();
             Status("Disconnected");
         }
 
@@ -221,22 +223,22 @@ namespace Cluewren
         {
             if (TestWire != null) return;  // (tests: no socket)
             CloseSocket(WebSocketCloseStatus.NormalClosure, "reconnect");
-            Uri uri = null;
-            var why = Discovery.Read(Discovery.FilePath(), Host.ProjectDir, out var brain);
-            if (why == null)
+            var invite = Invites?.Look();
+            if (invite == null)
             {
-                Url = string.IsNullOrEmpty(givenUrl) ? brain.Url : givenUrl;
-                why = Discovery.CheckUrl(Url, out uri);
-            }
-            if (why != null)
-            {
-                lastFailure = why;
-                if (ProblemCode == 0) Problem = why;
-                if (LastStatus != Problem) Status(Problem);
-                ScheduleReconnect();
+                Problem = Invites?.Problem ?? "";
+                if (Problem.Length > 0)
+                {
+                    lastFailure = Problem;
+                    if (LastStatus != Problem) Status(Problem);
+                }
+                backoff = 1.0;
+                nextReconnect = Now + LookSeconds;
                 return;
             }
-            secret = brain.Secret;
+            Url = invite.Url.ToString();
+            var uri = invite.Url;
+            secret = invite.Secret;
             var gen = ++generation;
             var ws = new ClientWebSocket();
             // A system-wide proxy must not carry a connection that is only ever meant for this machine.
@@ -257,14 +259,15 @@ namespace Cluewren
             }
             catch (Exception e)
             {
-                incoming.Enqueue((gen, "failed", e.InnerException?.Message ?? e.Message));
+                incoming.Enqueue((gen, "failed", e.InnerException?.Message ?? e.Message, 0));
                 return;
             }
-            incoming.Enqueue((gen, "open", null));
+            incoming.Enqueue((gen, "open", null, 0));
             var sender = Task.Run(() => SendLoop(ws, gen, ct));
             var buffer = new byte[1 << 16];
             var message = new MemoryStream();
             string why = "closed";
+            var close = 0;
             try
             {
                 while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
@@ -272,7 +275,8 @@ namespace Cluewren
                     var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct).ConfigureAwait(false);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        why = $"{(int?)result.CloseStatus} {result.CloseStatusDescription}";
+                        why = result.CloseStatusDescription ?? "";
+                        close = (int)(result.CloseStatus ?? WebSocketCloseStatus.Empty);
                         break;
                     }
                     message.Write(buffer, 0, result.Count);
@@ -287,14 +291,14 @@ namespace Cluewren
                     var text = Encoding.UTF8.GetString(message.GetBuffer(), 0, (int)message.Length);
                     message.SetLength(0);
                     if (result.MessageType == WebSocketMessageType.Text)
-                        incoming.Enqueue((gen, "text", text));
+                        incoming.Enqueue((gen, "text", text, 0));
                 }
             }
             catch (Exception e)
             {
                 why = e.InnerException?.Message ?? e.Message;
             }
-            incoming.Enqueue((gen, "closed", why));
+            incoming.Enqueue((gen, "closed", why, close));
             try
             {
                 await sender.ConfigureAwait(false);
@@ -386,23 +390,34 @@ namespace Cluewren
 
         public void Send(Dictionary<string, object> frame)
         {
-            if (!Connected) return;
-            if (TestWire != null)
-            {
-                TestWire(Json.Write(frame));
-                return;
-            }
-            if (socket == null) return;
-            outgoing.Add(Json.Write(frame));
+            if (Linked) Put(Json.Write(frame));
+        }
+
+        bool Linked => Connected && (socket != null || TestWire != null);
+
+        void Put(string text)
+        {
+            if (TestWire != null) TestWire(text);
+            else outgoing.Add(text);
         }
 
         // -- tests: frames sent go to TestWire instead of a socket, and frames come in as from the brain -----------
 
         internal Action<string> TestWire;
+        internal InviteWatch TestInvites;
+
+        // A test never takes, or refuses, this process's own invite.
+        InviteWatch Invites => TestInvites ?? (TestWire == null ? Discovery.Invites : null);
 
         internal void TestConnected(bool connected) => SetConnected(connected);
 
         internal void TestReceive(string json) => HandleMessage(json);
+
+        internal void TestOpen(byte[] invited)
+        {
+            secret = invited;
+            SendHello();
+        }
 
         /// <summary>The connection's number now: a message made for one (on a worker thread) isn't sent on another.</summary>
         public int ConnectionGeneration => Volatile.Read(ref generation);
@@ -415,16 +430,19 @@ namespace Cluewren
             return true;
         }
 
-        /// <summary>A response already written as JSON, from any thread: sent now, or held until connected again (as
-        /// Respond does).</summary>
-        public void SendResponseText(string text)
+        /// <summary>A response already written as JSON: sent now, or held until connected again (as Respond does).</summary>
+        public void SendResponseText(string text) => SendOrHoldText(text);
+
+        public int SessionSerial { get; private set; }
+
+        // On the main thread, where a new session begins: what a worker thread finishes for the session before (a
+        // capture read back and encoded) would otherwise answer, with that session's request id, into this one.
+        public void InSession(int serial, Action answer)
         {
-            if (Connected && socket != null)
+            MainThread.Post(() =>
             {
-                outgoing.Add(text);
-                return;
-            }
-            MainThread.Post(() => SendOrHoldText(text));
+                if (serial == SessionSerial) answer();
+            });
         }
 
         void SendHello()
@@ -456,7 +474,7 @@ namespace Cluewren
             }
             else Media.Stop();  // (a new connection: no recording goes on from the one before)
             askedResume = resumeSession;
-            outgoing.Add(Json.Write(hello));
+            Put(Json.Write(hello));
         }
 
         public void Respond(long id, object result)
@@ -493,9 +511,9 @@ namespace Cluewren
 
         void SendOrHoldText(string text)
         {
-            if (Connected && socket != null)
+            if (Linked)
             {
-                outgoing.Add(text);
+                Put(text);
                 return;
             }
             // (between a script reload and the resumed connection: answered once connected again)
@@ -617,29 +635,47 @@ namespace Cluewren
                         socket = null;
                         // (Windows' socket errors come padded with NULs and a line break)
                         lastFailure = (item.text ?? "").Replace("\0", "").Trim();
-                        if (ProblemCode == 0)
-                            Problem = $"Can’t reach the playtest service at {Url} ({lastFailure}). Trying again…";
+                        Problem = $"Can’t reach Cluewren at {Url} ({lastFailure}). Trying again…";
                         if (LastStatus != Problem) Status(Problem);
                         ScheduleReconnect();
                         break;
                     case "closed":
-                    {
-                        var was = Connected;
-                        socket = null;
-                        handshakeDeadline = 0;
-                        SetConnected(false);
-                        BrainRole = null;
-                        if (was) Status($"Connection closed ({item.text})");
-                        Hands.ReleaseAll();
-                        Media.Stop();  // (a recording doesn't outlive its connection)
-                        ScheduleReconnect();
+                        Closed(item.close, item.text);
                         break;
-                    }
                     case "text":
                         HandleMessage(item.text);
                         break;
                 }
             }
+        }
+
+        internal void Closed(int status, string why)
+        {
+            var was = Connected;
+            socket = null;
+            handshakeDeadline = 0;
+            SetConnected(false);
+            if (!was && status == (int)WebSocketCloseStatus.PolicyViolation)
+            {
+                // The brain's refusal, whose error frame didn't arrive: the close's reason is the same code.
+                if (RefusalCode(why) is { } code) Refuse("Refused: " + Refusal(code), WebSocketCloseStatus.NormalClosure, "refused");
+                else NoProof();
+                return;
+            }
+            if (was) Status(status > 0 ? $"Connection closed ({status} {why})" : $"Connection closed ({why})");
+            Hands.ReleaseAll();
+            Media.Stop();  // (a recording doesn't outlive its connection)
+            // A session ends with its connection, however that was lost: the next hello asks for no resume. Only the
+            // editor's own close for a script reload (CloseForReload, which doesn't come here) is resumed: an answer
+            // on its way when a socket drops is not known to have arrived, and the brain acknowledges none.
+            if (was)
+            {
+                // Forgotten here, not only left unasked for: a script reload before the next welcome saves what the
+                // client holds, and would ask to resume it.
+                SessionId = null;
+                SessionEnded?.Invoke();
+            }
+            ScheduleReconnect();
         }
 
         void FlushEvents()
@@ -681,7 +717,7 @@ namespace Cluewren
             {
                 if (!Connected)
                 {
-                    RefuseBrain();
+                    NoProof();
                     return;
                 }
                 Debug.LogWarning($"[Cluewren] Unreadable message from the brain ({e.Message}): {text.Substring(0, Math.Min(200, text.Length))}");
@@ -690,7 +726,9 @@ namespace Cluewren
             if (!Connected)
             {
                 if (m != null && Json.Str(m, "type") == "welcome" && Proved(m, out var brainNonce)) Welcomed(m, brainNonce);
-                else RefuseBrain();
+                else if (m != null && Json.Str(m, "type") == "error" && m.TryGetValue("code", out var given) && RefusalCode(given) is { } code)
+                    Refuse("Refused: " + Refusal(code), WebSocketCloseStatus.NormalClosure, "refused");
+                else NoProof();
                 return;
             }
             if (m == null) return;
@@ -734,11 +772,13 @@ namespace Cluewren
                     break;
                 case "error":
                 {
-                    // The brain refused (answering the hello) or gave up: show its message as it is
+                    // Only after the welcome, so in the words of a brain that has proved itself. The same invite
+                    // wouldn't do better a second time.
                     Problem = Json.Str(m, "message");
-                    ProblemCode = (int)Json.Num(m, "code", 0);
                     Status(Problem);
-                    WantConnected = false;  // a refusal: connecting again by itself wouldn't help
+                    WantConnected = false;
+                    Invites?.Refuse();
+                    SessionEnded?.Invoke();
                     if (ExitOnFailure) Host.Exit(1);
                     break;
                 }
@@ -768,40 +808,77 @@ namespace Cluewren
         void Welcomed(Dictionary<string, object> welcome, byte[] brainNonce)
         {
             var proof = Handshake.Prove(secret, Handshake.PluginRole, pluginNonce, brainNonce);
-            outgoing.Add(Json.Write(new Dictionary<string, object> { ["type"] = "proof", ["proof"] = Convert.ToBase64String(proof) }));
+            Put(Json.Write(new Dictionary<string, object> { ["type"] = "proof", ["proof"] = Convert.ToBase64String(proof) }));
             secret = null;
             pluginNonce = null;
             handshakeDeadline = 0;
-            BrainRole = Json.Str(welcome, "role");
             var session = Json.Str(welcome, "session");
-            // (a resume the brain didn't take is a new connection: no recording goes on)
-            if (!string.IsNullOrEmpty(askedResume) && session != askedResume) Media.Stop();
+            if (string.IsNullOrEmpty(askedResume) || session != askedResume)
+            {
+                // The brain counts this session's requests from 1 again: an answer or a count kept from the one before
+                // would be taken for one of them. No recording or held key goes on either.
+                lastRequest = 0;
+                ++SessionSerial;
+                heldResponses.Clear();
+                pending.Clear();
+                RunActive = false;
+                Hands.ReleaseAll();
+                Media.Stop();
+                SessionEnded?.Invoke();
+            }
             askedResume = null;
             if (!string.IsNullOrEmpty(session)) SessionId = session;
             resumeSession = null;
             welcomed = true;
             backoff = 1.0;
             Problem = "";
-            ProblemCode = 0;
             SetConnected(true);
             // (only now, for a brain that has proved itself: the devices, as these held answers)
             Hands.EnsureDevices();
-            foreach (var r in heldResponses) outgoing.Add(r);
+            foreach (var r in heldResponses) Put(r);
             heldResponses.Clear();
-            Status("Connected to the playtest service");
-            if (BrainRole == "cli") RunActive = true;
+            Status("Connected to Cluewren");
         }
 
-        // No reconnect: whatever answers here doesn't know this machine's secret, and asking again won't change that.
-        void RefuseBrain()
+        // The code comes from a peer that has proved nothing: only a short plain word of it is ever shown.
+        static string RefusalCode(object given)
+        {
+            if (!(given is string code) || code.Length == 0 || code.Length > 32) return null;
+            foreach (var c in code)
+                if (!(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_'))
+                    return null;
+            return code;
+        }
+
+        static string Refusal(string code)
+        {
+            switch (code)
+            {
+                case "protocol": return Discovery.OtherRelease;
+                case "not_authenticated": return "The brain did not accept this editor's proof of the invite";
+                case "project": return "The run is for another project than this editor's";
+                case "resume": return "The session this editor tried to resume belongs to another project or engine";
+                default: return $"The brain refused the connection ({code})";
+            }
+        }
+
+        void NoProof() =>
+            Refuse($"Refused {Url}: it didn't prove it is this machine's brain", WebSocketCloseStatus.PolicyViolation, "bad proof");
+
+        // No reconnect until the invite changes: the same invite would be refused the same way.
+        void Refuse(string why, WebSocketCloseStatus status, string closing)
         {
             WantConnected = false;
             handshakeDeadline = 0;
             secret = null;
             pluginNonce = null;
-            Problem = $"Refused {Url}: it didn't prove it is this machine's brain";
-            lastFailure = Problem;
-            CloseSocket(WebSocketCloseStatus.PolicyViolation, "bad proof");
+            resumeSession = null;
+            Media.Stop();
+            Problem = why;
+            lastFailure = why;
+            Invites?.Refuse();
+            CloseSocket(status, closing);
+            SessionEnded?.Invoke();
             Status(Problem);
             if (ExitOnFailure) Host.Exit(1);
         }
@@ -837,7 +914,6 @@ namespace Cluewren
         {
             return new Dictionary<string, object>
             {
-                ["url"] = givenUrl,
                 ["want"] = WantConnected,
                 ["session"] = SessionId ?? "",
                 ["run_active"] = RunActive,
