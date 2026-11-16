@@ -23,6 +23,8 @@ public sealed class VerifiedFolder : IDisposable
 
     public bool Is(VerifiedFolder other) => other._key == _key;
 
+    internal string Key => _key;
+
     public void Dispose() => _handle?.Dispose();
 }
 
@@ -33,30 +35,34 @@ public sealed class ProjectScope : IDisposable
 
     ProjectScope(string folder, bool exact)
     {
-        // Not GetFullPath: it expands 8.3 names, and an editor that shows the short form matches only if that is announced.
+        // Not GetFullPath: it expands 8.3 names, and an editor that shows the short form is opened by that form.
         Folder = AsGiven(Path.IsPathFullyQualified(folder) ? folder : Path.GetFullPath(folder));
         Exact = exact;
         _run = Identify(Folder);
-        var final = _run?.Final is { } raw ? AsGiven(WithoutPrefix(raw)) : null;
-        Folders = final is not null && !string.Equals(final, Folder, TextComparison) ? [Folder, final] : [Folder];
+    }
+
+    // The folder was opened and identified when it was matched: the scope keeps that identity and its open handle, so
+    // nothing between the match and a hello can put another folder behind the path.
+    readonly VerifiedFolder? _chosen;
+
+    ProjectScope(VerifiedFolder chosen)
+    {
+        Folder = AsGiven(chosen.Path);
+        Exact = true;
+        _chosen = chosen;
     }
 
     public static ProjectScope Related(string folder) => new(folder, exact: false);
 
     public static ProjectScope ExactlyAt(string folder) => new(folder, exact: true);
 
+    public static ProjectScope ExactlyThe(VerifiedFolder chosen) => new(chosen);
+
     public string Folder { get; }
 
     public bool Exact { get; }
 
-    public string Match => Exact ? "exact" : "related";
-
-    public IReadOnlyList<string> Folders { get; }
-
     public string Described => Exact ? $"{Folder} exactly" : $"{Folder}, a folder inside it or one that contains it";
-
-    static StringComparison TextComparison =>
-        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
     public static bool IsLocalPath(string path)
     {
@@ -81,6 +87,15 @@ public sealed class ProjectScope : IDisposable
 
     public VerifiedFolder? Admit(string project)
     {
+        if (_chosen is not null)
+        {
+            if (Identify(project) is not { } hello)
+                return null;
+            if (hello.Key == _chosen.Key)
+                return new VerifiedFolder(Normal(project), hello.Key, hello.Handle);
+            hello.Dispose();
+            return null;
+        }
         if (_run is not { } run || Identify(project) is not { } editor)
             return null;
         if (run.Key == editor.Key || (!Exact && (Within(editor.Final, run.Key) || Within(run.Final, editor.Key))))
@@ -89,7 +104,11 @@ public sealed class ProjectScope : IDisposable
         return null;
     }
 
-    public void Dispose() => _run?.Dispose();
+    public void Dispose()
+    {
+        _run?.Dispose();
+        _chosen?.Dispose();
+    }
 
     internal static string? KeyOf(string path)
     {
@@ -111,11 +130,6 @@ public sealed class ProjectScope : IDisposable
     {
         public void Dispose() => Handle?.Dispose();
     }
-
-    static string WithoutPrefix(string final) =>
-        final.StartsWith(@"\\?\UNC\", StringComparison.Ordinal) ? @"\\" + final[8..]
-        : final.StartsWith(@"\\?\", StringComparison.Ordinal) ? final[4..]
-        : final;
 
     static Opened? Identify(string path)
     {

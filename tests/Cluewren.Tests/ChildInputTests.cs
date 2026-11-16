@@ -2,7 +2,7 @@ using System.Buffers;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 using Cluewren.Sandbox;
 
@@ -242,7 +242,7 @@ sealed class RecordingLink : IGameLink
     }
 }
 
-sealed class HeldJev : IJevRelay
+sealed class HeldJev : IDecisionRelay
 {
     int _asked, _cancelled;
 
@@ -295,7 +295,7 @@ public sealed class ChildInputTests : IDisposable
 
     public void Dispose() => File.Delete(_log);
 
-    SandboxSession Start(ScriptedChild child, IGameLink link, IJevRelay? jev = null, IEpisodeRecorder? recorder = null) =>
+    SandboxSession Start(ScriptedChild child, IGameLink link, IDecisionRelay? jev = null, IEpisodeRecorder? recorder = null) =>
         new(child, link, jev, () => true, recorder, _ => { }, _log);
 
     const string Broken = """{"type":"reply","id":"x"}""" + "\n";
@@ -474,7 +474,7 @@ public sealed class ChildInputTests : IDisposable
         });
         using var session = Start(child, link, jev, recorder);
         session.Episode = 1;
-        child.Out.Write("""{"type":"jev","rid":1,"body":{}}""" + "\n");
+        child.Out.Write("""{"type":"decide","rid":1,"body":{}}""" + "\n");
         await Until(() => jev.Asked > 0);
         child.Out.Write("""{"type":"episode","rid":2,"mark":"begin","n":1}""" + "\n"
                         + """{"type":"post","op":"key","args":{"key":"W","mode":"hold"}}""" + "\n");
@@ -492,7 +492,7 @@ public sealed class ChildInputTests : IDisposable
         using var session = Start(child, new StillGame(), jev);
         var flood = new StringBuilder();
         for (var i = 1; i <= 2000; i++)
-            flood.Append($$"""{"type":"jev","rid":{{i}},"body":{"state":{} } }""").Append('\n');
+            flood.Append($$"""{"type":"decide","rid":{{i}},"body":{"state":{} } }""").Append('\n');
         child.Out.Write(flood.ToString());
         await child.KillStarted.Task.WaitAsync(Patience);
         var failed = await Assert.ThrowsAsync<SandboxException>(
@@ -554,6 +554,20 @@ public sealed class ChildInputTests : IDisposable
         using var session = Start(child, new RecordingLink());
         session.Episode = 3;
         child.Out.Write("""{"type":"episode","rid":1,"mark":"begin","n":7}""" + "\n");
+        await child.KillStarted.Task.WaitAsync(Patience);
+        var failed = await Assert.ThrowsAsync<SandboxException>(
+            () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
+        Assert.Contains("another episode", failed.Message);
+    }
+
+    // Before: the child of a probe, which plays no episode, could mark episode 0 and have what it filmed looked at as
+    // an episode's pictures.
+    [Fact]
+    public async Task A_mark_from_a_child_that_plays_no_episode_ends_the_session()
+    {
+        var child = new ScriptedChild();
+        using var session = Start(child, new RecordingLink());
+        child.Out.Write("""{"type":"episode","rid":1,"mark":"begin","n":0}""" + "\n");
         await child.KillStarted.Task.WaitAsync(Patience);
         var failed = await Assert.ThrowsAsync<SandboxException>(
             () => session.Call("ping", null, 30, CancellationToken.None).WaitAsync(Patience));
@@ -623,6 +637,285 @@ public sealed class ChildInputTests : IDisposable
         using var session = Start(child, new RecordingLink());
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => session.Call("ping", null, seconds, CancellationToken.None));
         Assert.Equal("pong", await Ping(session, child));
+    }
+
+    sealed class SeenLink : Sim.SimLink
+    {
+        readonly List<string> _seen = [];
+
+        public string[] Seen
+        {
+            get
+            {
+                lock (_seen)
+                    return [.. _seen];
+            }
+        }
+
+        protected override object? Answer(string op, JsonElement args)
+        {
+            lock (_seen)
+                _seen.Add($"{op} {args.GetRawText()}");
+            return new Dictionary<string, object?> { ["took"] = op };
+        }
+    }
+
+    static string Line(string type, string op, string? args, long? rid = null) =>
+        $$"""{"type":"{{type}}",{{(rid is null ? "" : $"\"rid\":{rid},")}}"op":"{{op}}"{{(args is null ? "" : $",\"args\":{args}")}}}""" + "\n";
+
+    static async Task<JsonElement> Res(ScriptedChild child, long rid)
+    {
+        var res = await child.In.Next("res");
+        Assert.Equal(rid, res.GetProperty("rid").GetInt64());
+        return res;
+    }
+
+    [Theory]
+    [InlineData("record", """{"action":"start","fps":20}""")]
+    [InlineData("record", """{"action":"stop"}""")]
+    [InlineData("capture", "{}")]
+    [InlineData("detectors", """{"enabled":false}""")]
+    [InlineData("timestep", """{"scale":20}""")]
+    [InlineData("session", """{"action":"stop"}""")]
+    [InlineData("session", """{"action":"start"}""")]
+    [InlineData("session", """{"action":"start","map":"Levels/Main"}""")]
+    [InlineData("session", """{"action":"RESTART"}""")]
+    [InlineData("session", """{"action":7}""")]
+    [InlineData("session", "{}")]
+    [InlineData("session", null)]
+    [InlineData("session", """["restart"]""")]
+    [InlineData("session", """{"action":"restart","map":"C:/Games/Foo/.cluewren/runs/20250101-000000/work/made.tscn"}""")]
+    [InlineData("session", """{"action":"restart","map":"res://.Cluewren/runs/1/work/made.tscn"}""")]
+    [InlineData("session", """{"action":"restart","map":["Levels/Main"]}""")]
+    [InlineData("session", """{"action":"restart","map":null}""")]
+    [InlineData("Pose", "{}")]
+    [InlineData("no_such_op", "{}")]
+    public async Task What_harness_code_may_not_ask_is_answered_403_or_dropped_and_the_session_goes_on(string op, string? args)
+    {
+        var child = new ScriptedChild();
+        var link = new SeenLink();
+        using var session = Start(child, link);
+        child.Out.Write(Line("req", op, args, rid: 5));
+        var refused = await Res(child, 5);
+        Assert.False(refused.GetProperty("ok").GetBoolean());
+        Assert.Equal(403, refused.GetProperty("status").GetInt32());
+        Assert.Equal($"{op} is refused: harness code may not send it", refused.GetProperty("error").GetString());
+        child.Out.Write(Line("post", op, args) + Line("req", "pose", "{}", rid: 6));
+        Assert.True((await Res(child, 6)).GetProperty("ok").GetBoolean());
+        Assert.Equal("pong", await Ping(session, child));
+        Assert.Equal(["pose {}"], link.Seen);
+        Assert.DoesNotContain("kill", child.Events);
+    }
+
+    [Theory]
+    [InlineData("pose", "{}", "{}")]
+    [InlineData("ping", null, "{}")]
+    [InlineData("key", """{"key":"W","mode":"hold"}""", """{"key":"W","mode":"hold"}""")]
+    [InlineData("pause", """{"paused":true}""", """{"paused":true}""")]
+    [InlineData("rc", """{"object":"Main:/Door","property":"open","value":true}""", """{"object":"Main:/Door","property":"open","value":true}""")]
+    [InlineData("session", """{"action":"restart"}""", """{"action":"restart"}""")]
+    [InlineData("session", """{"action":"restart","map":"Levels/Main"}""", """{"action":"restart","map":"Levels/Main"}""")]
+    public async Task What_harness_code_may_ask_reaches_the_game_as_a_request_and_as_a_post(string op, string? args, string reached)
+    {
+        var child = new ScriptedChild();
+        var link = new SeenLink();
+        using var session = Start(child, link);
+        child.Out.Write(Line("req", op, args, rid: 5));
+        var answered = await Res(child, 5);
+        Assert.True(answered.GetProperty("ok").GetBoolean(), answered.GetRawText());
+        Assert.Equal(op, answered.GetProperty("result").GetProperty("took").GetString());
+        child.Out.Write(Line("post", op, args));
+        Assert.Equal("pong", await Ping(session, child));
+        Assert.Equal([$"{op} {reached}", $"{op} {reached}"], link.Seen);
+    }
+
+    [Fact]
+    public void Every_op_the_kit_sends_for_play_is_allowed_and_what_the_brain_runs_a_run_by_is_not()
+    {
+        using var none = JsonDocument.Parse("{}");
+        foreach (var op in (string[])
+                 [
+                     "rc", "find", "transforms", "pose", "movement", "view", "watch", "screen", "ui", "ui_act", "key", "input", "move",
+                     "pointer", "pause", "context", "levels", "ping",
+                 ])
+            Assert.True(ChildOps.Allows(op, none.RootElement), op);
+        foreach (var op in (string[])["record", "capture", "detectors", "timestep", "session", "hello", ""])
+            Assert.False(ChildOps.Allows(op, none.RootElement), op);
+        Assert.False(ChildOps.Allows("session", default));
+    }
+
+    const string TwoOptions = """{"pick":{"type":"choice","instructions":"Choose.","criteria":{"a":"go left","b":"go right"}}}""";
+    const string PicksA = """{"answers":{"pick":{"type":"choice","choice":"a","confidence":0.9,"probabilities":{"a":0.9,"b":0.1}}},"usage":{"input_tokens":100,"output_tokens":2}}""";
+
+    [Theory]
+    [InlineData(TwoOptions, PicksA, 1)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"b"}}}""", 1)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"probabilities":{"b":1.0,"elsewhere":0.0}}}}""", 1)]
+    [InlineData("""{"pick":{"type":"choice","criteria":{"a":"go left","b":"go right"}},"sure":{"type":"noul","criteria":"is it safe"}}""", PicksA, 1)]
+    [InlineData("""{"pick":{"type":"choice","criteria":{"a":"go left"}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"choice","criteria":{}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"choice","criteria":{"a":"go left","a":"go left again"}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"score","criteria":{"a":"go left","b":"go right"}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"noul","criteria":{"a":"go left","b":"go right"}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"criteria":{"a":"go left","b":"go right"}}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"choice","criteria":["a","b"]}}""", PicksA, 0)]
+    [InlineData("""{"pick":{"type":"choice"}}""", PicksA, 0)]
+    [InlineData("""{"other":{"type":"choice","criteria":{"a":"go left","b":"go right"}}}""", PicksA, 0)]
+    [InlineData("""["pick"]""", PicksA, 0)]
+    [InlineData(null, PicksA, 0)]
+    [InlineData(TwoOptions, null, 0)]
+    [InlineData(TwoOptions, "{}", 0)]
+    [InlineData(TwoOptions, "[]", 0)]
+    [InlineData(TwoOptions, """{"answers":{}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":[]}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"other":{"type":"choice","choice":"a"}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":"a"}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice"}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"elsewhere"}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"A"}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":7}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"elsewhere","probabilities":{"elsewhere":1.0}}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","probabilities":{}}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","probabilities":["a","b"]}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"a","probabilities":{"a":"high"}}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"a","probabilities":{"elsewhere":1.0}}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","probabilities":{"a":0.0}}}}""", 0)]
+    [InlineData(TwoOptions, """{"answers":{"pick":{"type":"choice","choice":"a","probabilities":{"a":0.0,"b":-1.0}}}}""", 0)]
+    public async Task Only_an_answer_that_picks_among_two_or_more_options_offered_as_a_choice_counts_as_served(string? questions,
+        string? answer, int counted)
+    {
+        var child = new ScriptedChild();
+        var jev = new FixedJev(answer);
+        using var session = Start(child, new RecordingLink(), jev);
+        var body = questions is null ? """{"state":{}}""" : $$"""{"state":{},"questions":{{questions}}}""";
+        for (var rid = 1; rid <= 2; rid++)
+        {
+            child.Out.Write($$"""{"type":"decide","rid":{{rid}},"body":{{body}}}""" + "\n");
+            var res = await Res(child, rid);
+            Assert.Equal(answer is not null, res.GetProperty("ok").GetBoolean());
+            if (answer is null)
+                Assert.Equal("DecisionException: HTTP 503", res.GetProperty("error").GetString());
+            else
+                Assert.Equal(answer, res.GetProperty("result").GetRawText());
+            Assert.Equal(rid * counted, session.DecisionsServed);
+        }
+        Assert.Equal(2, jev.Calls);
+        Assert.Equal("pong", await Ping(session, child));
+    }
+
+    [Fact]
+    public async Task A_decision_past_the_runs_limit_or_without_a_decider_is_answered_as_failed_and_not_counted()
+    {
+        var decide = """{"type":"decide","rid":1,"body":{"state":{},"questions":""" + TwoOptions + "}}\n";
+        var jev = new FixedJev(PicksA);
+        var limited = new ScriptedChild();
+        using (var session = new SandboxSession(limited, new RecordingLink(), jev, () => false, null, _ => { }, _log))
+        {
+            limited.Out.Write(decide);
+            var res = await Res(limited, 1);
+            Assert.False(res.GetProperty("ok").GetBoolean());
+            Assert.Contains("limit on Jev decisions is reached", res.GetProperty("error").GetString());
+            Assert.Equal((0, 0), (session.DecisionsServed, jev.Calls));
+        }
+        var alone = new ScriptedChild();
+        using (var session = Start(alone, new RecordingLink()))
+        {
+            alone.Out.Write(decide);
+            Assert.Contains("no Jev key in this run", (await Res(alone, 1)).GetProperty("error").GetString());
+            Assert.Equal(0, session.DecisionsServed);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task The_child_is_told_the_run_folder_the_work_folder_and_whether_a_decider_is_there(bool decider)
+    {
+        var child = new ScriptedChild();
+        var link = new SeenLink();
+        link.FeatureList.Add("media");
+        using var session = Start(child, link, decider ? new FixedJev(PicksA) : null);
+        session.Init(@"C:\Games\Foo\.cluewren\runs\1", @"C:\Games\Foo\.cluewren\runs\1\work", "Levels/Main", 42);
+        var init = await child.In.Next("init");
+        Assert.Equal(["type", "run_folder", "work_folder", "level", "decider", "max_decisions", "engine", "features"],
+            init.EnumerateObject().Select(field => field.Name));
+        Assert.Equal(@"C:\Games\Foo\.cluewren\runs\1", init.GetProperty("run_folder").GetString());
+        Assert.Equal(@"C:\Games\Foo\.cluewren\runs\1\work", init.GetProperty("work_folder").GetString());
+        Assert.Equal("Levels/Main", init.GetProperty("level").GetString());
+        Assert.Equal(decider, init.GetProperty("decider").GetBoolean());
+        Assert.Equal(42, init.GetProperty("max_decisions").GetInt32());
+        Assert.Equal("unity", init.GetProperty("engine").GetString());
+        Assert.Equal(["media"], init.GetProperty("features").EnumerateArray().Select(feature => feature.GetString()));
+    }
+
+    [Fact]
+    public async Task A_child_that_ignores_the_stop_is_ended_once_the_grace_is_over()
+    {
+        var child = new ScriptedChild();
+        using var session = Start(child, new RecordingLink());
+        var playing = session.Call("run_harness", null, 600, CancellationToken.None);
+        await CallId(child);
+        session.StopWithin(TimeSpan.FromMilliseconds(50));
+        await child.In.Next("stop");
+        var ended = await Assert.ThrowsAsync<SandboxException>(() => playing.WaitAsync(Patience));
+        Assert.Equal("it didn't stop when asked and was ended", ended.Message);
+        await child.KillStarted.Task.WaitAsync(Patience);
+        var after = await Assert.ThrowsAsync<SandboxException>(() => session.Call("ping", null, 30, CancellationToken.None));
+        Assert.Equal("it didn't stop when asked and was ended", after.Message);
+    }
+
+    [Fact]
+    public async Task A_child_that_stops_when_asked_gives_its_result_and_is_not_killed_after_the_grace()
+    {
+        var grace = TimeSpan.FromMilliseconds(200);
+        var child = new ScriptedChild();
+        var session = Start(child, new RecordingLink());
+        try
+        {
+            var playing = session.Call("run_harness", null, 600, CancellationToken.None);
+            var id = await CallId(child);
+            session.StopWithin(grace);
+            await child.In.Next("stop");
+            child.Out.Write(Reply(id, "summary"));
+            Assert.Equal("summary", (await playing.WaitAsync(Patience)).GetString());
+        }
+        finally
+        {
+            session.Dispose();
+        }
+        await Task.Delay(grace * 3);
+        Assert.Equal(["dispose"], child.Events);
+    }
+
+    // Before, the stop line was written first and on the caller's thread: a child that read nothing more held the caller
+    // in the write, and the end after the grace was never set.
+    [Fact]
+    public async Task A_child_that_reads_nothing_more_is_ended_after_the_grace_and_the_stop_does_not_wait_for_it()
+    {
+        var child = new ScriptedChild();
+        using var reading = new ManualResetEventSlim(true);
+        child.In.Refuse = () =>
+        {
+            reading.Wait();
+            return null;
+        };
+        var session = Start(child, new RecordingLink());
+        try
+        {
+            var playing = session.Call("run_harness", null, 600, CancellationToken.None);
+            await CallId(child);
+            reading.Reset();
+            await Task.Run(() => session.StopWithin(TimeSpan.FromMilliseconds(50))).WaitAsync(Patience);
+            var ended = await Assert.ThrowsAsync<SandboxException>(() => playing.WaitAsync(Patience));
+            Assert.Equal("it didn't stop when asked and was ended", ended.Message);
+            Assert.Contains("kill", child.Events);
+        }
+        finally
+        {
+            reading.Set();
+            session.Dispose();
+        }
     }
 }
 

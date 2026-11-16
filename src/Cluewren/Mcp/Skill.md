@@ -23,7 +23,7 @@ revise the harness, and report what play showed. Its tools come from the `cluewr
    Pass `time_limit_minutes` when the user gives a time limit.
 3. Read the INSTRUCTIONS.md it names, all of it. Follow it: it is how to work, what the kit is,
    and the rules a report must meet.
-4. A call that answers "still going" (an episode, the game starting) isn't done: call `wait` until it gives the result.
+4. A call that answers "still going" (an episode, the game starting) isn't done: call `wait` until it gives the result. To end an episode or a probe that should not go on (the user asks you to stop, it is plainly stuck), call `stop`, then `wait` for what it gave.
 5. To look at the game's picture, never call `frames` yourself: hand the episode, the game times and open questions
    (nothing about the request or what you expect) to the `frame-describer` subagent, as INSTRUCTIONS.md says.
 6. If start_run asks for the decision model's key, tell the user where it goes. Never ask them to paste a key into this

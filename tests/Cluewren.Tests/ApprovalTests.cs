@@ -675,7 +675,8 @@ public class ToolAnnotationTests
     {
         var expected = new Dictionary<string, (bool ReadOnly, bool Destructive, bool OpenWorld)>
         {
-            ["start_run"] = (false, true, true), ["wait"] = (true, false, false), ["probe"] = (false, true, true),
+            ["start_run"] = (false, true, true), ["wait"] = (true, false, false), ["stop"] = (false, true, false),
+            ["probe"] = (false, true, true),
             ["use_harness"] = (false, true, false), ["check_harness"] = (false, true, true), ["run_harness"] = (false, true, true),
             ["snapshot"] = (false, true, false), ["restart_level"] = (false, true, false), ["frames"] = (true, false, false),
             ["report"] = (false, true, false),

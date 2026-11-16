@@ -2,7 +2,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Cluewren.Bridge;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Sandbox;
 
 namespace Cluewren.Mcp;
@@ -23,6 +23,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     {
         ["start_run"] = ("Start a playtest run", false, true),
         ["wait"] = ("Wait for the call still going", true, false),
+        ["stop"] = ("Stop the call still going", false, false),
         ["probe"] = ("Probe the live game", false, true),
         ["use_harness"] = ("Reuse an earlier harness", false, false),
         ["check_harness"] = ("Check the harness", false, true),
@@ -51,6 +52,10 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             "Wait for the call still going (an episode, the game starting) and give its result. If it is still going after about 40 s, it "
             + "says so: call wait again.",
             """{"type":"object","properties":{}}"""),
+        ("stop",
+            "Stop the episode, check or probe still going: it ends where it is, the keys are let go and the game is paused. Then "
+            + "call wait for what it gave until then.",
+            """{"type":"object","properties":{}}"""),
         ("probe",
             "Run C# statements against the live game (it runs while this tool runs, then pauses). `game` and everything in the kit "
             + "is in scope, with top-level await. Console output and the value of the last expression come back. Use it to find actors, "
@@ -68,7 +73,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             "Run this request's harness.cs on the live game for `seconds` of play (5-360; default restart: the level starts over first; "
             + "restart=false continues play from where it is, and the plan's progress of the episode before is handed to the harness's "
             + "Resume) with Jev deciding. Returns a summary: how each option fared, the timeline, where the plan got, what Jev saw, "
-            + "errors. The full trace is saved beside harness.cs as traceN.jsonl. frames_fps: the frames a second the episode is filmed "
+            + "errors. The full trace is saved in the run's work folder as traceN.jsonl. frames_fps: the frames a second the episode is filmed "
             + "at (1-20; default 5: more for a fast animation).",
             """{"type":"object","properties":{"seconds":{"type":"number"},"restart":{"type":"boolean"},"frames_fps":{"type":"number"}},"required":["seconds"]}"""),
         ("snapshot",
@@ -97,17 +102,21 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     readonly CancellationTokenSource _stopping = new();
     readonly SemaphoreSlim _runLock = new(1, 1);
     (Task<ToolResult> Task, string Tool, DateTimeOffset Since)? _pending;
+    string? _pendingRequest;
     string _client = "an MCP client";
     BridgeServer? _bridge;
-    (string Path, Discovery Announced)? _discovery;
+    (string Path, Invite Sent)? _invite;
     JevClient? _jev;
     PlaytestRun? _run;
     (string Run, string Reason, string Folder)? _ended;
     Task? _watch;
+    FramesRelay? _relay;
 
-    public string? JevKey { get; init; }
+    public string? DecisionKey { get; init; }
 
-    public string WorkingFolder { get; } = Environment.CurrentDirectory;
+    public string WorkingFolder { get; init; } = Environment.CurrentDirectory;
+
+    public string RendezvousFolder { get; init; } = Rendezvous.DefaultFolder;
 
     public SandboxMode Sandbox { get; init; }
 
@@ -187,7 +196,14 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         var id = message["id"]?.DeepClone();
         var method = message["method"]?.GetValue<string>();
         if (id is null)
+        {
+            // A client that gives up on a call says so: what the call was playing must not go on for minutes with keys held.
+            if (method == "notifications/cancelled" && message["params"]?["requestId"]?.ToJsonString() is { } cancelled)
+                lock (_gate)
+                    if (_pending is { } going && !going.Task.IsCompleted && _pendingRequest == cancelled && Stoppable(going.Tool))
+                        _run?.StopPlaying();
             return;
+        }
         JsonNode? result;
         switch (method)
         {
@@ -215,7 +231,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
                 ToolResult answer;
                 try
                 {
-                    answer = await CallAsync(tool, args).ConfigureAwait(false);
+                    answer = await CallAsync(tool, args, id.ToJsonString()).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
@@ -244,16 +260,32 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         return new JsonObject { ["content"] = content, ["isError"] = result.Error };
     }
 
-    public async Task<ToolResult> CallAsync(string tool, JsonObject args)
+    // The calls that play: a stop kept for one of them would end the next of them if it were taken for another call.
+    static bool Stoppable(string tool) => tool is "probe" or "check_harness" or "run_harness";
+
+    public async Task<ToolResult> CallAsync(string tool, JsonObject args, string? requestId = null)
     {
         (Task<ToolResult> Task, string Tool, DateTimeOffset Since) pending;
         lock (_gate)
         {
+            if (tool == "stop")
+            {
+                if (_pending is not { } going)
+                    return ToolResult.Say("Nothing is going: no call is there to stop.");
+                if (going.Task.IsCompleted)
+                    return ToolResult.Say($"{going.Tool} has ended: call wait for its result.");
+                if (_run is null || !Stoppable(going.Tool))
+                    return ToolResult.Say($"{going.Tool} is still going and can't be stopped: call wait.");
+                _run.StopPlaying();
+                return ToolResult.Say($"Stopping {going.Tool}: call wait for what it gave until then.");
+            }
             if (tool == "wait")
             {
                 if (_pending is null)
                     return ToolResult.Say("Nothing is going: no call is waiting for its result.");
                 pending = _pending.Value;
+                // The request a client can still cancel is this one: the call that began the play was answered.
+                _pendingRequest = requestId ?? _pendingRequest;
             }
             else if (_pending is { } going)
                 return ToolResult.Say($"{going.Tool} is still going ({Seconds(going.Since)} s): call wait for its result first.", true);
@@ -261,6 +293,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             {
                 pending = (Task.Run(() => DoAsync(tool, args)), tool, DateTimeOffset.UtcNow);
                 _pending = pending;
+                _pendingRequest = requestId;
             }
         }
         await Task.WhenAny(pending.Task, Task.Delay(TimeSpan.FromSeconds(waitSeconds))).ConfigureAwait(false);
@@ -269,7 +302,11 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             if (!pending.Task.IsCompleted)
                 return ToolResult.Say($"{pending.Tool} is still going ({Seconds(pending.Since)} s): call wait for its result.");
             if (_pending?.Task == pending.Task)
+            {
                 _pending = null;
+                // A stop that came after the call ended, before its result was fetched, must not end the next call.
+                _run?.ForgetStop();
+            }
         }
         return await pending.Task.ConfigureAwait(false);
     }
@@ -292,7 +329,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             if (tool == "start_run")
                 return await StartAsync(args).ConfigureAwait(false);
             if (_run is not { } run)
-                return NoRun();
+                return tool == "frames" && await FramesRelay.AskAsync(WorkingFolder, args, _stopping.Token).ConfigureAwait(false) is { } relayed
+                    ? relayed : NoRun();
             var endedBefore = run.Ended is not null;
             var result = await run.CallAsync(tool, args, _stopping.Token).ConfigureAwait(false);
             if (run.Ended is not null)
@@ -344,7 +382,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             return ToolResult.Say($"Run {_run.RunId} is going: finish it with report first.", true);
         _ended = null;
         await CloseRunAsync().ConfigureAwait(false);
-        var key = JevKey ?? ApiKeys.Find(ApiKeys.TypeSafeKey);
+        var key = DecisionKey ?? ApiKeys.Find(ApiKeys.TypeSafeKey);
         if (string.IsNullOrWhiteSpace(key))
             return ToolResult.Say($"The decision model's key is missing. Tell the user to put it in {ApiKeys.KeysFile} as "
                 + $"{ApiKeys.TypeSafeKey}=<key>, and never to paste it here, then call start_run again. (Set in the environment "
@@ -362,23 +400,35 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         var secret = Handshake.NewSecret();
         var bridge = await BridgeServer.StartAsync(secret, scope).ConfigureAwait(false);
         _bridge = bridge;
-        var announced = new Discovery(bridge.Url, Convert.ToBase64String(secret), Environment.ProcessId, DateTimeOffset.UtcNow,
-            scope.Folders, scope.Match);
-        _discovery = (DiscoveryFile.Write(announced, DiscoveryFile.DefaultFolder), announced);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
         deadline.CancelAfter(TimeSpan.FromSeconds(connectSeconds));
+        EditorAdvert? invited = null;
         try
         {
+            var chosen = await Rendezvous.ChooseAsync(RendezvousFolder, scope, BridgeServer.Protocol, ct: deadline.Token)
+                .ConfigureAwait(false);
+            bridge.Expect(ProjectScope.ExactlyThe(chosen.Folder));
+            var editor = chosen.Editor;
+            var invitation = Rendezvous.Invite(RendezvousFolder, editor, bridge.Url, secret, BridgeServer.Protocol);
+            _invite = (invitation.Path, invitation.Invite);
+            invited = editor;
             var link = await _bridge.NextLinkAsync(deadline.Token).ConfigureAwait(false);
-            _jev = new JevClient(new JevOptions(key));
+            _jev = new JevClient(JevOptions.FromSettings(key));
             _run = await PlaytestRun.OpenAsync(link, new RunRequest(request, kind, args["minutes"]?.GetValue<double>(),
                 args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, Sandbox, _stopping.Token).ConfigureAwait(false);
             _watch = CloseWhenEndedAsync(_run);
+            _relay = FramesRelay.Serve(WorkingFolder, frames => CallAsync("frames", frames));
             return ToolResult.Say(_run.Opening);
         }
-        catch (OperationCanceledException)
+        catch (RendezvousException e)
         {
-            var text = NoEditorText(bridge, connectSeconds);
+            var text = NoEditorText(bridge.Scope, e.Message);
+            await CloseRunAsync().ConfigureAwait(false);
+            return ToolResult.Say(text, true);
+        }
+        catch (OperationCanceledException) when (invited is not null)
+        {
+            var text = NotConnectedText(bridge, invited, connectSeconds);
             await CloseRunAsync().ConfigureAwait(false);
             return ToolResult.Say(text, true);
         }
@@ -389,14 +439,17 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         }
     }
 
-    public static string NoEditorText(BridgeServer bridge, double seconds)
+    public static string NoEditorText(ProjectScope scope, string why) =>
+        $"The run didn't start: {why.TrimEnd('.')}. This run takes an editor whose project is {scope.Described}"
+        + (scope.Exact ? ". " : " (start_run's project names one exactly). ")
+        + "Tell the user to open the game's project in its editor with the Cluewren plugin, then call start_run again.";
+
+    public static string NotConnectedText(BridgeServer bridge, EditorAdvert editor, double seconds)
     {
         var refused = bridge.Refused;
-        return $"No editor connected within {seconds:0} s. This run takes an editor whose project is {bridge.Scope.Described}"
-            + (bridge.Scope.Exact ? ". " : " (start_run's project names one exactly). ")
+        return $"The editor of {editor.ProjectDir} ({editor.Engine}) was invited and didn't connect within {seconds:0} s. "
             + (refused.Count > 0 ? $"Refused at the handshake: {string.Join("; ", refused)}. " : "")
-            + "An editor of another project doesn't connect, and shows why in its own Cluewren window. Tell the user to open "
-            + "the game's project in its editor with the Cluewren plugin, then call start_run again.";
+            + "Its Cluewren window shows why. Tell the user, then call start_run again.";
     }
 
     async Task CloseRunAsync(bool remember = false)
@@ -408,12 +461,15 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             await _run.DisposeAsync().ConfigureAwait(false);
         }
         _run = null;
+        if (_relay is not null)
+            await _relay.DisposeAsync().ConfigureAwait(false);
+        _relay = null;
         if (_jev is not null)
             await _jev.DisposeAsync().ConfigureAwait(false);
         _jev = null;
-        if (_discovery is { } discovery)
-            DiscoveryFile.Withdraw(discovery.Path, discovery.Announced);
-        _discovery = null;
+        if (_invite is { } invite)
+            Rendezvous.Withdraw(invite.Path, invite.Sent);
+        _invite = null;
         if (_bridge is not null)
             await _bridge.DisposeAsync().ConfigureAwait(false);
         _bridge = null;
@@ -422,7 +478,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
     public async ValueTask DisposeAsync()
     {
         await _stopping.CancelAsync().ConfigureAwait(false);
-        // A run_harness whose child doesn't stop holds the lock for minutes, and with it the editor and brain.json.
+        // A run_harness whose child doesn't stop holds the lock for minutes, and with it the editor and its invite.
         var locked = await _runLock.WaitAsync(StopPatience).ConfigureAwait(false);
         try
         {

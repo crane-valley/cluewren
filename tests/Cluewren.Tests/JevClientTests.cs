@@ -7,7 +7,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 
 namespace Cluewren.Tests;
@@ -18,6 +18,7 @@ public sealed class FakeJev : IAsyncDisposable
     public readonly List<string> Bodies = [];
     public readonly List<string?> Authorizations = [];
     public int ModelCalls;
+    public int Elsewhere;
     public Func<int, (int Status, string Body, TimeSpan Delay)> Answer = _ => (200, Good, TimeSpan.Zero);
 
     public const string Good = """
@@ -37,6 +38,11 @@ public sealed class FakeJev : IAsyncDisposable
         var app = builder.Build();
         var fake = new FakeJev(app);
         app.MapPost("/v1/systemone", fake.HandleAsync);
+        app.MapPost("/v1/elsewhere", () =>
+        {
+            Interlocked.Increment(ref fake.Elsewhere);
+            return Good;
+        });
         app.MapGet("/v1/models", () =>
         {
             Interlocked.Increment(ref fake.ModelCalls);
@@ -63,6 +69,8 @@ public sealed class FakeJev : IAsyncDisposable
         if (delay > TimeSpan.Zero)
             await Task.Delay(delay, context.RequestAborted);
         context.Response.StatusCode = status;
+        if (status is >= 300 and < 400)
+            context.Response.Headers.Location = "/v1/elsewhere";
         context.Response.ContentType = "application/json";
         await context.Response.WriteAsync(answer);
     }
@@ -76,7 +84,7 @@ public sealed class FakeJev : IAsyncDisposable
 
 public class JevClientTests
 {
-    static readonly JevRequest Request = new("Open the gate", JevRequest.DefaultInstructions,
+    static readonly DecisionRequest Request = new("Open the gate", DecisionRequest.DefaultInstructions,
         new Dictionary<string, object?> { ["health"] = 80 },
         [
             new OfferedOption("a", "pull the lever", new Dictionary<string, object?> { ["distance"] = 3.5 }),
@@ -163,8 +171,94 @@ public class JevClientTests
         await using var fake = await FakeJev.StartAsync();
         fake.Answer = _ => (401, "{}", TimeSpan.Zero);
         await using var client = Client(fake);
-        await Assert.ThrowsAsync<JevException>(() => client.DecideAsync(Request, default));
+        await Assert.ThrowsAsync<DecisionException>(() => client.DecideAsync(Request, default));
         Assert.Single(fake.Bodies);
+    }
+
+    // The key goes with every request: a redirect followed would hand it to wherever the answer points.
+    [Theory]
+    [InlineData(301)]
+    [InlineData(302)]
+    [InlineData(307)]
+    [InlineData(308)]
+    public async Task A_redirect_is_not_followed(int status)
+    {
+        await using var fake = await FakeJev.StartAsync();
+        fake.Answer = _ => (status, "{}", TimeSpan.Zero);
+        await using var client = Client(fake);
+        var refused = await Assert.ThrowsAsync<DecisionException>(() => client.DecideAsync(Request, default));
+        Assert.Equal($"HTTP {status}", refused.Message);
+        Assert.Single(fake.Bodies);
+        Assert.Equal(0, fake.Elsewhere);
+    }
+
+    static Func<string, string?> Settings(params (string Name, string Value)[] set) =>
+        name => set.FirstOrDefault(setting => setting.Name == name).Value;
+
+    [Fact]
+    public void Settings_that_are_not_set_leave_the_default_model_and_address()
+    {
+        var options = JevOptions.FromSettings("key", Settings());
+        Assert.Equal(new JevOptions("key"), options);
+        Assert.Equal(("key", JevOptions.DefaultModel, new Uri("https://api.typesafe.ai")), (options.ApiKey, options.Model, options.BaseUrl));
+    }
+
+    [Fact]
+    public async Task The_model_setting_is_the_model_asked()
+    {
+        var options = JevOptions.FromSettings("key", Settings((ApiKeys.TypeSafeModel, "jev-latest")));
+        Assert.Equal(new JevOptions("key") { Model = "jev-latest" }, options);
+        await using var fake = await FakeJev.StartAsync();
+        await using var client = new JevClient(options with { BaseUrl = fake.Url, AttemptTimeout = Patience, TotalTimeout = Patience });
+        await client.DecideAsync(Request, default);
+        using var relayed = JsonDocument.Parse("""{"model":"the-child-asked-for-this","state":{},"questions":{}}""");
+        await client.DecideRawAsync(relayed.RootElement, default);
+        Assert.All(fake.Bodies, body =>
+        {
+            using var sent = JsonDocument.Parse(body);
+            Assert.Equal("jev-latest", sent.RootElement.GetProperty("model").GetString());
+            Assert.Single(sent.RootElement.EnumerateObject(), field => field.Name == "model");
+        });
+        Assert.Equal(2, fake.Bodies.Count);
+    }
+
+    [Theory]
+    [InlineData("https://decisions.example.test")]
+    [InlineData("https://decisions.example.test/")]
+    [InlineData("HTTPS://127.0.0.1:8443")]
+    public void An_https_base_url_setting_is_taken(string address)
+    {
+        var options = JevOptions.FromSettings("key", Settings((ApiKeys.TypeSafeBaseUrl, address)));
+        Assert.Equal(new JevOptions("key") { BaseUrl = new Uri(address) }, options);
+    }
+
+    [Theory]
+    [InlineData("http://decisions.example.test")]
+    [InlineData("http://127.0.0.1:8080")]
+    [InlineData("https://user:pass@decisions.example.test")]
+    [InlineData("https://user@decisions.example.test")]
+    [InlineData("decisions.example.test")]
+    [InlineData("//decisions.example.test")]
+    [InlineData("wss://decisions.example.test")]
+    [InlineData("file:///C:/keys")]
+    [InlineData("")]
+    public void A_base_url_setting_that_is_not_https_or_carries_a_user_is_refused(string address)
+    {
+        var refused = Assert.Throws<DecisionException>(() => JevOptions.FromSettings("key",
+            Settings((ApiKeys.TypeSafeModel, "jev-latest"), (ApiKeys.TypeSafeBaseUrl, address))));
+        Assert.Equal("TYPESAFE_BASE_URL must be an https address of a host alone: no user, password, path or query", refused.Message);
+    }
+
+    // Before, an address with a path was taken, and the requests, sent to paths from the host's root, carried the key to
+    // another place than the one the address named.
+    [Theory]
+    [InlineData("https://decisions.example.test/base/")]
+    [InlineData("https://decisions.example.test:8443/base/")]
+    [InlineData("https://decisions.example.test/?a=1")]
+    [InlineData("https://decisions.example.test/#top")]
+    public void A_base_url_setting_with_a_path_a_query_or_a_fragment_is_refused(string address)
+    {
+        Assert.Throws<DecisionException>(() => JevOptions.FromSettings("key", Settings((ApiKeys.TypeSafeBaseUrl, address))));
     }
 
     [Fact]
@@ -177,7 +271,7 @@ public class JevClientTests
             AttemptTimeout = TimeSpan.FromMilliseconds(100),
             TotalTimeout = TimeSpan.FromMilliseconds(250),
         });
-        await Assert.ThrowsAsync<JevException>(() => client.DecideAsync(Request, default));
+        await Assert.ThrowsAsync<DecisionException>(() => client.DecideAsync(Request, default));
     }
 
     [Fact]

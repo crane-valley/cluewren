@@ -6,11 +6,11 @@ using System.Net.Sockets;
 using System.Text.Json;
 using Cluewren.Kit;
 
-namespace Cluewren.Jev;
+namespace Cluewren.Decisions;
 
-public sealed class JevException(string message) : Exception(message);
+public sealed class DecisionException(string message) : Exception(message);
 
-public interface IJevRelay
+public interface IDecisionRelay
 {
     Task<(byte[] Body, long LatencyTicks)> DecideRawAsync(JsonElement stateAndQuestions, CancellationToken ct);
 }
@@ -27,9 +27,28 @@ public sealed record JevOptions(string ApiKey)
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(50);
     public TimeSpan WarmEvery { get; init; } = TimeSpan.FromSeconds(15);
     public TimeSpan WarmTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    // The key goes wherever the base URL points, so only an https address the user set is taken. Requests go to paths
+    // from the host's root, so an address with a path of its own would send the key to another place than it names.
+    public static JevOptions FromSettings(string apiKey, Func<string, string?>? find = null)
+    {
+        find ??= name => ApiKeys.Find(name);
+        var options = new JevOptions(apiKey);
+        if (find(ApiKeys.TypeSafeModel) is { } model)
+            options = options with { Model = model };
+        if (find(ApiKeys.TypeSafeBaseUrl) is { } address)
+        {
+            if (!Uri.TryCreate(address, UriKind.Absolute, out var url) || url.Scheme != Uri.UriSchemeHttps
+                || url.UserInfo.Length > 0 || url.AbsolutePath != "/" || url.Query.Length > 0 || url.Fragment.Length > 0)
+                throw new DecisionException($"{ApiKeys.TypeSafeBaseUrl} must be an https address of a host alone: no user, "
+                    + "password, path or query");
+            options = options with { BaseUrl = url };
+        }
+        return options;
+    }
 }
 
-public sealed class JevClient : IDecider, IJevRelay, IAsyncDisposable
+public sealed class JevClient : IDecider, IDecisionRelay, IAsyncDisposable
 {
     const int MaxAttempts = 2;
 
@@ -49,6 +68,7 @@ public sealed class JevClient : IDecider, IJevRelay, IAsyncDisposable
             EnableMultipleHttp2Connections = true,
             ConnectCallback = ConnectToFastestAsync,
             AutomaticDecompression = DecompressionMethods.None,
+            AllowAutoRedirect = false,
         })
         {
             BaseAddress = options.BaseUrl,
@@ -60,10 +80,10 @@ public sealed class JevClient : IDecider, IJevRelay, IAsyncDisposable
         _warm = KeepWarmAsync();
     }
 
-    public async Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+    public async Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
     {
         var (body, latency) = await PostAsync(request.Encode(_options.Model), ct).ConfigureAwait(false);
-        return JevDecision.Parse(body, latency);
+        return Decision.Parse(body, latency);
     }
 
     public Task<(byte[] Body, long LatencyTicks)> DecideRawAsync(JsonElement stateAndQuestions, CancellationToken ct)
@@ -113,7 +133,7 @@ public sealed class JevClient : IDecider, IJevRelay, IAsyncDisposable
                     return (answer, Stopwatch.GetTimestamp() - started);
                 failure = $"HTTP {(int)response.StatusCode}";
                 if (!Retryable(response.StatusCode))
-                    throw new JevException(failure);
+                    throw new DecisionException(failure);
             }
             catch (HttpRequestException e)
             {
@@ -125,18 +145,18 @@ public sealed class JevClient : IDecider, IJevRelay, IAsyncDisposable
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                throw new JevException("no answer in time");
+                throw new DecisionException("no answer in time");
             }
 
             if (attempt >= MaxAttempts)
-                throw new JevException(failure);
+                throw new DecisionException(failure);
             try
             {
                 await Task.Delay(_options.RetryDelay, total.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                throw new JevException("no answer in time");
+                throw new DecisionException("no answer in time");
             }
         }
     }

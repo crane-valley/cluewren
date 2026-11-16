@@ -1,16 +1,43 @@
 using System.Buffers;
 using System.Text.Json;
 using Cluewren.Bridge;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 
 namespace Cluewren.Sandbox;
 
 public interface IEpisodeRecorder
 {
+    // An episode that was numbered and then not played: its number is given to the next one.
+    void Forget(int episode)
+    {
+    }
+
     void Begin(int episode);
 
     void End(int episode);
+}
+
+// What harness code may ask of the game. The rest is the brain's: what it films and measures a run by, and where the
+// game starts and ends.
+public static class ChildOps
+{
+    static readonly HashSet<string> Allowed =
+    [
+        "rc", "find", "transforms", "pose", "movement", "view", "watch", "screen", "ui", "ui_act", "key", "input", "move",
+        "pointer", "pause", "context", "levels", "ping",
+    ];
+
+    public static bool Allows(string op, JsonElement args) =>
+        Allowed.Contains(op)
+        || (op == "session" && args.ValueKind == JsonValueKind.Object && args.TryGetProperty("action", out var action)
+            && action.ValueKind == JsonValueKind.String && action.ValueEquals("restart") && !StartsWhatItWrote(args));
+
+    // The plugin refuses a map under the folder harness code can write, after resolving what the engine resolves. This
+    // is the same refusal by the name alone, for a level that would run outside the container.
+    static bool StartsWhatItWrote(JsonElement args) =>
+        args.TryGetProperty("map", out var map)
+        && (map.ValueKind != JsonValueKind.String || map.GetString()!.Contains(".cluewren", StringComparison.OrdinalIgnoreCase));
 }
 
 public sealed class SandboxSession : IDisposable
@@ -43,7 +70,7 @@ public sealed class SandboxSession : IDisposable
 
     readonly ISandboxProcess _process;
     readonly IGameLink _link;
-    readonly IJevRelay? _jev;
+    readonly IDecisionRelay? _jev;
     readonly Func<bool> _spendDecision;
     readonly IEpisodeRecorder? _recorder;
     readonly Action<string> _say;
@@ -56,8 +83,12 @@ public sealed class SandboxSession : IDisposable
     readonly Lock _ending = new();
     readonly Queue<(string Text, int Bytes)> _statuses = new();
     readonly Lock _logging = new();
+    // Its own lock, not the one a failing session takes to kill the child: a recorder that is slow must not hold that up.
+    readonly Lock _marking = new();
+    bool _marksClosed;
     FileStream? _log;
     long _ids;
+    int _served;
     int _heldItems;
     long _heldBytes;
     bool _ended;
@@ -66,7 +97,7 @@ public sealed class SandboxSession : IDisposable
     int _disposed;
     string? _failure;
 
-    public SandboxSession(ISandboxProcess process, IGameLink link, IJevRelay? jev, Func<bool> spendDecision,
+    public SandboxSession(ISandboxProcess process, IGameLink link, IDecisionRelay? jev, Func<bool> spendDecision,
         IEpisodeRecorder? recorder, Action<string> say, string logPath)
     {
         _process = process;
@@ -85,16 +116,20 @@ public sealed class SandboxSession : IDisposable
 
     public string Kind => _process.Kind;
 
+    // Counted here, where the decision model answered: what the child says it decided is its own word.
+    public int DecisionsServed => Volatile.Read(ref _served);
+
     public int Episode { get; set; }
 
-    public void Init(string runFolder, string? level, int maxDecisions) =>
-        _out.Write((runFolder, level, maxDecisions, Link: _link, Jev: _jev is not null), static (json, s) =>
+    public void Init(string runFolder, string workFolder, string? level, int maxDecisions) =>
+        _out.Write((runFolder, workFolder, level, maxDecisions, Link: _link, Decider: _jev is not null), static (json, s) =>
         {
             json.WriteString("type", "init");
             json.WriteString("run_folder", s.runFolder);
+            json.WriteString("work_folder", s.workFolder);
             if (s.level is not null)
                 json.WriteString("level", s.level);
-            json.WriteBoolean("jev", s.Jev);
+            json.WriteBoolean("decider", s.Decider);
             json.WriteNumber("max_decisions", s.maxDecisions);
             json.WriteString("engine", s.Link.Engine);
             json.WriteStartArray("features");
@@ -324,6 +359,18 @@ public sealed class SandboxSession : IDisposable
             {
                 var rid = root.GetProperty("rid").GetInt64();
                 var op = Text(root, "op");
+                if (!ChildOps.Allows(op, root.TryGetProperty("args", out var asked) ? asked : default))
+                {
+                    _out.Write((rid, op), static (json, s) =>
+                    {
+                        json.WriteString("type", "res");
+                        json.WriteNumber("rid", s.rid);
+                        json.WriteBoolean("ok", false);
+                        json.WriteNumber("status", 403);
+                        json.WriteString("error", $"{s.op} is refused: harness code may not send it");
+                    });
+                    break;
+                }
                 if (!Admit(line))
                     break;
                 _ = Serve(ServeRequest(rid, op, root), line);
@@ -333,6 +380,8 @@ public sealed class SandboxSession : IDisposable
             {
                 var op = Text(root, "op");
                 var args = root.TryGetProperty("args", out var posted) ? posted : default;
+                if (!ChildOps.Allows(op, args))
+                    break;
                 var taken = true;
                 lock (_gate)
                     if (!_ended)
@@ -366,12 +415,12 @@ public sealed class SandboxSession : IDisposable
                     _ = Task.Run(SayQueued);
                 break;
             }
-            case "jev":
+            case "decide":
             {
                 var rid = root.GetProperty("rid").GetInt64();
                 if (!Admit(line))
                     break;
-                _ = Serve(ServeJev(rid, root), line);
+                _ = Serve(ServeDecision(rid, root), line);
                 return;
             }
             case "episode":
@@ -445,6 +494,7 @@ public sealed class SandboxSession : IDisposable
             using var answer = await (_link is BridgeLink bridge
                 ? bridge.RequestWithinAsync(op, json => WriteFields(json, args), timeout, _closing.Token)
                 : _link.RequestAsync(op, json => WriteFields(json, args), timeout, _closing.Token).AsTask()).ConfigureAwait(false);
+            Restarted(op);
             _out.Write((rid, answer, Link: _link), static (json, s) =>
             {
                 json.WriteString("type", "res");
@@ -464,6 +514,7 @@ public sealed class SandboxSession : IDisposable
         }
         catch (GameException e)
         {
+            Restarted(op);
             _out.Write((rid, e, Link: _link), static (json, s) =>
             {
                 json.WriteString("type", "res");
@@ -475,6 +526,7 @@ public sealed class SandboxSession : IDisposable
                     json.WriteNumber("game_time", latest);
             });
         }
+        // The game gave no answer (the link went, or this session is ending): nothing is known to have started over.
         catch (Exception e)
         {
             _out.Write((rid, Text: $"{e.GetType().Name}: {e.Message}", Link: _link), static (json, s) =>
@@ -489,15 +541,52 @@ public sealed class SandboxSession : IDisposable
         }
     }
 
-    async Task ServeJev(long rid, JsonElement root)
+    // The level starting over is where an episode's pictures begin, and this process saw it: a harness that marks its
+    // beginning later moves nothing. Before the answer is written to the child, which may not be reading.
+    void Restarted(string op)
+    {
+        if (op == "session" && Episode > 0)
+            Mark(begin: true, Episode);
+    }
+
+    // A decision is a choice among two or more options: a request that offers one is a script asking for a signature.
+    // Only this counts toward the report's gate: two or more options by different names were offered as a choice, and
+    // the decision model's answer picks among them.
+    static bool Decided(JsonElement asked, ReadOnlySpan<byte> answered)
+    {
+        if (asked.ValueKind != JsonValueKind.Object || !asked.TryGetProperty("questions", out var questions)
+            || questions.ValueKind != JsonValueKind.Object
+            || !questions.TryGetProperty(DecisionRequest.PickQuestion, out var pick) || pick.ValueKind != JsonValueKind.Object
+            || !pick.TryGetProperty("type", out var type) || !type.ValueEquals("choice")
+            || !pick.TryGetProperty("criteria", out var options) || options.ValueKind != JsonValueKind.Object)
+            return false;
+        var offered = options.EnumerateObject().Select(option => option.Name).ToHashSet(StringComparer.Ordinal);
+        if (offered.Count < 2)
+            return false;
+        // Read as the kit reads it, so that what counts here is what a harness can act on.
+        try
+        {
+            return Decision.Parse(answered, 0).Probabilities
+                .Any(weight => offered.Contains(weight.Key) && double.IsFinite(weight.Value) && weight.Value > 0);
+        }
+        catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException)
+        {
+            return false;
+        }
+    }
+
+    async Task ServeDecision(long rid, JsonElement root)
     {
         try
         {
             if (_jev is null)
-                throw new JevException("no Jev key in this run");
+                throw new DecisionException("no Jev key in this run");
             if (!_spendDecision())
-                throw new JevException("the run's limit on Jev decisions is reached");
-            var (body, latency) = await _jev.DecideRawAsync(root.GetProperty("body"), _closing.Token).ConfigureAwait(false);
+                throw new DecisionException("the run's limit on Jev decisions is reached");
+            var asked = root.GetProperty("body");
+            var (body, latency) = await _jev.DecideRawAsync(asked, _closing.Token).ConfigureAwait(false);
+            if (Decided(asked, body))
+                Interlocked.Increment(ref _served);
             _out.Write((rid, body, latency), static (json, s) =>
             {
                 json.WriteString("type", "res");
@@ -520,21 +609,37 @@ public sealed class SandboxSession : IDisposable
         }
     }
 
+    // Not once the session is disposed: its episode may have been given up by then, and its number to another.
+    void Mark(bool begin, int n)
+    {
+        string? failed = null;
+        lock (_marking)
+        {
+            if (_marksClosed)
+                return;
+            try
+            {
+                if (begin)
+                    _recorder?.Begin(n);
+                else
+                    _recorder?.End(n);
+            }
+            catch (Exception e) when (e is IOException or InvalidOperationException)
+            {
+                failed = e.Message;
+            }
+        }
+        if (failed is not null)
+            _say($"The episode's recording failed: {failed}");
+    }
+
     void ServeEpisode(long rid, string mark, int n)
     {
-        if (n != Episode)
+        // A probe or a check plays no episode: a mark from one would make pictures to look at where none was played.
+        if (Episode <= 0 || n != Episode)
             throw new FormatException("an episode mark for another episode than the one being played");
-        try
-        {
-            if (mark == "begin")
-                _recorder?.Begin(n);
-            else if (mark == "end")
-                _recorder?.End(n);
-        }
-        catch (Exception e) when (e is IOException or InvalidOperationException)
-        {
-            _say($"The episode's recording failed: {e.Message}");
-        }
+        if (mark is "begin" or "end")
+            Mark(mark == "begin", n);
         _out.Write(rid, static (json, s) =>
         {
             json.WriteString("type", "res");
@@ -593,6 +698,18 @@ public sealed class SandboxSession : IDisposable
 
     public void Stop() => _out.Write(0, static (json, _) => json.WriteString("type", "stop"));
 
+    // The child is asked, so that an episode ends with its summary. Stopping does not rest on its answer, nor on the
+    // asking: a child that reads nothing blocks the write, so the end is set before it and the write waits elsewhere.
+    public void StopWithin(TimeSpan grace)
+    {
+        _ = Task.Delay(grace).ContinueWith(_ =>
+        {
+            if (Volatile.Read(ref _disposed) == 0 && !Volatile.Read(ref _ended))
+                Fail("it didn't stop when asked and was ended");
+        }, TaskScheduler.Default);
+        _ = Task.Run(Stop);
+    }
+
     public void Dispose()
     {
         lock (_ending)
@@ -609,5 +726,9 @@ public sealed class SandboxSession : IDisposable
         _closing.Dispose();
         foreach (var call in calls)
             call.TrySetResult(null);
+        // Last, when the child is gone and its calls are answered: a recorder still busy with a mark delays only this
+        // return, after which no mark of this session reaches it.
+        lock (_marking)
+            _marksClosed = true;
     }
 }

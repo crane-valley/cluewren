@@ -71,7 +71,7 @@ Inputs (the player's hands; the only way to act in play):
   (with the research helpers: Teleport, FightTrial, CallAny); in an episode only to set up a verification (e.g. take away
   what only gets in the way of testing). Every write is reported, an episode's apart from research's.
 - `await game.Restart(map: null)`: start the run's level over (the briefing's), or open a map (named as the engine's section
-  says). For a game that boots into a main menu, set the harness's `StartMap` to its gameplay level (from the codex),
+  says). For a game that boots into a main menu, set the harness's `StartMap` to its gameplay level (from the export),
   or click through the menu in Setup (`game.Ui()`, `game.UiAct`).
 
 ## Controllers (the Control class): async methods, `await` them inside executors
@@ -139,7 +139,7 @@ class MyHarness : Harness {
     public override Task<Obs> Observe(Game game) ...      // cheap reads each tick; "_"-keys hidden from Jev
     public override object Facts(Obs obs) ...                                   // optional: what Jev sees of the situation
     public override List<Option> Options(Obs obs) ...                           // legal options now, each with facts
-    public override Dictionary<string, Question> Questions(Obs obs) ...         // optional extra Noul/Score/Choice -> OnAnswers(answers, obs)
+    public override Dictionary<string, Question> Questions(Obs obs) ...         // optional extra YesNo/Score/Choice -> OnAnswers(answers, obs)
     public override Status Status(Obs obs) ...                                  // running / done / failed (+ note, evidence)
     public override async Task Idle(Game game, Obs obs) => await game.Tick();  // while nothing runs
 }
@@ -236,11 +236,11 @@ Harness:
   things in one frame. Keys starting with "_" are kept from Jev (paths, raw vectors).
 - `Facts`: what Jev is told about the situation (default: obs without "_" keys).
 - `Options`: the legal options now.
-- `Questions`: extra questions for Jev, asked with each decision: id to `Noul`, `Score` or `Choice`; their answers go to
-  OnAnswers (e.g. a Noul "is the player in danger" that code uses to gate options).
-  `new Noul { Instructions = "...", IfTrue = "...", IfFalse = "..." }`, `new Choice(criteria) { Instructions = "..." }`,
+- `Questions`: extra questions for Jev, asked with each decision: id to `YesNo`, `Score` or `Choice`; their answers go to
+  OnAnswers (e.g. a YesNo "is the player in danger" that code uses to gate options).
+  `new YesNo { Instructions = "...", IfTrue = "...", IfFalse = "..." }`, `new Choice(criteria) { Instructions = "..." }`,
   `new Score(levels) { Instructions = "..." }`.
-- `OnAnswers`: answers: id to a double (Noul or Score) or a `Dictionary<string, double>` of each option's probability (Choice).
+- `OnAnswers`: answers: id to a double (YesNo or Score) or a `Dictionary<string, double>` of each option's probability (Choice).
 - `Status`: how the episode stands.
 - `Idle`: what the player does while no option runs (default: nothing).
 - `Teardown`: after the episode.

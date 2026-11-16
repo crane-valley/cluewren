@@ -11,7 +11,7 @@ class, subclasses too. A Blueprint goes by its name, a C++ class by its name in 
 Reading and calling (`game.Get`, `game.Props`, `game.Call`, `game.Ret`, `game.Describe`). They reach the game's objects and
 their properties, protected and Blueprint variables included. The editor's own modules and Python, files, processes, the
 network, console commands, calls and property writes by name, bound delegates, the project's settings and anything under
-`Saved/Cluewren` answer 403 "... is refused": read the project with your own tools. `game.Describe(path)` lists its class, properties and
+`.cluewren` answer 403 "... is refused": read the project with your own tools. `game.Describe(path)` lists its class, properties and
 Blueprint-callable functions with their arguments. Static library functions go to class default objects, as
 `game.Ret("/Script/Engine.Default__GameplayStatics", "GetPlayerCharacter", new { WorldContextObject = await game.World(),
 PlayerIndex = 0 })`. A rotation is `{"Pitch","Yaw","Roll"}` in degrees. A destroyed actor can still be read until garbage
@@ -34,7 +34,7 @@ its gameplay level (from the export's maps.txt), or click through the menu in Se
 
 UI. `game.Screen()` keys texts `<UserWidget>.<TextBlock>` (UMG). `game.Ui()` lists its buttons, sliders and the like.
 
-The export. `Saved/CluewrenCodex` holds the project as text: `summary.txt`, `blueprints/` as pseudo-code (variables,
+The export. `.cluewren/export` holds the project as text: `summary.txt`, `blueprints/` as pseudo-code (variables,
 components, defaults, graphs), `input/`, `data/` (data tables, data assets, enums, structs), `assets.txt` and `maps.txt`.
 C++ is under `Source/`, settings under `Config/`. It is made in the background when a session starts, so it can arrive
 after the run does.

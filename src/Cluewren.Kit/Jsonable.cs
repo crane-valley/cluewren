@@ -66,7 +66,7 @@ public static class Jsonable
             case JsonElement element:
                 WriteElement(json, element, round);
                 break;
-            case JevRequest request:
+            case DecisionRequest request:
                 request.WriteState(json);
                 break;
             case Pose pose:

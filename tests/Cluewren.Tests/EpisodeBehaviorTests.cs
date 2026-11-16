@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 using Cluewren.Tests.Sim;
 
@@ -94,23 +94,23 @@ public class EpisodeBehaviorTests : TempTests
         public override Status Status(Obs obs) => new();
     }
 
-    sealed class FakeDecider(Func<JevRequest, IReadOnlyDictionary<string, double>> pick, TimeSpan delay = default) : IDecider
+    sealed class FakeDecider(Func<DecisionRequest, IReadOnlyDictionary<string, double>> pick, TimeSpan delay = default) : IDecider
     {
-        public readonly List<JevRequest> Requests = [];
+        public readonly List<DecisionRequest> Requests = [];
 
-        public async Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+        public async Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
         {
             lock (Requests)
                 Requests.Add(request);
             await Task.Delay(delay, ct);
-            return new JevDecision(pick(request), 100, 2, 1000);
+            return new Decision(pick(request), 100, 2, 1000);
         }
     }
 
     sealed class FailingDecider : IDecider
     {
-        public Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct) =>
-            Task.FromException<JevDecision>(new JevException("down"));
+        public Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct) =>
+            Task.FromException<Decision>(new DecisionException("down"));
     }
 
     const double Limit = 10;
@@ -416,7 +416,7 @@ public class EpisodeBehaviorTests : TempTests
 
         public TaskCompletionSource Cancelled { get; } = new();
 
-        public async Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+        public async Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
         {
             if (Interlocked.Increment(ref _calls) == 1)
                 return PickingJev.Answer(request, "hold");

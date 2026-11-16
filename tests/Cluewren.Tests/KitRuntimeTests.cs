@@ -275,15 +275,15 @@ public sealed class PickingJev(string likes) : IDecider
 
     public int Calls => Volatile.Read(ref _calls);
 
-    public static JevDecision Answer(JevRequest request, string likes)
+    public static Decision Answer(DecisionRequest request, string likes)
     {
         var names = request.Options.Select(o => o.Name).ToList();
         var best = names.Contains(likes) ? likes : names[0];
         var probabilities = names.ToDictionary(n => n, n => n == best ? 0.8 : 0.2 / Math.Max(1, names.Count - 1));
-        return new JevDecision(probabilities, 0, 0, 0);
+        return new Decision(probabilities, 0, 0, 0);
     }
 
-    public Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+    public Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
     {
         Interlocked.Increment(ref _calls);
         return Task.FromResult(Answer(request, likes));

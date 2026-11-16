@@ -175,13 +175,13 @@ sealed class ProxyLink : IGameLink
         json.WriteEndObject();
     });
 
-    public ValueTask<GameAnswer> AskJev(byte[] body, CancellationToken ct)
+    public ValueTask<GameAnswer> AskDecider(byte[] body, CancellationToken ct)
     {
-        var waiter = Rent("jev", 10, ct, out var id);
+        var waiter = Rent("decide", 10, ct, out var id);
         var version = waiter.Version;
         _out.Write((id, body), static (json, s) =>
         {
-            json.WriteString("type", "jev");
+            json.WriteString("type", "decide");
             json.WriteNumber("rid", s.id);
             json.WritePropertyName("body");
             json.WriteRawValue(s.body, skipInputValidation: true);
@@ -245,12 +245,12 @@ sealed class ProxyLink : IGameLink
     }
 }
 
-sealed class RemoteJev(ProxyLink link) : IDecider
+sealed class RemoteDecider(ProxyLink link) : IDecider
 {
-    public async Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct)
+    public async Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct)
     {
-        using var answer = await link.AskJev(request.EncodeBody(), ct).ConfigureAwait(false);
+        using var answer = await link.AskDecider(request.EncodeBody(), ct).ConfigureAwait(false);
         var latency = answer.Frame.TryGetProperty("latency", out var ticks) ? ticks.GetInt64() : 0;
-        return JevDecision.Parse(answer.Result, latency);
+        return Decision.Parse(answer.Result, latency);
     }
 }

@@ -1,12 +1,14 @@
 using Cluewren.Bridge;
 
-namespace Cluewren.Jev;
+namespace Cluewren.Decisions;
 
 public static class ApiKeys
 {
     public const string TypeSafeKey = "TYPESAFE_API_KEY";
+    public const string TypeSafeModel = "TYPESAFE_MODEL";
+    public const string TypeSafeBaseUrl = "TYPESAFE_BASE_URL";
 
-    public static string KeysFile => Path.Combine(DiscoveryFile.DefaultFolder, "keys.env");
+    public static string KeysFile => Path.Combine(Rendezvous.DefaultFolder, "keys.env");
 
     public static string? Find(string name, string? file = null)
     {

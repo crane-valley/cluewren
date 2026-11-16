@@ -1,19 +1,19 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using Cluewren.Jev;
+using Cluewren.Decisions;
 using Cluewren.Kit;
 
 namespace Cluewren.Sandbox;
 
 public sealed record HostOptions(IGameLink Link, string RunFolder)
 {
-    public IJevRelay? Jev { get; init; }
+    public IDecisionRelay? Decider { get; init; }
 
     public string? ProjectFolder { get; init; }
 
     public Action<string>? Say { get; init; }
 
-    public int MaxJevDecisions { get; init; } = 5000;
+    public int MaxDecisions { get; init; } = 5000;
 
     public long MemoryLimitBytes { get; init; } = 2L << 30;
 
@@ -47,7 +47,11 @@ public sealed class HarnessHost : IAsyncDisposable
     readonly string? _lib;
     readonly Action<string> _say;
     readonly SemaphoreSlim _one = new(1, 1);
+    // Under one lock: a stop and a call that is just getting its child must each see what the other did.
+    readonly Lock _stopping = new();
     SandboxSession? _running;
+    bool _stopAsked;
+    bool _contained;
     FileStream? _claim;
     string? _downgrade;
     // Apart from _downgrade, which sends every later child to a plain process: a missing CPU ceiling is no reason to.
@@ -62,7 +66,7 @@ public sealed class HarnessHost : IAsyncDisposable
         _link = options.Link;
         _game = new Game(_link);
         _runFolder = Path.GetFullPath(options.RunFolder);
-        Directory.CreateDirectory(_runFolder);
+        Directory.CreateDirectory(Path.Combine(_runFolder, "work"));
         _compiler = new HarnessCompiler(_runFolder);
         _harness = Path.Combine(_runFolder, "harness.cs");
         var lib = Path.Combine(Path.GetFullPath(options.ProjectFolder ?? _runFolder), "lib.cs");
@@ -78,7 +82,7 @@ public sealed class HarnessHost : IAsyncDisposable
 
     public int MostDecisions => _mostDecisions;
 
-    public int JevDecisions => Volatile.Read(ref _decisions);
+    public int DecisionsSpent => Volatile.Read(ref _decisions);
 
     public List<JsonObject> Writes { get; } = [];
 
@@ -89,7 +93,7 @@ public sealed class HarnessHost : IAsyncDisposable
     ChildSpec Spec() => new(ChildRuntime.Dotnet(), Path.Combine(ChildRuntime.Materialize(), "Cluewren.Child.dll"),
         _runFolder, _options.MemoryLimitBytes);
 
-    bool SpendDecision() => Interlocked.Increment(ref _decisions) <= _options.MaxJevDecisions;
+    bool SpendDecision() => Interlocked.Increment(ref _decisions) <= _options.MaxDecisions;
 
     async Task<SandboxSession> Attach(ISandboxProcess process, NoGameLink? preflight, CancellationToken ct)
     {
@@ -98,9 +102,9 @@ public sealed class HarnessHost : IAsyncDisposable
         {
             var log = Path.Combine(_runFolder, "sandbox.log");
             session = preflight is null
-                ? new SandboxSession(process, _link, _options.Jev, SpendDecision, _options.Recorder, _say, log)
+                ? new SandboxSession(process, _link, _options.Decider, SpendDecision, _options.Recorder, _say, log)
                 : new SandboxSession(process, preflight, null, () => false, null, _ => preflight.Status(""), log);
-            session.Init(_runFolder, _game.Level, Math.Max(0, _options.MaxJevDecisions - JevDecisions));
+            session.Init(_runFolder, Path.Combine(_runFolder, "work"), _game.Level, Math.Max(0, _options.MaxDecisions - DecisionsSpent));
             if ((await session.Call("ping", null, 60, ct).ConfigureAwait(false)).GetString() != "pong")
                 throw new SandboxException("the child didn't answer its first call");
             return session;
@@ -121,7 +125,7 @@ public sealed class HarnessHost : IAsyncDisposable
         var mode = _downgrade is not null ? SandboxMode.Process : _options.Mode;
         if (OperatingSystem.IsWindows() && mode != SandboxMode.Process)
             _claim ??= WindowsContainer.Claim(_runFolder);
-        var (process, note, uncapped) = SandboxStarter.Start(spec, mode);
+        var (process, note, uncapped) = SandboxStarter.Start(spec, mode, keepContained: _contained);
         _downgrade ??= note;
         _uncapped = uncapped;
         SandboxSession session;
@@ -129,13 +133,16 @@ public sealed class HarnessHost : IAsyncDisposable
         {
             session = await Attach(process, preflight, ct).ConfigureAwait(false);
         }
-        catch (SandboxException e) when (_options.Mode == SandboxMode.Auto && process.Kind != "process")
+        // Only while no contained child of this run has worked: after one has, what fails the next may be what harness
+        // code left behind for it, and that must not buy a child without the container.
+        catch (SandboxException e) when (_options.Mode == SandboxMode.Auto && process.Kind != "process" && !_contained)
         {
             _downgrade = SandboxStarter.Downgraded(e.Message);
             (var plain, _, _uncapped) = SandboxStarter.Start(spec, SandboxMode.Process);
             session = await Attach(plain, preflight, ct).ConfigureAwait(false);
         }
         Sandbox = session.Kind;
+        _contained |= session.Kind != "process";
         return session;
     }
 
@@ -192,9 +199,11 @@ public sealed class HarnessHost : IAsyncDisposable
                     args["harness_problem"] = "The harness doesn't load:\n" + harness.ProblemText;
             }
             var session = await StartChild(ct).ConfigureAwait(false);
-            _running = session;
+            var stopAsked = Running(session);
             try
             {
+                if (stopAsked)
+                    return new ProbeResult(WithNote(StoppedEarly), Sandbox, []);
                 var value = await session.Call("probe", args, limit + 30, ct).ConfigureAwait(false);
                 Keep(value);
                 var text = value.GetProperty("text").GetString() ?? "";
@@ -206,12 +215,13 @@ public sealed class HarnessHost : IAsyncDisposable
             }
             finally
             {
-                _running = null;
+                Idle(forget: false);
                 await Abandon(session).ConfigureAwait(false);
             }
         }
         finally
         {
+            Idle(forget: true);
             _one.Release();
         }
     }
@@ -226,9 +236,11 @@ public sealed class HarnessHost : IAsyncDisposable
             if (!compiled.Ok)
                 return WithNote("The harness doesn't load:\n" + compiled.ProblemText);
             var session = await StartChild(ct).ConfigureAwait(false);
-            _running = session;
+            var stopAsked = Running(session);
             try
             {
+                if (stopAsked)
+                    return WithNote(StoppedEarly);
                 var value = await session.Call("check", new Dictionary<string, object?>
                 {
                     ["assembly"] = compiled.Assembly, ["type"] = compiled.Type, ["seconds"] = seconds, ["restart"] = restart,
@@ -243,12 +255,13 @@ public sealed class HarnessHost : IAsyncDisposable
             }
             finally
             {
-                _running = null;
+                Idle(forget: false);
                 await Abandon(session).ConfigureAwait(false);
             }
         }
         finally
         {
+            Idle(forget: true);
             _one.Release();
         }
     }
@@ -283,11 +296,23 @@ public sealed class HarnessHost : IAsyncDisposable
                 progress = saved.RootElement.Clone();
             }
             var session = await StartChild(ct).ConfigureAwait(false);
-            _running = session;
             session.Episode = n;
-            using var stop = ct.Register(session.Stop);
+            var stopAsked = Running(session);
+            var numberTakenBack = false;
+            using var stop = ct.Register(() => session.StopWithin(StopGrace));
             try
             {
+                if (stopAsked)
+                {
+                    _episodes--;
+                    _played--;
+                    numberTakenBack = true;
+                    return NoEpisode(StoppedEarly);
+                }
+                // Play that goes on from where it is begins here, before any harness code runs; one that starts the level
+                // over begins when the session sees the restart answered.
+                if (!restart)
+                    _options.Recorder?.Begin(n);
                 var value = await session.Call("run_harness", new Dictionary<string, object?>
                 {
                     ["assembly"] = compiled.Assembly, ["type"] = compiled.Type, ["n"] = n, ["seconds"] = seconds,
@@ -302,20 +327,23 @@ public sealed class HarnessHost : IAsyncDisposable
                     {
                         _episodes--;
                         _played--;
+                        numberTakenBack = true;
                     }
                     return NoEpisode(note);
                 }
                 File.Copy(_harness, Path.Combine(_runFolder, $"harness{n}.cs"), overwrite: true);
-                _mostDecisions = value.GetProperty("most_decisions").GetInt32();
+                // The report's gate rests on this number, so it is no more than the decisions this process saw answered.
+                var decisions = Math.Min(value.GetProperty("decisions").GetInt32(), session.DecisionsServed);
+                _mostDecisions = Math.Max(_mostDecisions, decisions);
                 _pawnSeen = value.GetProperty("pawn_seen").GetBoolean();
                 _progress = value.GetProperty("progress").GetRawText();
                 _writesAfterPlay = Writes.Count;
                 var summary = value.GetProperty("summary").GetString() ?? "";
                 var state = value.GetProperty("state").GetString();
                 return new HarnessResult(
-                    WithNote(note + $"Episode {n} (trace{n}.jsonl; harness saved as harness{n}.cs)\n" + Cut(summary, MaxSummary)),
+                    WithNote(note + $"Episode {n} (work/trace{n}.jsonl; harness saved as harness{n}.cs)\n" + Cut(summary, MaxSummary)),
                     true, n, value.GetProperty("reason").GetString(), state, value.GetProperty("note").GetString(),
-                    value.GetProperty("decisions").GetInt32(), summary, Sandbox, [], value.GetProperty("stats"));
+                    decisions, summary, Sandbox, [], value.GetProperty("stats"));
             }
             catch (SandboxException e)
             {
@@ -323,12 +351,18 @@ public sealed class HarnessHost : IAsyncDisposable
             }
             finally
             {
-                _running = null;
+                // The episode's pictures reach to here, whatever end the harness marked before it stopped playing.
+                _options.Recorder?.End(n);
+                Idle(forget: false);
                 await Abandon(session).ConfigureAwait(false);
+                // After the session is gone: nothing it still had under way can mark this number again.
+                if (numberTakenBack)
+                    _options.Recorder?.Forget(n);
             }
         }
         finally
         {
+            Idle(forget: true);
             _one.Release();
         }
     }
@@ -370,7 +404,42 @@ public sealed class HarnessHost : IAsyncDisposable
         }
     }
 
-    public void EndEpisode() => _running?.Stop();
+    public static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(15);
+
+    // Kept for a call still compiling or starting its child: it has nothing running yet to stop.
+    public void EndEpisode()
+    {
+        SandboxSession? running;
+        lock (_stopping)
+        {
+            _stopAsked = true;
+            running = _running;
+        }
+        running?.StopWithin(StopGrace);
+    }
+
+    bool Running(SandboxSession session)
+    {
+        lock (_stopping)
+        {
+            _running = session;
+            return _stopAsked;
+        }
+    }
+
+    void Idle(bool forget)
+    {
+        lock (_stopping)
+        {
+            _running = null;
+            if (forget)
+                _stopAsked = false;
+        }
+    }
+
+    public void ForgetStop() => Idle(forget: true);
+
+    const string StoppedEarly = "Stopped before it began.";
 
     public async Task<string> SnapshotAsync(CancellationToken ct = default)
     {

@@ -17,7 +17,7 @@ public sealed class FakePlugin : IAsyncDisposable
         string? engine = null, long received = 0) => new()
     {
         ["type"] = "hello",
-        ["protocol"] = 1,
+        ["protocol"] = BridgeServer.Protocol,
         ["nonce"] = Convert.ToBase64String(nonce),
         ["engine"] = engine,
         ["project_dir"] = project,
@@ -47,6 +47,31 @@ public sealed class FakePlugin : IAsyncDisposable
             ["proof"] = Convert.ToBase64String(proof),
         });
         return plugin;
+    }
+
+    public sealed record Refusal(string Code, string Message, WebSocketCloseStatus? Close);
+
+    public static async Task<Refusal> RefusedAsync(string url, object hello)
+    {
+        using var socket = new ClientWebSocket();
+        await socket.ConnectAsync(new Uri(url), default);
+        await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(hello), WebSocketMessageType.Text, true, default);
+        return await RefusalAsync(socket);
+    }
+
+    public static async Task<Refusal> RefusalAsync(WebSocket socket)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var buffer = new byte[64 * 1024];
+        var result = await socket.ReceiveAsync(buffer, timeout.Token);
+        using var reply = JsonDocument.Parse(Encoding.UTF8.GetString(buffer, 0, result.Count));
+        var root = reply.RootElement;
+        Assert.True("error" == root.GetProperty("type").GetString(), root.GetRawText());
+        var (code, message) = (root.GetProperty("code").GetString()!, root.GetProperty("message").GetString()!);
+        var closed = await socket.ReceiveAsync(buffer, timeout.Token);
+        Assert.Equal(WebSocketMessageType.Close, closed.MessageType);
+        Assert.Equal((WebSocketCloseStatus.PolicyViolation, code), (closed.CloseStatus, closed.CloseStatusDescription));
+        return new Refusal(code, message, closed.CloseStatus);
     }
 
     public Task SendAsync(object frame) =>
@@ -120,8 +145,7 @@ public sealed class BridgeServerTests : IDisposable
         var brainNonce = welcome.RootElement.GetProperty("nonce").GetBytesFromBase64();
         var wrong = Handshake.Prove(Handshake.NewSecret(), Handshake.PluginRole, nonce, brainNonce);
         await Send(socket, new { type = "proof", proof = Convert.ToBase64String(wrong) });
-        using var refusal = await Receive(socket);
-        Assert.Equal("error", refusal.RootElement.GetProperty("type").GetString());
+        Assert.Equal("proof", (await FakePlugin.RefusalAsync(socket)).Code);
         using var wait = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await server.NextLinkAsync(wait.Token));
     }
@@ -135,19 +159,152 @@ public sealed class BridgeServerTests : IDisposable
         await Send(socket, FakePlugin.Hello(Secret, Handshake.NewNonce(), _project));
         using var welcome = await Receive(socket);
         await Send(socket, new { type = "proof", proof = welcome.RootElement.GetProperty("proof").GetString() });
-        using var refusal = await Receive(socket);
-        Assert.Equal("error", refusal.RootElement.GetProperty("type").GetString());
+        Assert.Equal("proof", (await FakePlugin.RefusalAsync(socket)).Code);
+    }
+
+    Dictionary<string, object?> Hello(Action<Dictionary<string, object?>> change)
+    {
+        var hello = FakePlugin.Hello(Secret, Handshake.NewNonce(), _project);
+        change(hello);
+        return hello;
+    }
+
+    static async Task AssertRefusedAsync(BridgeServer server, string code, object hello)
+    {
+        var refusal = await FakePlugin.RefusedAsync(server.Url, hello);
+        Assert.True(code == refusal.Code, $"{JsonSerializer.Serialize(hello)}: {refusal.Code} ({refusal.Message})");
+        Assert.Equal(WebSocketCloseStatus.PolicyViolation, refusal.Close);
+        using var wait = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await server.NextLinkAsync(wait.Token));
     }
 
     [Fact]
-    public async Task Hello_without_nonce_is_refused()
+    public async Task A_first_frame_that_is_no_hello_with_a_nonce_is_refused_as_hello()
+    {
+        await using var server = await StartAsync();
+        await AssertRefusedAsync(server, "hello", new { type = "hello", protocol = BridgeServer.Protocol });
+        await AssertRefusedAsync(server, "hello", Hello(hello => hello["type"] = "proof"));
+        await AssertRefusedAsync(server, "hello", Hello(hello => hello.Remove("type")));
+        await AssertRefusedAsync(server, "hello", Hello(hello => hello["nonce"] = Convert.ToBase64String(new byte[16])));
+        await AssertRefusedAsync(server, "hello", Hello(hello => hello["nonce"] = "not base64"));
+        await AssertRefusedAsync(server, "hello", new[] { "hello" });
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(null)]
+    public async Task A_hello_of_another_protocol_is_refused_as_protocol_whatever_else_it_carries(int? protocol)
+    {
+        void Change(Dictionary<string, object?> hello)
+        {
+            if (protocol is null)
+                hello.Remove("protocol");
+            else
+                hello["protocol"] = protocol;
+        }
+        await using var server = await StartAsync();
+        await AssertRefusedAsync(server, "protocol", Hello(Change));
+        await AssertRefusedAsync(server, "protocol", Hello(hello =>
+        {
+            Change(hello);
+            hello.Remove("mac");
+        }));
+    }
+
+    [Fact]
+    public async Task A_hello_without_a_valid_mac_over_its_project_is_refused_as_not_authenticated()
+    {
+        await using var server = await StartAsync();
+        await AssertRefusedAsync(server, "not_authenticated", Hello(hello => hello.Remove("mac")));
+        await AssertRefusedAsync(server, "not_authenticated", Hello(hello => hello.Remove("project_dir")));
+        await AssertRefusedAsync(server, "not_authenticated", Hello(hello => hello["mac"] = "not base64"));
+        await AssertRefusedAsync(server, "not_authenticated",
+            FakePlugin.Hello(Handshake.NewSecret(), Handshake.NewNonce(), _project));
+        await AssertRefusedAsync(server, "not_authenticated", Hello(hello => hello["project_dir"] = _project + "2"));
+    }
+
+    [Fact]
+    public async Task An_authenticated_hello_for_a_path_the_scope_does_not_admit_is_refused_as_project()
+    {
+        var other = Directory.CreateTempSubdirectory("cluewren-other").FullName;
+        try
+        {
+            await using var server = await StartAsync();
+            await AssertRefusedAsync(server, "project", FakePlugin.Hello(Secret, Handshake.NewNonce(), other));
+            await AssertRefusedAsync(server, "project", FakePlugin.Hello(Secret, Handshake.NewNonce(), "Foo"));
+            await AssertRefusedAsync(server, "project",
+                FakePlugin.Hello(Secret, Handshake.NewNonce(), Path.Combine(_project, "missing")));
+        }
+        finally
+        {
+            Directory.Delete(other, true);
+        }
+    }
+
+    [Fact]
+    public async Task A_resume_of_a_session_of_another_engine_is_refused_as_resume()
+    {
+        await using var server = await StartAsync();
+        var first = await FakePlugin.ConnectAsync(server.Url, Secret, _project, engine: "godot");
+        await server.NextLinkAsync();
+        await first.Socket.CloseOutputAsync((WebSocketCloseStatus)1012, "reload", default);
+        await ProjectBindingTests.DrainAsync(first.Socket);
+        await first.DisposeAsync();
+
+        var refusal = await FakePlugin.RefusedAsync(server.Url,
+            FakePlugin.Hello(Secret, Handshake.NewNonce(), _project, first.Session, "unity"));
+        Assert.Equal("resume", refusal.Code);
+        Assert.Equal(WebSocketCloseStatus.PolicyViolation, refusal.Close);
+        await using var second = await FakePlugin.ConnectAsync(server.Url, Secret, _project, first.Session, "godot");
+        Assert.Equal(first.Session, second.Session);
+    }
+
+    [Fact]
+    public async Task The_welcome_carries_the_brains_version_and_no_features()
     {
         await using var server = await StartAsync();
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(new Uri(server.Url), default);
-        await Send(socket, new { type = "hello", protocol = 1 });
-        using var refusal = await Receive(socket);
-        Assert.Equal("error", refusal.RootElement.GetProperty("type").GetString());
+        await Send(socket, FakePlugin.Hello(Secret, Handshake.NewNonce(), _project));
+        using var welcome = await Receive(socket);
+        var root = welcome.RootElement;
+        Assert.Equal("welcome", root.GetProperty("type").GetString());
+        Assert.NotEqual("", BridgeServer.Version);
+        Assert.Equal(BridgeServer.Version, root.GetProperty("brain_version").GetString());
+        Assert.False(root.TryGetProperty("features", out _));
+    }
+
+    [Fact]
+    public async Task Once_an_editor_is_expected_only_its_project_is_admitted_of_those_the_first_scope_took()
+    {
+        var games = Directory.CreateTempSubdirectory("cluewren-games").FullName;
+        try
+        {
+            var foo = Directory.CreateDirectory(Path.Combine(games, "Foo")).FullName;
+            var bar = Directory.CreateDirectory(Path.Combine(games, "Bar")).FullName;
+            var related = ProjectScope.Related(games);
+            await using var server = await BridgeServer.StartAsync(Secret, related);
+            await using (await FakePlugin.ConnectAsync(server.Url, Secret, bar))
+                await server.NextLinkAsync();
+
+            server.Expect(ProjectScope.ExactlyThe(related.Admit(foo)!));
+            Assert.True(server.Scope.Exact);
+            Assert.Equal(foo, server.Scope.Folder);
+            foreach (var other in new[] { bar, games })
+            {
+                var refusal = await FakePlugin.RefusedAsync(server.Url, FakePlugin.Hello(Secret, Handshake.NewNonce(), other));
+                Assert.Equal("project", refusal.Code);
+                Assert.Contains($"{foo} exactly", refusal.Message);
+            }
+            await using var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, foo);
+            Assert.True((await server.NextLinkAsync()).Project!.Holds(foo));
+            Assert.Equal([$"{bar}: another project", $"{games}: another project"], server.Refused);
+        }
+        finally
+        {
+            Directory.Delete(games, true);
+        }
     }
 
     [Fact]

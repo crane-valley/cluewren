@@ -9,19 +9,19 @@ public sealed record NowDoing(string Option, double ForSeconds);
 
 public sealed record OfferedOption(string Name, string Description, IReadOnlyDictionary<string, object?> Facts);
 
-public sealed record JevDecision(IReadOnlyDictionary<string, double> Probabilities, int InputTokens, int OutputTokens,
+public sealed record Decision(IReadOnlyDictionary<string, double> Probabilities, int InputTokens, int OutputTokens,
     long LatencyTicks)
 {
     public Dictionary<string, object?> Extra { get; init; } = [];
 
-    public static JevDecision Parse(ReadOnlySpan<byte> body, long latencyTicks)
+    public static Decision Parse(ReadOnlySpan<byte> body, long latencyTicks)
     {
         var reader = new Utf8JsonReader(body);
         using var document = JsonDocument.ParseValue(ref reader);
         return Parse(document.RootElement, latencyTicks);
     }
 
-    public static JevDecision Parse(JsonElement root, long latencyTicks)
+    public static Decision Parse(JsonElement root, long latencyTicks)
     {
         var probabilities = new Dictionary<string, double>();
         var extra = new Dictionary<string, object?>();
@@ -29,7 +29,7 @@ public sealed record JevDecision(IReadOnlyDictionary<string, double> Probabiliti
         {
             foreach (var answer in answers.EnumerateObject())
             {
-                if (answer.Name == JevRequest.PickQuestion)
+                if (answer.Name == DecisionRequest.PickQuestion)
                 {
                     ReadChoice(answer.Value, probabilities);
                     continue;
@@ -59,7 +59,7 @@ public sealed record JevDecision(IReadOnlyDictionary<string, double> Probabiliti
             if (usage.TryGetProperty("output_tokens", out var o) && o.TryGetInt32(out var outputTokens))
                 output = outputTokens;
         }
-        return new JevDecision(probabilities, input, output, latencyTicks) { Extra = extra };
+        return new Decision(probabilities, input, output, latencyTicks) { Extra = extra };
     }
 
     static void ReadChoice(JsonElement answer, Dictionary<string, double> probabilities)
@@ -74,10 +74,10 @@ public sealed record JevDecision(IReadOnlyDictionary<string, double> Probabiliti
 
 public interface IDecider
 {
-    Task<JevDecision> DecideAsync(JevRequest request, CancellationToken ct);
+    Task<Decision> DecideAsync(DecisionRequest request, CancellationToken ct);
 }
 
-public sealed record JevRequest(string Goal, string Instructions, object? Situation,
+public sealed record DecisionRequest(string Goal, string Instructions, object? Situation,
     IReadOnlyList<OfferedOption> Options, NowDoing? NowDoing, IReadOnlyList<RecentOption> Recent)
 {
     public const string PickQuestion = "pick";

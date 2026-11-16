@@ -39,7 +39,7 @@ public sealed class LatencySeries(int capacity = 1 << 16)
 public sealed record DecisionStats(int Asked, int Answered, int Errors, int Started, int Kept, int Switched, int Held,
     int Dropped, long InputTokens, long OutputTokens, LatencySummary Latency, string? LastError)
 {
-    public double JevCostUsd => InputTokens * 0.042 / 1_000_000;
+    public double CostUsd => InputTokens * 0.042 / 1_000_000;
 }
 
 public sealed record EpisodeStats(int Ticks, LatencySummary Step, LatencySummary ObserveRoundTrip,
@@ -74,7 +74,7 @@ public sealed partial class Runtime
 {
     public const int MaxInFlight = 2;
     public const double MinAskGap = 0.08;
-    public const double JevTimeout = 1.5;
+    public const double DecisionTimeout = 1.5;
     public const int MaxConsecutiveErrors = 25;
     public const double ObsTraceEvery = 1.0;
     public const int StepSamples = 4000;
@@ -99,7 +99,7 @@ public sealed partial class Runtime
 
     sealed record Looked(Obs Obs, Status Status, List<Option> Options, double Begun);
 
-    sealed record Pending(Task<JevDecision> Task, double Asked, List<string> Names, double T, JevRequest Request);
+    sealed record Pending(Task<Decision> Task, double Asked, List<string> Names, double T, DecisionRequest Request);
 
     sealed record Ending(Option Option, Obs Before, double T0, bool Ok, string Why, Dictionary<string, object?>? Data,
         double At, double TEnd);
@@ -247,7 +247,7 @@ public sealed partial class Runtime
         {
             Error("questions", e);
         }
-        var request = new JevRequest(_h.Goal, _h.Instructions ?? JevRequest.DefaultInstructions, _h.Facts(obs),
+        var request = new DecisionRequest(_h.Goal, _h.Instructions ?? DecisionRequest.DefaultInstructions, _h.Facts(obs),
             opts.Select(o => new OfferedOption(o.Name, o.Description, o.Facts)).ToList(), doing, [.. _recent])
         {
             Plan = _plan.Count > 0 ? PlanFacts() : null,
@@ -262,15 +262,15 @@ public sealed partial class Runtime
         _lastAsk = asked;
     }
 
-    List<(Pending Item, JevDecision Decision)> Answers()
+    List<(Pending Item, Decision Decision)> Answers()
     {
-        List<(Pending, JevDecision)>? done = null;
+        List<(Pending, Decision)>? done = null;
         for (var i = 0; i < _pending.Count;)
         {
             var item = _pending[i];
             if (!item.Task.IsCompleted)
             {
-                if (_game.Clock.Monotonic() - item.Asked > JevTimeout * 2.5)
+                if (_game.Clock.Monotonic() - item.Asked > DecisionTimeout * 2.5)
                 {
                     _trace.Log("jev_error", F(("error", "no answer in time"), ("t", _game.T)));
                     _pending.RemoveAt(i);
@@ -495,7 +495,7 @@ public sealed partial class Runtime
     }
 
     public async ValueTask Apply(IReadOnlyDictionary<string, double> probabilities, Dictionary<string, object?> extra,
-        double latency, List<Option> optsNow, Obs obs, double askedT, JevRequest? request = null,
+        double latency, List<Option> optsNow, Obs obs, double askedT, DecisionRequest? request = null,
         CancellationToken ct = default)
     {
         _decisions++;

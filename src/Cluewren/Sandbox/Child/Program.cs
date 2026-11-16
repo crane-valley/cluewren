@@ -68,9 +68,9 @@ static class Program
             var init = document.RootElement;
             var features = init.GetProperty("features").EnumerateArray().Select(f => f.GetString() ?? "").ToArray();
             link = new ProxyLink(output, features, init.GetProperty("engine").GetString() ?? "unity");
-            runner = new Runner(link, output, router, init.GetProperty("run_folder").GetString()!,
+            runner = new Runner(link, output, router, init.GetProperty("run_folder").GetString()!, init.GetProperty("work_folder").GetString()!,
                 init.TryGetProperty("level", out var level) ? level.GetString() : null,
-                init.GetProperty("jev").GetBoolean(), init.GetProperty("max_decisions").GetInt32());
+                init.GetProperty("decider").GetBoolean(), init.GetProperty("max_decisions").GetInt32());
         }
         while (reader.Next() is { } line)
         {

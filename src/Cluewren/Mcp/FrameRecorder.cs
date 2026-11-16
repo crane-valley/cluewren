@@ -100,10 +100,17 @@ public sealed class FrameRecorder : IEpisodeRecorder, IAsyncDisposable
         }
     }
 
+    // Once for an episode: a harness that marked its beginning again would move what was filmed before out of reach.
     public void Begin(int episode)
     {
         lock (_gate)
-            _spans[episode] = (Now, null);
+            _spans.TryAdd(episode, (Now, null));
+    }
+
+    public void Forget(int episode)
+    {
+        lock (_gate)
+            _spans.Remove(episode);
     }
 
     public void End(int episode)
