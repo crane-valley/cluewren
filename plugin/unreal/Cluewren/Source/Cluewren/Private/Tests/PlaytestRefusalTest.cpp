@@ -3,7 +3,9 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "HAL/FileManager.h"
 #include "PlaytestJson.h"
+#include "PlaytestLevels.h"
 #include "PlaytestRefusal.h"
 #include "Misc/EngineVersionComparison.h"
 #include "Misc/Paths.h"
@@ -16,6 +18,10 @@
 #include "UObject/TextProperty.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UnrealType.h"
+
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include "Windows/WindowsHWrapper.h"
+#include "Windows/HideWindowsPlatformTypes.h"
 
 namespace
 {
@@ -208,20 +214,21 @@ bool FCluewrenRcRefusalTest::RunTest(const FString& Parameters)
 		Allows(TEXT("C8 GeneralProjectSettings read"), General->GetDefaultObject(), TEXT("ProjectName"), EOp::Read);
 	}
 
-	const FString Data = FPaths::ProjectSavedDir() / TEXT("Cluewren/runs/x/evil.umap");
-	for (const FString& Path : {Data, FPaths::ConvertRelativePathToFull(Data), FString(TEXT("Saved/Cluewren/x.uasset")),
-		FString(TEXT("saved\\CLUEWREN\\x.uasset")), FString(TEXT("/Game/../../Saved/Cluewren/x")), FString(TEXT("SAVED~1/Cluewren/x")),
-		FString(TEXT("/Temp/Cluewren/runs/x/evil"))})
+	const FString Data = FPaths::ProjectDir() / TEXT(".cluewren/runs/x/evil.umap");
+	for (const FString& Path : {Data, FPaths::ConvertRelativePathToFull(Data), FString(TEXT(".cluewren")),
+		FString(TEXT(".cluewren/export/summary.txt")), FString(TEXT(".CLUEWREN\\memory\\lib.cs")), FString(TEXT("Content/../.cluewren/x")),
+		FString(TEXT("/Game/../.cluewren/x"))})
 	{
 		TestTrue(TEXT("C9 data path ") + Path, DataPath(Path));
 	}
 	for (const TCHAR* Path : {TEXT("/Game/Maps/Level"), TEXT("/Script/Engine.Default__GameplayStatics"), TEXT("Saved/Logs/x.log"),
+		TEXT("Saved/Cluewren/x.uasset"), TEXT("/Temp/Cluewren/runs/x/evil"), TEXT(".cluewrenx/y"),
 		TEXT("/Game/Maps/Level.Level:PersistentLevel.BP_Door_C_3")})
 	{
 		TestFalse(FString(TEXT("C9 not data ")) + Path, DataPath(Path));
 	}
-	TestNull(TEXT("C9 ResolveObject refuses Saved/Cluewren"), PlaytestJson::ResolveObject(Data));
-	TSharedPtr<FJsonValue> Deep = MakeShared<FJsonValueString>(TEXT("Saved/Cluewren/x.uasset"));
+	TestNull(TEXT("C9 ResolveObject refuses .cluewren"), PlaytestJson::ResolveObject(Data));
+	TSharedPtr<FJsonValue> Deep = MakeShared<FJsonValueString>(TEXT(".cluewren/x.uasset"));
 	TSharedPtr<FJsonValue> Flat = MakeShared<FJsonValueNumber>(1);
 	for (int32 i = 0; i < 20; ++i)
 	{
@@ -238,8 +245,8 @@ bool FCluewrenRcRefusalTest::RunTest(const FString& Parameters)
 		if (FStrProperty* Text = CastField<FStrProperty>(Print->FindPropertyByName(TEXT("InString"))))
 		{
 			void* Value = Text->ContainerPtrToValuePtr<void>(Scope.GetStructMemory());
-			Text->SetPropertyValue(Value, TEXT("Saved/Cluewren/runs/x/evil.umap"));
-			TestFalse(TEXT("C9 a string into Saved/Cluewren"), RefusedValue(Text, Value).IsEmpty());
+			Text->SetPropertyValue(Value, TEXT(".cluewren/runs/x/evil.umap"));
+			TestFalse(TEXT("C9 a string into .cluewren"), RefusedValue(Text, Value).IsEmpty());
 			Text->SetPropertyValue(Value, TEXT("hello/world"));
 			TestTrue(TEXT("C9 another string stays"), RefusedValue(Text, Value).IsEmpty());
 		}
@@ -263,6 +270,104 @@ bool FCluewrenRcRefusalTest::RunTest(const FString& Parameters)
 	Allows(TEXT("the Actor class as an argument"), Class(TEXT("/Script/Engine.Actor")), nullptr, EOp::Argument);
 	Allows(TEXT("an instance's property write"), NewObject<UObject>(GetTransientPackage(), Class(TEXT("/Script/Engine.StaticMesh"))),
 		TEXT("LightMapResolution"), EOp::Write);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCluewrenRcDataFolderTest, "Cluewren.Rc.DataFolder",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCluewrenRcDataFolderTest::RunTest(const FString& Parameters)
+{
+	using PlaytestRefusal::DataPath;
+	for (const TCHAR* Path : {TEXT(".cluewren/x"), TEXT("a/.CLUEWREN/x"), TEXT("C:\\other\\.cluewren\\x"),
+		TEXT("\\\\server\\share\\.cluewren\\x"), TEXT(".cluewren."), TEXT(".cluewren "), TEXT(".cluewren::$INDEX_ALLOCATION"),
+		TEXT(".cluewren:x"), TEXT("file:///C:/p/%2Ecluewren/x"), TEXT("Q:/nowhere/.cluewren./memory/lib.cs"), TEXT("C:.cluewren\\x"),
+		TEXT("c:.CLUEWREN"), TEXT(".cluewren"), TEXT("%2Ecluewren%2Fmemory%2Flib.cs"), TEXT("CLUEWR~1"), TEXT("C:/p/cl12ab~1/x"),
+		TEXT("CLUEW~12/x"), TEXT("CLUEWR~1./x"), TEXT("cluewr~3:x")})
+	{
+		TestTrue(FString(TEXT("C9 data folder: ")) + Path, DataPath(Path));
+	}
+	for (const TCHAR* Path : {TEXT(".cluewrens/x"), TEXT("x.cluewren/y"), TEXT("my.cluewren"), TEXT("a/cluewren/b"),
+		TEXT("C:/PROGRA~1/Game/Content/x.uasset"), TEXT("Assets/NUL"), TEXT("file:///C:/p/%2Ecluewrens/x"), TEXT("C:.cluewrens\\x"),
+		TEXT("PROGRA~1"), TEXT("CLUEWRE~1/x"), TEXT("CLUEWREN~1/x"), TEXT("CLUEWR~1.txt"), TEXT("CLUEWR~/x"), TEXT("CLUEWR~1a")})
+	{
+		TestFalse(FString(TEXT("C9 not the data folder: ")) + Path, DataPath(Path));
+	}
+	TestFalse(TEXT("C9 the folder alone as an rc value"), PlaytestRefusal::RefusedJson(MakeShared<FJsonValueString>(TEXT(".cluewren"))).IsEmpty());
+	TestFalse(TEXT("C9 the folder percent-encoded as an rc value"),
+		PlaytestRefusal::RefusedJson(MakeShared<FJsonValueString>(TEXT("%2Ecluewren%2Fmemory%2Flib.cs"))).IsEmpty());
+	TestTrue(TEXT("C9 another word as an rc value"), PlaytestRefusal::RefusedJson(MakeShared<FJsonValueString>(TEXT("cluewren"))).IsEmpty());
+
+	IFileManager& Files = IFileManager::Get();
+	FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	FPaths::NormalizeDirectoryName(Root);
+	const FString Data = Root / TEXT(".cluewren");
+	const bool bMade = !Files.DirectoryExists(*Data);
+	Files.MakeDirectory(*Data, true);
+	FString Folder = Data;
+	FPaths::MakePlatformFilename(Folder);
+	TCHAR Short[4096];
+	const DWORD Length = GetShortPathNameW(*Folder, Short, (DWORD)UE_ARRAY_COUNT(Short));
+	const FString Name = Length > 0 && Length < UE_ARRAY_COUNT(Short) ? FPaths::GetCleanFilename(FString((int32)Length, Short)) : FString();
+	if (!Name.IsEmpty() && !Name.Equals(TEXT(".cluewren"), ESearchCase::IgnoreCase))
+	{
+		AddInfo(FString::Printf(TEXT("the folder's short name here: %s"), *Name));
+		TestTrue(TEXT("C9 the folder's short name"), DataPath(Name / TEXT("memory/lib.cs")));
+		TestTrue(TEXT("C9 the folder's short name, under any root"), DataPath(FString(TEXT("D:/elsewhere/")) + Name.ToLower() + TEXT("/x")));
+	}
+	else
+	{
+		AddInfo(FString::Printf(TEXT("%s has no 8.3 short name: that case is not tried"), *Data));
+	}
+	if (bMade)
+	{
+		Files.DeleteDirectory(*Data);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCluewrenRcSessionMapTest, "Cluewren.Rc.SessionMap",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCluewrenRcSessionMapTest::RunTest(const FString& Parameters)
+{
+	for (const TCHAR* Map : {TEXT("C:/Maps/Arena"), TEXT("C:Arena"), TEXT("C:\\Maps\\Arena.umap"), TEXT("\\\\server\\share\\Arena"),
+		TEXT("//server/share/Arena"), TEXT("\\\\.\\COM1"), TEXT("\\\\?\\C:\\Maps\\Arena"), TEXT("/C:/Maps/Arena"), TEXT("file:///C:/Maps/Arena"),
+		TEXT("127.0.0.1:7777"), TEXT("Arena?listen"), TEXT("/Game/Maps/Arena?listen"), TEXT("Arena#Portal"), TEXT("example.com"),
+		TEXT("10.0.0.1"), TEXT("[arena-server]"), TEXT("[::1]"), TEXT("\\Windows\\outside.umap"), TEXT("Arena;x"), TEXT("Arena Lobby"),
+		TEXT("Arena%20Lobby"), TEXT("Arena.Arena"), TEXT("Arena|x"), TEXT("/Game/Maps/"), TEXT("/Game//Maps/Arena"), TEXT("/Game/.Maps"),
+		TEXT("/Game/Maps/Arena.Arena.Arena"), TEXT("/Game/Ma.ps/Arena"), TEXT("Arena.demo"), TEXT("Arena.sav"), TEXT("Arena'"),
+		TEXT("Arena\"x"), TEXT("Arena\tx"), TEXT("/"), TEXT("")})
+	{
+		TestFalse(FString(TEXT("not a level's name: ")) + Map, PlaytestLevels::Shaped(Map));
+		FString Package, Error;
+		TestFalse(FString(TEXT("no level: ")) + Map, PlaytestLevels::Resolve(Map, Package, Error));
+		TestTrue(FString(TEXT("no level, in so many words: ")) + Map, Error.StartsWith(TEXT("No level named ")));
+		TestTrue(FString(TEXT("nothing to open: ")) + Map, Package.IsEmpty());
+	}
+	for (const TCHAR* Map : {TEXT("/Game/Maps/Arena"), TEXT("/Game/Maps/Arena.Arena"), TEXT("/Game/Maps/Arena.umap"), TEXT("Arena"),
+		TEXT("Arena.umap"), TEXT("ARENA.UMAP"), TEXT(" Lobby "), TEXT("Arena_2-b"), TEXT("Maps/Arena")})
+	{
+		TestTrue(FString(TEXT("a level's name: ")) + Map, PlaytestLevels::Shaped(Map));
+	}
+	// Shaped, but no level of the project's: matched against the project's levels, never looked for elsewhere.
+	for (const TCHAR* Map : {TEXT("/Windows/outside"), TEXT("/Engine/Maps/Entry"), TEXT("localhost"), TEXT("Maps/Arena")})
+	{
+		FString Package, Error;
+		TestFalse(FString(TEXT("no such level: ")) + Map, PlaytestLevels::Resolve(Map, Package, Error));
+		TestTrue(FString(TEXT("nothing to open: ")) + Map, Package.IsEmpty());
+	}
+	const TArray<FString> Levels = PlaytestLevels::List();
+	if (Levels.Num() > 0)
+	{
+		FString Package, Error;
+		TestTrue(TEXT("a level of the project's"), PlaytestLevels::Resolve(Levels[0].ToLower(), Package, Error));
+		TestEqual(TEXT("what is opened is the project's own name for it"), Package, Levels[0]);
+	}
+	else
+	{
+		AddInfo(TEXT("the project has no level: resolving one is not tried"));
+	}
 	return true;
 }
 

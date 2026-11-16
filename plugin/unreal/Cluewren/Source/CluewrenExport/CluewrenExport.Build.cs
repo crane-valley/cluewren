@@ -1,11 +1,11 @@
 // Modified by Crane Valley: renamed for Cluewren.
 using UnrealBuildTool;
 
-// The CluewrenCodex commandlet lives in its own editor module loaded at the Default phase: commandlets are looked up
+// The CluewrenExport commandlet lives in its own editor module loaded at the Default phase: commandlets are looked up
 // before PostEngineInit modules (CluewrenEditor) load.
-public class CluewrenCodex : ModuleRules
+public class CluewrenExport : ModuleRules
 {
-	public CluewrenCodex(ReadOnlyTargetRules Target) : base(Target)
+	public CluewrenExport(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 

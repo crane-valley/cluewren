@@ -1,13 +1,13 @@
 // Modified by Crane Valley: renamed for Cluewren.
-// The CluewrenCodex commandlet's maps (maps.txt): one line per placed actor, with where it is and what was set on it.
+// The CluewrenExport commandlet's maps (maps.txt): one line per placed actor, with where it is and what was set on it.
 
-#include "CluewrenCodexInternal.h"
+#include "CluewrenExportInternal.h"
 
 #include "Components/SceneComponent.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "GameFramework/Actor.h"
 
-namespace CluewrenCodex
+namespace CluewrenExport
 {
 	FString Vec(const FVector& V)
 	{

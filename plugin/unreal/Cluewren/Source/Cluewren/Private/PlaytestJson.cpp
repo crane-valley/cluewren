@@ -1,5 +1,5 @@
-// Modified by Crane Valley: renamed for Cluewren; a name compared per property is an FName; nothing under Saved/Cluewren
-// is resolved.
+// Modified by Crane Valley: renamed for Cluewren; a name compared per property is an FName; nothing under .cluewren is
+// resolved.
 #include "PlaytestJson.h"
 
 #include "PlaytestRefusal.h"
@@ -586,7 +586,7 @@ bool JsonToProperty(const FProperty* Property, void* ValuePtr, const TSharedPtr<
 			{
 				OutError = FString::Printf(TEXT("%s: %s has no fields to set from here%s"), *Property->GetName(),
 					*Struct->Struct->GetName(), Struct->Struct->GetFName() == TEXT("InputActionValue")
-						? TEXT(": press or hold the action itself (game.press / game.hold with its path), or call InjectInputVectorForAction (a plain vector)")
+						? TEXT(": press or hold the action itself (game.Press / game.Hold with its path), or call InjectInputVectorForAction (a plain vector)")
 						: TEXT(""));
 				return false;
 			}

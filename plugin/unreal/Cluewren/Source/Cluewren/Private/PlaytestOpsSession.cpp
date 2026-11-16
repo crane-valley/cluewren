@@ -1,4 +1,4 @@
-// Modified by Crane Valley: context says the engine and the project's folder; a restart never opens Saved/Cluewren.
+// Modified by Crane Valley: context says the engine and the project's folder; a restart never opens .cluewren.
 // `context`, `session`, `pause`, `timestep` and `ping`: what is running and the game's controls,
 // starting, stopping and restarting play, pausing, a fixed time step, and the clocks.
 
@@ -278,18 +278,36 @@ namespace
 			Bridge.Respond(Id, Obj(Status));
 			return;
 		}
-		if (PlaytestRefusal::DataPath(StringField(Args, TEXT("map"))))
+		FString Map = StringField(Args, TEXT("map"));
+		if (Map.IsEmpty() && Bridge.SessionHandler)
 		{
-			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under Saved/Cluewren is opened as a level"),
-				*StringField(Args, TEXT("map"))), 403);
+			Map = Bridge.GetStartMap();  // (a game opened it when it started: UPlaytestSubsystem::NoteLaunchMap)
+		}
+		if (PlaytestRefusal::DataPath(Map))
+		{
+			Bridge.RespondError(Id, FString::Printf(TEXT("%s is refused: nothing under .cluewren is opened as a level"), *Map), 403);
 			return;
+		}
+		if (!Map.IsEmpty() && (Action == TEXT("start") || Action == TEXT("restart")))
+		{
+			// What is played is the project's own name for a level of its, never the string as given: the engine opens a
+			// level by URL, and a host, a file or options in it would be reached before any answer.
+			FString Package, Error;
+			if (!PlaytestLevels::Resolve(Map, Package, Error))
+			{
+				Bridge.RespondError(Id, Error, 404);
+				return;
+			}
+			Map = Package;
 		}
 		if (Bridge.SessionHandler)
 		{
 			TWeakObjectPtr<UPlaytestSubsystem> Weak(&Bridge);
-			Bridge.SessionHandler(Action, StringField(Args, TEXT("map")), [Weak, Id](bool bRunning, const FString& Error)
+			const int32 Serial = Bridge.GetSessionSerial();
+			Bridge.SessionHandler(Action, Map, [Weak, Id, Serial](bool bRunning, const FString& Error)
 			{
-				if (UPlaytestSubsystem* B = Weak.Get())
+				UPlaytestSubsystem* B = Weak.Get();
+				if (B && B->GetSessionSerial() == Serial)
 				{
 					if (Error.IsEmpty())
 					{
@@ -309,13 +327,6 @@ namespace
 		if (Action != TEXT("restart") || !World)
 		{
 			Bridge.Respond(Id, Running(World != nullptr));
-			return;
-		}
-		FString Map = StringField(Args, TEXT("map"));
-		FString Package, Error;
-		if (!Map.IsEmpty() && Map.StartsWith(TEXT("/")) && !PlaytestLevels::Resolve(Map, Package, Error))
-		{
-			Bridge.RespondError(Id, Error, 404);
 			return;
 		}
 		if (Map.IsEmpty())

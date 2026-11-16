@@ -8,4 +8,4 @@ See the LICENSE file in this directory.
 Modified source and config files state so on their first line. Cluewren.uplugin was also
 modified; JSON has no comments, so this notice states it for it. Modules, classes and files were
 renamed from Autopilot's: AutopilotPlaytest to Cluewren, AutopilotPlaytestEditor to
-CluewrenEditor, and AutopilotCodex to CluewrenCodex.
+CluewrenEditor, and AutopilotCodex to CluewrenExport.

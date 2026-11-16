@@ -36,11 +36,9 @@ void FPlaytestLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosit
 	{
 		return;
 	}
-	static const FName PlaytestCategory(TEXT("LogPlaytest"));
-	static const FName WebSockets(TEXT("LogWebSockets"));
-	static const FName Http(TEXT("LogHttp"));
+	static const FName Own(TEXT("LogCluewren"));
 	static const FName Script(TEXT("LogScript"));
-	if (Category == PlaytestCategory || Category == WebSockets || Category == Http)
+	if (Category == Own)
 	{
 		return;
 	}

@@ -1,4 +1,4 @@
-// Modified by Crane Valley: the brain is found through brain.json and must prove itself; the account, sign-in, Aura,
+// Modified by Crane Valley: the brain is found through its invite and must prove itself; the account, sign-in, Aura,
 // agent service, run request, usage, memory, inspection, steering and settings plumbing is removed.
 #pragma once
 
@@ -14,15 +14,20 @@ class FPlaytestLogCapture;
 class FPlaytestMedia;
 class FPlaytestSocket;
 
+namespace PlaytestBrain
+{
+	struct FAddress;
+}
+
 /** Starts, stops or restarts the play session (PIE in the editor), in the level Map when given (a package name or a
  *  level's name: PlaytestLevels::Resolve; empty: the level open in the editor). Calls Done(running) once finished. */
 using FPlaytestSessionHandler = TFunction<void(const FString& /*Action*/, const FString& /*Map*/, TFunction<void(bool /*bRunning*/, const FString& /*Error*/)> /*Done*/)>;
 
 /**
- * The bridge between the game and the brain: finds it through brain.json, connects out over a WebSocket, proves itself,
- * answers the brain's requests on the game thread, and streams events (engine errors, in-engine detector findings,
- * heartbeats). In the editor it connects by itself once brain.json appears; a game only with -PlaytestConnect. Never built
- * into Shipping.
+ * The bridge between the game and the brain: advertises this process, connects out over a WebSocket to the brain that
+ * invites it, proves itself, answers the brain's requests on the game thread, and streams events (engine errors,
+ * in-engine detector findings, heartbeats). An attended editor advertises itself by itself; a game only with
+ * -CluewrenConnect. Never built into Shipping.
  */
 UCLASS()
 class CLUEWREN_API UPlaytestSubsystem : public UEngineSubsystem
@@ -30,8 +35,6 @@ class CLUEWREN_API UPlaytestSubsystem : public UEngineSubsystem
 	GENERATED_BODY()
 
 public:
-	static constexpr int32 ProtocolVersion = 1;
-
 	static UPlaytestSubsystem* Get();
 
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
@@ -39,6 +42,8 @@ public:
 
 	/** The brain has proved itself on this connection. */
 	bool IsConnected() const { return bConnected; }
+
+	bool IsRunActive() const { return bConnected && bRunActive; }
 
 	/** The world being played: the one with the player in it, the PIE world in the editor (the first client's when the
 	 *  editor plays as clients of a dedicated server), the game world otherwise. Never a dedicated server's world: it
@@ -65,6 +70,9 @@ public:
 	 *  moves the server to the next map of its rotation). */
 	const FString& GetLaunchMap() const { return LaunchMap; }
 
+	/** -CluewrenMap: the level a play session starts in when the brain names none, "" without the flag. */
+	const FString& GetStartMap() const { return StartMap; }
+
 	/** Queue an event for the brain (sent once per tick, batched). */
 	void QueueEvent(const TSharedRef<FJsonObject>& Event);
 
@@ -85,6 +93,26 @@ public:
 	void Respond(int64 Id, const TSharedPtr<FJsonValue>& Result);
 	void RespondError(int64 Id, const FString& Error, int32 Status = 400);
 	void AddPending(FPending&& Pending);
+
+	struct FHeld
+	{
+		TSharedPtr<FJsonObject> Json;
+		TArray<uint8> Bytes;
+	};
+
+	/** What is kept of a session across a dropped connection, for the next hello to ask to resume it. */
+	struct FSession
+	{
+		FString Id;
+		FString Asked;       // the session the last hello asked to resume
+		int64 Received = 0;  // the newest request handled: on a resume, the brain sends again what came after it
+		TArray<FHeld> Held;
+
+		/** True when the welcome's session is the one asked for. Any other is a new session: nothing of the one before
+		 *  is kept for it. */
+		bool Welcomed(const FString& Session);
+	};
+
 	/** Send a recording's frame, already written as JSON text; dropped while disconnected. */
 	void SendFrame(TArray<uint8>&& Text);
 	/** Send a response already written as JSON text; held while disconnected, as Respond's are. */
@@ -98,20 +126,16 @@ public:
 	FPlaytestDetectors& GetDetectors() { return *Detectors; }
 
 private:
-	struct FHeld
-	{
-		TSharedPtr<FJsonObject> Json;
-		TArray<uint8> Bytes;
-	};
-
 	bool Tick(float DeltaTime);
 	void TickConnection(double Now);
 	void TryConnect(double Now);
+	void Prepare();
 	void ConnectionLost(double Now, const FString& Why);
 	void HandleMessage(const TSharedPtr<FJsonObject>& Message);
 	void HandleWelcome(const TSharedPtr<FJsonObject>& Message);
 	void HandleRequest(const TSharedPtr<FJsonObject>& Message);
 	void Refuse(const FString& Why);
+	void ShowRun();
 	void SendHello();
 	void Send(const TSharedRef<FJsonObject>& Message);
 	void SendOrHold(const TSharedRef<FJsonObject>& Message);
@@ -123,22 +147,23 @@ private:
 	TSharedPtr<FPlaytestSocket> Socket;
 	FTSTicker::FDelegateHandle TickHandle;
 
-	bool bOnCommandLine = false;  // -PlaytestConnect
+	bool bOnCommandLine = false;  // -CluewrenConnect
 	bool bConnected = false;
 	bool bHelloSent = false;
+	bool bRunActive = false;
 	double NextAttempt = 0;
 	double HandshakeDeadline = 0;
-	double ConnectDeadline = 0;  // -PlaytestConnectTimeout: a game with no welcome by then exits with 1
+	double ConnectDeadline = 0;  // -CluewrenConnectTimeout: a game with no welcome by then exits with 1
 	FString LastStatus;
-	FDateTime RefusedFile;  // the brain.json that failed its proof: nothing connects until it is replaced
 
-	TArray<uint8> Secret;
+	FString Rendezvous;    // PlaytestBrain::Folder(), once this process advertises itself there
+	FString InvitePath;
+	uint64 InviteSeen = 0;  // PlaytestBrain::InviteWritten of the invite last read: it is read again only once that changes
+	TSharedPtr<PlaytestBrain::FAddress> Invited;  // the brain of the invite last read; none once it was refused or has ended
+
 	TArray<uint8> PluginNonce;
-	FString SessionId;     // kept across a dropped connection: the next hello asks to resume it
-	FString AskedResume;   // the session the last hello asked to resume
-	int64 LastRequest = 0;  // the newest request handled: on a resume, the brain sends again what came after it
+	FSession Session;
 	int32 SessionSerial = 0;
-	TArray<FHeld> HeldResponses;
 
 	double LastHeartbeat = 0;
 	double LastTickReal = 0;
@@ -149,6 +174,7 @@ private:
 
 	TWeakObjectPtr<UWorld> LastWorld;
 	FString LaunchMap;  // see GetLaunchMap
+	FString StartMap;   // see GetStartMap
 
 	TSharedPtr<FPlaytestDetectors> Detectors;
 	TSharedPtr<FPlaytestLogCapture> LogCapture;

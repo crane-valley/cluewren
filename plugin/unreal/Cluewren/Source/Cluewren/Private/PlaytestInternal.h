@@ -12,7 +12,7 @@ class AActor;
 class UClass;
 class UObject;
 
-DECLARE_LOG_CATEGORY_EXTERN(LogPlaytest, Log, All);
+DECLARE_LOG_CATEGORY_EXTERN(LogCluewren, Log, All);
 
 namespace PlaytestOps
 {
@@ -27,7 +27,7 @@ namespace PlaytestOps
 }
 
 #if WITH_EDITOR
-/** The Blueprint export the agent reads (Saved/CluewrenCodex): kept fresh by the commandlet, in a child process of
+/** The Blueprint export the agent reads (.cluewren/export in the project): kept fresh by the commandlet, in a child process of
  *  its own because it loads every asset. Game thread. */
 namespace PlaytestExport
 {

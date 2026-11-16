@@ -44,17 +44,6 @@ namespace
 		return Name;
 	}
 
-	/** Whether the package holds a level (a World asset). */
-	bool IsLevel(const FString& Package)
-	{
-		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-		TArray<FAssetData> Assets;
-		Registry.GetAssetsByPackageName(FName(*Package), Assets);
-		return Assets.ContainsByPredicate([](const FAssetData& Asset)
-		{
-			return Asset.AssetClassPath == UWorld::StaticClass()->GetClassPathName();
-		});
-	}
 }
 
 TArray<FString> List()
@@ -80,26 +69,64 @@ TArray<FString> List()
 	return Out;
 }
 
+bool Shaped(const FString& Name)
+{
+	// What the engine opens a level by is a URL: '[' or a dot makes it a host, ':' a protocol or port, '?' '#' ';' options,
+	// a name not starting with '/' a file to look for. Only package and level names' own characters are let through.
+	const FString Text = Name.TrimStartAndEnd();
+	int32 Slash = INDEX_NONE;
+	int32 Dot = INDEX_NONE;
+	for (int32 i = 0; i < Text.Len(); ++i)
+	{
+		const TCHAR C = Text[i];
+		if (C == TEXT('/'))
+		{
+			if (i + 1 == Text.Len() || Text[i + 1] == TEXT('/') || Dot != INDEX_NONE)
+			{
+				return false;
+			}
+			Slash = i;
+		}
+		else if (C == TEXT('.'))
+		{
+			if (Dot != INDEX_NONE || i == Slash + 1 || i + 1 == Text.Len())
+			{
+				return false;
+			}
+			Dot = i;
+		}
+		else if (!FChar::IsAlnum(C) && C != TEXT('_') && C != TEXT('-'))
+		{
+			return false;
+		}
+	}
+	// One dot: a package's .Object part, or .umap; a level's own name takes only .umap.
+	return !Text.IsEmpty() && (Dot == INDEX_NONE || Text.StartsWith(TEXT("/")) || Text.Mid(Dot).Equals(TEXT(".umap"), ESearchCase::IgnoreCase));
+}
+
 bool Resolve(const FString& Name, FString& OutPackage, FString& OutError)
 {
-	const FString Package = PackageName(Name);
-	if (Package.IsEmpty())
+	if (!Shaped(Name))
 	{
-		OutError = TEXT("No level named");
+		OutError = FString::Printf(TEXT("No level named %s in the project"), *Name.TrimStartAndEnd());
 		return false;
 	}
+	const FString Package = PackageName(Name);
+	const TArray<FString> Levels = List();
 	if (Package.StartsWith(TEXT("/")))
 	{
-		if (!FPackageName::DoesPackageExist(Package) || !IsLevel(Package))  // (a Blueprint's path is no level)
+		// Matched against the project's levels, not looked for on disk: what is opened is the registry's own name.
+		const FString* Level = Levels.FindByPredicate([&Package](const FString& Each) { return Each.Equals(Package, ESearchCase::IgnoreCase); });
+		if (!Level)
 		{
 			OutError = FString::Printf(TEXT("No level %s in the project"), *Package);
 			return false;
 		}
-		OutPackage = Package;
+		OutPackage = *Level;
 		return true;
 	}
 	TArray<FString> Found;
-	for (const FString& Level : List())
+	for (const FString& Level : Levels)
 	{
 		if (FPackageName::GetShortName(Level).Equals(Package, ESearchCase::IgnoreCase))
 		{
