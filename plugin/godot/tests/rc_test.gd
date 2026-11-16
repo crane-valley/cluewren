@@ -1,4 +1,5 @@
-## rc's refusals by category (docs/adr/0014) and which brain an editor takes (tests/binding.gd), on this Godot:
+## rc's refusals by category (docs/adr/0014), the export, and how an editor meets the brain (tests/binding.gd), on this
+## Godot:
 ## godot --headless --path plugin/godot -s res://tests/rc_test.gd
 ## Any error logged counts as a failure, and every way out prints the summary: a script error stops only the function
 ## it is in, and one in _initialize or _run would otherwise leave the tree running with nothing to quit it.
@@ -26,8 +27,8 @@ class Errors extends Logger:
 const REVIEWED := {
 	"GLTFState.set_base_path": "a field of the state; GLTFDocument, which reads and writes files, is refused",
 	"GLTFState.set_filename": "a field of the state; GLTFDocument, which reads and writes files, is refused",
-	"Node.set_scene_file_path": "a name only; what a restart opens is checked against res://.godot/",
-	"MultiplayerSpawner.add_spawnable_scene": "a path argument under res://.godot/ is refused",
+	"Node.set_scene_file_path": "a name only; what a restart opens is checked against res://.godot/ and res://.cluewren/",
+	"MultiplayerSpawner.add_spawnable_scene": "a path argument under res://.godot/ or res://.cluewren/ is refused",
 	"Resource.get_id_for_path": "reads an id",
 	"RenderingServer.texture_set_path": "a debug label",
 	"RenderingServer.shader_set_path_hint": "a debug label",
@@ -38,7 +39,7 @@ const REVIEWED := {
 const REVIEWED_PREFIXES := ["OpenXR"]  # OpenXR action and interaction paths, not files
 
 var Rc
-var Codex
+var Export
 var Binding
 var rc
 var host: Node
@@ -53,12 +54,18 @@ var _ran := false
 
 
 func _initialize() -> void:
+	# The tests make, write and remove res://.cluewren: they run in a copy of the plugin that has none, as
+	# eng/test-plugins.ps1 makes, never over a folder or a file somebody keeps under that name.
+	if FileAccess.file_exists("res://.cluewren") or DirAccess.dir_exists_absolute("res://.cluewren"):
+		printerr("res://.cluewren is there already: run the tests in a copy of plugin/godot that has none")
+		quit(1)
+		return
 	OS.add_logger(_errors)
 	_watchdog.start(_time_out)
 	_main.call_deferred()
 	# (loaded here, not preloaded: an addon script that doesn't compile is a failure with a summary, not a silent exit)
 	Rc = load("res://addons/cluewren/lib/rc.gd")
-	Codex = load("res://addons/cluewren/lib/codex.gd")
+	Export = load("res://addons/cluewren/lib/export.gd")
 	Binding = load("res://tests/binding.gd")
 	host = Node.new()
 	host.name = "Host"
@@ -124,6 +131,8 @@ func _run() -> void:
 	c7_console()
 	c8_settings()
 	c9_data_folder()
+	the_addon_itself()
+	the_export()
 	still_reachable()
 	census()
 	Binding.run(self)
@@ -287,30 +296,57 @@ func c8_settings() -> void:
 
 
 func c9_data_folder() -> void:
-	var scene := "res://.godot/cluewren/runs/x/evil.tscn"
-	refuses("C9", "a res://.godot/ target", read(scene))
-	refuses("C9", "a res://.godot/ describe", rc.handle("describe", {"objectPath": scene}))
-	refuses("C9", "a res://.godot/ string argument",
-		call_rc("/root/Probe", "set_scene_file_path", {"scene_file_path": scene}))
-	refuses("C9", "a relative .godot/ argument",
-		call_rc("/root/Probe", "set_scene_file_path", {"scene_file_path": ".godot/cluewren/x.tscn"}))
-	for p in ["res://.GODOT/cluewren/x.tscn", "res://GODOT~1/cluewren/x.tscn", "res://a/../.godot/x.tscn",
-			ProjectSettings.globalize_path(scene), ProjectSettings.globalize_path(scene).replace("/", "\\")]:
-		expect("C9", "data_path %s" % p, Codex.data_path(p))
-	var id := ResourceUID.create_id()
-	ResourceUID.add_id(id, scene)
-	expect("C9", "uid to res://.godot/", Codex.data_path(ResourceUID.id_to_text(id)))
-	ResourceUID.remove_id(id)
-	expect("C9", "find_scene refuses res://.godot/", Codex.find_scene(scene) == "")
-	expect("C9", "an ordinary path is not data", not Codex.data_path("res://tests/fixture.gd"))
-	expect("C9", "a node path is not data", not Codex.data_path("/root/Probe"))
-	refuses("C9", "a String default argument into res://.godot/", call_rc("/root/Probe", "pick"))
-	refuses("C9", "a NodePath default argument into res://.godot/", call_rc("/root/Probe", "pick_node"))
+	for scene in ["res://.cluewren/runs/x/work/evil.tscn", "res://.godot/imported/evil.tscn"]:
+		var folder: String = scene.get_slice("/", 2)
+		refuses("C9", "a res://%s/ target" % folder, read(scene))
+		refuses("C9", "a res://%s/ describe" % folder, rc.handle("describe", {"objectPath": scene}))
+		refuses("C9", "a res://%s/ string argument" % folder,
+			call_rc("/root/Probe", "set_scene_file_path", {"scene_file_path": scene}))
+		refuses("C9", "a relative %s/ argument" % folder,
+			call_rc("/root/Probe", "set_scene_file_path", {"scene_file_path": scene.trim_prefix("res://")}))
+		for p in ["res://%s/x.tscn" % folder.to_upper(), "res://a/../%s/x.tscn" % folder,
+				ProjectSettings.globalize_path(scene), ProjectSettings.globalize_path(scene).replace("/", "\\")]:
+			expect("C9", "data_path %s" % p, Export.data_path(p))
+		var id := ResourceUID.create_id()
+		ResourceUID.add_id(id, scene)
+		expect("C9", "uid to res://%s/" % folder, Export.data_path(ResourceUID.id_to_text(id)))
+		ResourceUID.remove_id(id)
+		expect("C9", "find_scene refuses res://%s/" % folder, Export.find_scene(scene) == "")
+		var why: String = Export.refused_scene(scene)
+		expect("C9", "a scene under res://%s/ is refused by name" % folder, why.begins_with(scene + " is refused: "), why)
+	# By the text alone: nothing a path names is opened, a share's included.
+	for p in [".cluewren/x", "a/.CLUEWREN/x", "C:\\other\\.cluewren\\x", "\\\\server\\share\\.cluewren\\x", ".cluewren.",
+			".cluewren ", ".cluewren::$INDEX_ALLOCATION", ".cluewren:x", "file:///C:/p/%2Ecluewren/x", "a/.godot/x",
+			"C:.cluewren/x", "c:.CLUEWREN", ".cluewren", "%2Eclue%77ren%2Fruns%2Fx%2Fwork%2Fevil.tscn", "C:/p/CLUEWR~1/x",
+			"cl12ab~1", "GODOT~1/imported/x.tscn"]:
+		expect("C9", "data_path %s" % p, Export.data_path(p))
+	for p in [".cluewrens/x", "x.cluewren/y", "my.cluewren", "a/cluewren/b", "C:/PROGRA~1/x/y.tscn", "Assets/NUL",
+			"CLUEWREN~1/x", "CLUEWR~1.txt"]:
+		expect("C9", "not data_path %s" % p, not Export.data_path(p))
+	refuses("C9", "a percent-encoded .cluewren as a string argument", call_rc("/root/Probe", "echo",
+		{"value": "%2Eclue%77ren%2Fruns%2Fx%2Fwork%2Fevil.tscn"}))
+	refuses("C9", "a share's .cluewren as a string argument", call_rc("/root/Probe", "echo",
+		{"value": "\\\\server\\share\\.cluewren\\x"}))
+	refuses("C9", "a stream of .cluewren as a string argument", call_rc("/root/Probe", "echo", {"value": ".cluewren:x"}))
+	var had_home := DirAccess.dir_exists_absolute("res://.cluewren")
+	if not had_home:
+		DirAccess.make_dir_absolute("res://.cluewren")
+	var short := _short_name(ProjectSettings.globalize_path("res://.cluewren"))
+	if short != "":
+		var through := ProjectSettings.globalize_path("res://").path_join(short).path_join("runs/x.tscn")
+		expect("C9", "data_path through the folder's own 8.3 name", Export.data_path(through), through)
+	if not had_home:
+		DirAccess.remove_absolute("res://.cluewren")
+	expect("C9", "an ordinary scene is not refused", Export.refused_scene("res://levels/one.tscn") == "")
+	expect("C9", "an ordinary path is not data", not Export.data_path("res://tests/fixture.gd"))
+	expect("C9", "a node path is not data", not Export.data_path("/root/Probe"))
+	refuses("C9", "a String default argument into res://.cluewren/", call_rc("/root/Probe", "pick"))
+	refuses("C9", "a NodePath default argument into res://.cluewren/", call_rc("/root/Probe", "pick_node"))
 	allows("ok", "an ordinary default argument", call_rc("/root/Probe", "pick_safe"))
 	refuses("C9", "a String default argument after no positional ones", call_rc("/root/Probe", "pick", []))
 	refuses("C9", "a NodePath default argument after no positional ones", call_rc("/root/Probe", "pick_node", []))
 	allows("ok", "an ordinary default argument after no positional ones", call_rc("/root/Probe", "pick_safe", []))
-	var deep = "res://.godot/cluewren/x.tscn"
+	var deep = "res://.cluewren/runs/x.tscn"
 	var flat = 1
 	for i in 12:
 		deep = [deep]
@@ -318,6 +354,98 @@ func c9_data_folder() -> void:
 	refuses("C9", "a path nested past the depth checked", call_rc("/root/Probe", "echo", {"value": deep}))
 	refuses("C9", "a value nested past the depth checked", call_rc("/root/Probe", "echo", {"value": flat}))
 	allows("ok", "a shallow value", call_rc("/root/Probe", "echo", {"value": [[1]]}))
+
+
+## The 8.3 name Windows gave a folder, "" when it gave none.
+func _short_name(folder: String) -> String:
+	var script := "(New-Object -ComObject Scripting.FileSystemObject).GetFolder('%s').ShortName" % folder.replace("/", "\\").replace("'", "''")
+	var shell := OS.get_environment("SystemRoot").path_join("System32/WindowsPowerShell/v1.0/powershell.exe")
+	var out := []
+	var code := OS.execute(shell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", Marshalls.raw_to_base64(script.to_utf16_buffer())], out)
+	var said := str(out[0]).strip_edges() if code == 0 and out.size() > 0 else ""
+	return "" if said.to_lower() == folder.get_file().to_lower() else said
+
+
+## The autoload holds the link to the brain and the addon's scripts read the invite: rc (here with /root/Host as its
+## host) reaches neither.
+func the_addon_itself() -> void:
+	refuses("addon", "its node as a target", read("/root/Host"))
+	refuses("addon", "its node described", rc.handle("describe", {"objectPath": "/root/Host"}))
+	refuses("addon", "a call on its node", call_rc("/root/Host", "get_name"))
+	refuses("addon", "a write to its node", write("/root/Host", "name", "Other"))
+	refuses("addon", "its node as an argument", call_rc("/root/Probe", "is_ancestor_of", {"node": "/root/Host"}))
+	var said := read("/root/Host")
+	expect("addon", "the refusal names the node and why", str(said[1]).begins_with("/root/Host is refused: "), said)
+	for script in ["res://addons/cluewren/lib/discovery.gd", "res://addons/cluewren/game.gd"]:
+		refuses("addon", "%s as a target" % script, read(script))
+	refuses("addon", "a static function of its scripts", call_rc("res://addons/cluewren/lib/discovery.gd", "invite_path"))
+	refuses("addon", "a constant of its scripts", read("res://addons/cluewren/lib/discovery.gd", "PROTOCOL"))
+	# Windows opens a file by any case of its name, and Godot keeps the spelling it was asked for as the script's path.
+	var id := ResourceUID.create_id()
+	ResourceUID.add_id(id, "res://addons/CLUEWREN/lib/discovery.gd")
+	for script in ["res://ADDONS/cluewren/lib/discovery.gd", "res://addons/Cluewren/lib/discovery.gd",
+			"res://addons/x/../cluewren/lib/discovery.gd", "res://addons//cluewren/lib/discovery.gd", ResourceUID.id_to_text(id)]:
+		refuses("addon", "a static function of its scripts by %s" % script, call_rc(script, "invite_path"))
+	ResourceUID.remove_id(id)
+	refuses("addon", "its script as an object argument by another spelling",
+		call_rc("/root/Probe", "is_ancestor_of", {"node": "res://ADDONS/cluewren/lib/discovery.gd"}))
+	for p in ["res://addons/CLUEWREN/lib/discovery.gd", ProjectSettings.globalize_path("res://addons/cluewren/lib/discovery.gd")]:
+		refuses("addon", "its script's path %s as a string argument" % p, call_rc("/root/Probe", "echo", {"value": p}))
+	expect("addon", "no other spelling of its scripts is loaded for rc", not ResourceLoader.has_cached("res://ADDONS/cluewren/lib/discovery.gd")
+		and not ResourceLoader.has_cached("res://addons/Cluewren/lib/discovery.gd")
+		and not ResourceLoader.has_cached("res://addons/CLUEWREN/lib/discovery.gd"))
+	var loaded: Script = load("res://Addons/cluewren/lib/discovery.gd")
+	expect("addon", "its script loaded under another spelling", rc.refused(loaded, "invite_path", "call") != "", loaded.resource_path)
+	the_addon_reached_elsewhere()
+
+
+## A junction in the project and a copy of a script reach the addon's scripts under paths of their own. Once loaded as a
+## target they are known by what they hold; a string naming them is not followed (it is left to the project's own code).
+func the_addon_reached_elsewhere() -> void:
+	# (names of the test's own: it never writes over, or removes, what it didn't make)
+	var own := "%d-%08x" % [OS.get_process_id(), randi()]
+	var alias_res := "res://rc_alias-" + own
+	var alias := ProjectSettings.globalize_path(alias_res)
+	var copy := "res://tests/rc_copy-%s.gd" % own
+	if DirAccess.dir_exists_absolute(alias) or FileAccess.file_exists(alias) or FileAccess.file_exists(copy):
+		expect("addon", "names of the test's own", false, [alias, copy])
+		return
+	var out := []
+	OS.execute(OS.get_environment("SystemRoot").path_join("System32/cmd.exe"), ["/c", "mklink", "/J", alias.replace("/", "\\"),
+		ProjectSettings.globalize_path("res://addons/cluewren").replace("/", "\\")], out, true)
+	expect("addon", "a junction for the test", DirAccess.dir_exists_absolute(alias), out)
+	var f := FileAccess.open(copy, FileAccess.WRITE)
+	f.store_string(FileAccess.get_file_as_string("res://addons/cluewren/lib/discovery.gd"))
+	f.close()
+	for script in [alias_res + "/lib/discovery.gd", copy]:
+		refuses("addon", "a static function of its script as %s" % script, call_rc(script, "invite_path"))
+		refuses("addon", "its script as %s as an object argument" % script,
+			call_rc("/root/Probe", "is_ancestor_of", {"node": script}))
+	var copied: Script = load(copy)
+	expect("addon", "a copy of its script loaded", rc.refused(copied, "invite_path", "call") != "", copy)
+	DirAccess.remove_absolute(copy)
+	# (the junction alone: a junction is removed as an empty folder, what it points at staying)
+	DirAccess.remove_absolute(alias)
+	expect("addon", "the junction is gone and the addon is not", not DirAccess.dir_exists_absolute(alias) and
+		FileAccess.file_exists("res://addons/cluewren/lib/discovery.gd"))
+
+
+func the_export() -> void:
+	var home := "res://.cluewren"
+	if DirAccess.dir_exists_absolute(home):
+		expect("export", "no res://.cluewren before the test", false, ProjectSettings.globalize_path(home))
+		return
+	var why: String = Export.write_summary()
+	expect("export", "the summary is written", why == "", why)
+	var summary := FileAccess.get_file_as_string(home + "/export/summary.txt")
+	expect("export", "to res://.cluewren/export/summary.txt", summary.begins_with("Godot project: "), summary.left(80))
+	expect("export", "whoever makes .cluewren ignores it for git", FileAccess.get_file_as_string(home + "/.gitignore") == "*\n")
+	expect("export", "nothing where the summary used to be", not DirAccess.dir_exists_absolute("res://.godot/cluewren_codex"))
+	DirAccess.remove_absolute(home + "/.gitignore")
+	expect("export", "written again", Export.write_summary() == "")
+	expect("export", "a .cluewren that was there gets no .gitignore", not FileAccess.file_exists(home + "/.gitignore"))
+	for path in [home + "/export/summary.txt", home + "/export", home]:
+		DirAccess.remove_absolute(path)
 
 
 func still_reachable() -> void:
@@ -336,7 +464,7 @@ func still_reachable() -> void:
 	allows("ok", "script read", read("/root/Probe", "script"))
 	var sum := call_rc("/root/Probe", "add", {"a": 1, "b": 2})
 	expect("ok", "script function", sum[0] and sum[1].ReturnValue == 3, sum)
-	allows("ok", "a node argument", call_rc("/root/Probe", "is_ancestor_of", {"node": "/root/Host"}))
+	allows("ok", "a node argument", call_rc("/root/Probe", "is_ancestor_of", {"node": "/root/LinkButton"}))
 	allows("ok", "script object static function", call_rc("res://tests/fixture.gd", "twice", {"x": 2}))
 	allows("ok", "script object constant", read("res://tests/fixture.gd", "LIMIT"))
 	var props := read("OS")

@@ -1,6 +1,7 @@
 # Modified by Crane Valley: reduced to the link to the brain, starting and stopping play, and the relay to the game. The
-# editor connects by itself once brain.json appears; runs, steering, memory, usage, the account, sign-in and codex ops are
-# removed, and a restart without "fresh" stays in the running game; a restart never plays a scene under res://.godot/.
+# editor advertises itself and connects once the brain invites it; runs, steering, memory, usage, the account, sign-in
+# and codex ops are removed, and a restart without "fresh" stays in the running game; a restart never plays a scene under
+# res://.godot/ or res://.cluewren/.
 ## The editor's link to the brain (hello host "editor"). The editor and the game are separate processes in Godot, so:
 ##  - this holds the one WebSocket to the brain (the brain expects one link per run, whatever the game does);
 ##  - the brain's `session` requests start, stop and restart the play session here (EditorInterface.play_main_scene /
@@ -17,19 +18,17 @@ extends Node
 signal state_changed
 
 const Link = preload("lib/link.gd")
-const Codex = preload("lib/codex.gd")
+const Export = preload("lib/export.gd")
 const Keys = preload("lib/keys.gd")
 const Media = preload("lib/media.gd")
 const Discovery = preload("lib/discovery.gd")
 const SESSION_TIMEOUT := 60.0
-const AUTO_CONNECT_SECONDS := 2.0
 const RESUME_META := &"cluewren_resume"
 const BUSY_SLEEP_USEC := 1000
 
 var debugger  # debugger.gd
 var link = Link.new()
 var run_active := false
-var disconnected_by_user := false
 
 var _game_session := -1
 var _game_ready := false
@@ -39,10 +38,12 @@ var _attach_until := 0.0
 var _forwarded := {}  # request ids in flight to the game
 var _pending := []  # session waits: {"tick": Callable(now) -> bool}
 var _heartbeat_at := 0.0
-var _auto_connect_at := 0.0
 var _shown_state := ""
+var _advert_problem := ""
 var _detector_config := {}
 var _summary_task := -1
+var _summary_said := ""  # what the task says, for the editor's thread to read once the task is over
+var _export_problem := ""
 var _last_played := ""
 var _record = null  # the brain's `record` start args while it records (kept across play sessions; null: not recording)
 var _record_frames := 0  # frames passed on since that start
@@ -71,7 +72,9 @@ func _ready() -> void:
 		_record = kept.record
 		_record_frames = kept.frames
 		_record_next = kept.next
-		link.open()
+		_forwarded = kept.get("forwarded", {})
+	_advert_problem = Discovery.write_advert("editor")
+	link.open()
 
 
 func _notification(what: int) -> void:
@@ -81,12 +84,15 @@ func _notification(what: int) -> void:
 
 func _exit_tree() -> void:
 	_set_busy(false)
+	# Not when the plugin is only loaded again: the brain goes on finding this editor, and the next instance writes it anew.
+	if _quitting:
+		Discovery.remove_advert()
 	if _quitting or not link.connected:
 		link.close()
 	else:
 		# The plugin was reloaded or disabled, not the editor closed: the same run goes on with the next instance.
 		Engine.set_meta(RESUME_META, {"session": link.session, "received": link.received, "run_active": run_active,
-			"record": _record, "frames": _record_frames, "next": _record_next})
+			"record": _record, "frames": _record_frames, "next": _record_next, "forwarded": _forwarded})
 		link.close_for_reload()
 	if _summary_task >= 0:
 		WorkerThreadPool.wait_for_task_completion(_summary_task)
@@ -102,24 +108,25 @@ func wants_connection() -> bool:
 
 func state_text() -> String:
 	if link.connected:
-		return "Connected"
-	if link.problem != "" and (link.want or link.refused_stamp >= 0):
+		var said := "Connected: playing a run" if run_active else "Connected"
+		return said if _export_problem == "" else "%s\n%s" % [said, _export_problem]
+	if _advert_problem != "":
+		return _advert_problem
+	if link.problem != "":
 		return link.problem
-	return "Connecting" if link.want else "Disconnected"
+	if not link.want:
+		return "Disconnected"
+	return "Connecting" if link.ws != null else "Waiting for a Cluewren run"
 
 
 func connect_to_brain() -> void:
-	disconnected_by_user = false
-	link.refused_stamp = -1
 	link.open()
 	state_changed.emit()
 
 
 func disconnect_from_brain() -> void:
-	disconnected_by_user = true
 	link.close()
 	link.problem = ""
-	link.problem_code = 0
 	run_active = false
 	_set_busy(false)
 	_record = null
@@ -139,11 +146,7 @@ func _set_busy(busy: bool) -> void:
 
 
 func _hello() -> Dictionary:
-	var cfg := ConfigFile.new()
-	var version := "0.1.2"
-	if cfg.load("res://addons/cluewren/plugin.cfg") == OK:
-		version = str(cfg.get_value("plugin", "version", version))
-	return {"plugin_version": version, "engine": "godot", "engine_version": Engine.get_version_info().string,
+	return {"plugin_version": Discovery.plugin_version(), "engine": "godot", "engine_version": Engine.get_version_info().string,
 		"project": str(ProjectSettings.get_setting("application/config/name", "")), "host": "editor",
 		# the games it starts can be captured (a headless one answers record and capture with 409); `levels`, and
 		# `session` playing the `map` asked for
@@ -157,8 +160,6 @@ func _process(_delta: float) -> void:
 	if _editor_sleep >= 0:
 		OS.low_processor_usage_mode_sleep_usec = BUSY_SLEEP_USEC
 	link.poll()
-	if not link.want:
-		_auto_connect(now)
 	# (the link changes its problem as it retries, with no event of its own: the dock shows why it doesn't connect)
 	if state_text() != _shown_state:
 		_shown_state = state_text()
@@ -182,21 +183,6 @@ func _process(_delta: float) -> void:
 		link.send_text(JSON.stringify({"type": "events", "events": [{"kind": "heartbeat", "t": null, "fps": Engine.get_frames_per_second(), "paused": false}], "t": null}))
 
 
-## A brain that failed its proof, or that the brain's error turned away, isn't asked again: only a new brain.json is.
-func _auto_connect(now: float) -> void:
-	if now < _auto_connect_at or disconnected_by_user:
-		return
-	_auto_connect_at = now + AUTO_CONNECT_SECONDS
-	var path := Discovery.file_path()
-	if path == "" or not FileAccess.file_exists(path):
-		return
-	if link.refused_stamp >= 0 and FileAccess.get_modified_time(path) == link.refused_stamp:
-		return
-	link.refused_stamp = -1
-	link.open()
-	state_changed.emit()
-
-
 func _on_welcomed(resumed: bool) -> void:
 	state_changed.emit()
 	_set_busy(true)
@@ -206,6 +192,7 @@ func _on_welcomed(resumed: bool) -> void:
 		_forwarded.clear()
 		_record = null
 		_record_starts.clear()
+		_detach()  # (the game drops what it owes the session before)
 		_game_ready = false  # (a game already playing is attached again, for this brain)
 	if _game_session >= 0 and not _game_ready:
 		_attach_at = 0.0
@@ -243,10 +230,6 @@ func _on_brain_frame(frame: Dictionary, text: String) -> void:
 				debugger.send(_game_session, "release", [])
 		"status":
 			print("Cluewren: %s" % frame.get("text", ""))
-		"finding":
-			var f = frame.get("finding", {})
-			if typeof(f) == TYPE_DICTIONARY:
-				print("Cluewren: finding: %s" % f.get("summary", ""))
 
 
 # --- requests from the brain ------------------------------------------------------------------------
@@ -342,7 +325,7 @@ func _editor_context() -> Dictionary:
 ## `levels`: the project's scenes, what a start without a map plays (the main scene) and the one playing.
 func _levels() -> Dictionary:
 	var playing := EditorInterface.get_playing_scene() if EditorInterface.is_playing_scene() else ""
-	return {"levels": Codex.scenes(), "open": str(ProjectSettings.get_setting("application/run/main_scene", "")), "playing": playing}
+	return {"levels": Export.scenes(), "open": str(ProjectSettings.get_setting("application/run/main_scene", "")), "playing": playing}
 
 
 func _play(scene: String) -> void:
@@ -354,20 +337,38 @@ func _play(scene: String) -> void:
 
 
 func _write_summary() -> void:
-	if _summary_task >= 0:
-		if not WorkerThreadPool.is_task_completed(_summary_task):
-			return
-		WorkerThreadPool.wait_for_task_completion(_summary_task)
-	_summary_task = WorkerThreadPool.add_task(Codex.write_summary, false, "Cluewren summary")
+	if _summary_written():
+		_summary_task = WorkerThreadPool.add_task(_export, false, "Cluewren export")
+
+
+func _export() -> void:
+	_summary_said = Export.write_summary()
+
+
+func _summary_written() -> bool:
+	if _summary_task < 0:
+		return true
+	if not WorkerThreadPool.is_task_completed(_summary_task):
+		return false
+	WorkerThreadPool.wait_for_task_completion(_summary_task)
+	_summary_task = -1
+	_export_problem = _summary_said
+	if _export_problem != "":
+		push_warning("Cluewren: " + _export_problem)
+	return true
 
 
 func _session(id, args: Dictionary, text: String) -> void:
 	var action := str(args.get("action", "status"))
 	var scene := ""
 	if str(args.get("map", "")) != "":
-		scene = Codex.find_scene(str(args.map))
+		var refused := Export.refused_scene(str(args.map))
+		if refused != "":
+			_respond_error(id, refused, 403)
+			return
+		scene = Export.find_scene(str(args.map))
 		if scene == "":
-			_respond_error(id, "No scene %s" % args.map)
+			_respond_error(id, "No scene %s" % args.map, 404)
 			return
 	match action:
 		"start":
@@ -404,8 +405,9 @@ func _session(id, args: Dictionary, text: String) -> void:
 			var target := scene
 			if target == "":
 				target = EditorInterface.get_playing_scene() if EditorInterface.is_playing_scene() else _last_played
-			if Codex.data_path(target):
-				_respond_error(id, "%s is refused: nothing under res://.godot/ is opened as a scene" % target)
+			var refused := Export.refused_scene(target)
+			if refused != "":
+				_respond_error(id, refused, 403)
 				return
 			_last_played = target
 			var gen := _game_gen
@@ -438,7 +440,7 @@ func _session(id, args: Dictionary, text: String) -> void:
 func _wait_ready(id) -> void:
 	var started := _now()
 	_pending.append({"tick": func(now: float) -> bool:
-		if _game_ready and (_summary_task < 0 or WorkerThreadPool.is_task_completed(_summary_task)):
+		if _game_ready and _summary_written():
 			_respond(id, {"running": true})
 			return true
 		if now - started > SESSION_TIMEOUT:
@@ -502,6 +504,8 @@ func _on_game_message(message: String, data: Array, session_id: int) -> void:
 			if id == -1:
 				link.send_text(data[2])
 				return
+			if not _forwarded.has(id):
+				return  # (owed to a session before this one)
 			_forwarded.erase(id)
 			if _record_starts.has(id):
 				if data[1]:
@@ -535,6 +539,8 @@ func _on_game_media(data: Array) -> void:
 		"still":
 			var id = head.get("id")
 			id = int(id) if typeof(id) == TYPE_FLOAT else id
+			if not _forwarded.has(id):
+				return
 			_forwarded.erase(id)
 			link.send_answer(Media.response_text(id, {"width": int(head.get("width", 0)), "height": int(head.get("height", 0)),
 				"t": head.get("t")}, b64, head.get("t")), true)

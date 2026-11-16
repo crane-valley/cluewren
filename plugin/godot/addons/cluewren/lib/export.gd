@@ -1,16 +1,24 @@
-# Modified by Crane Valley: only the project summary stays, written to .godot/cluewren_codex/; the manifest and read
-# paths are removed, the agent reading the project with its own tools; nothing under res://.godot/ is found as a scene.
-## The addon's summary of the project for the agent (main scene, autoloads, input actions, global classes, each scene's
-## nodes), written to .godot/cluewren_codex/summary.txt, or to user://cluewren_codex/ when res:// is
-## read-only. The project's files are its .gd .cs .tscn .tres .gdshader files, skipping directories whose name starts
-## with "." (.godot, .git, .import...), node_modules, addons/cluewren and any directory holding a .gdignore.
+# Modified by Crane Valley: renamed from codex.gd; only the project summary stays, written to .cluewren/export/; the
+# manifest and read paths are removed, the agent reading the project with its own tools; nothing under res://.godot/ or
+# res://.cluewren/ is found as a scene.
+## The addon's export of the project for the agent: a summary (main scene, autoloads, input actions, global classes, each
+## scene's nodes) written to res://.cluewren/export/summary.txt. The project's files are its .gd .cs .tscn .tres
+## .gdshader files, skipping directories whose name starts with "." (.godot, .cluewren, .git, .import...), node_modules,
+## addons/cluewren and any directory holding a .gdignore.
 extends RefCounted
 
 const EXTENSIONS := ["gd", "cs", "tscn", "tres", "gdshader"]
+const HOME := "res://.cluewren"
+const SUMMARY := HOME + "/export/summary.txt"
 const Keys = preload("keys.gd")
 
-static var _short: RegEx
+const DATA_FOLDERS := [".cluewren", ".godot"]
+const KEPT := 4096  # (the longest string a verdict is kept for, and how many are kept)
+
 static var _known := {}  # the same paths come back tick after tick
+static var _spelled := {}
+# The 8.3 names Windows can give .cluewren and .godot: CLUEWR~1 to ~4, then two letters, four hex digits and ~N.
+static var _short_shape := RegEx.create_from_string("^(cl|go)[^.]*~[0-9]+$")
 
 
 static func skipped_dir(name: String) -> bool:
@@ -49,40 +57,76 @@ static func scenes() -> Array:
 	return out
 
 
-# res://.godot/ holds the engine's cache and Cluewren's data, harness output included: rc and a scene change never load it.
+# res://.godot/ is the engine's cache and res://.cluewren/ holds Cluewren's data, what the harness wrote included: rc and
+# a scene change never load from either. Decided by the text alone: what a path names is never opened to find out, so it
+# is refused under any root, drive or share it is reached by.
 static func data_path(path: String) -> bool:
 	if _known.has(path):
 		return _known[path]
-	if _known.size() > 4096:
+	if _known.size() > KEPT:
 		_known.clear()
-	var found := _data_path(path)
-	_known[path] = found
+	var found := _names_data_folder(path)
+	if not found and "%" in path:
+		found = _names_data_folder(path.uri_decode())
+	if not found and path.strip_edges().begins_with("uid://"):
+		var id := ResourceUID.text_to_id(path.strip_edges())
+		found = ResourceUID.has_id(id) and _names_data_folder(ResourceUID.get_id_path(id))
+	if path.length() <= KEPT:
+		_known[path] = found
 	return found
 
 
-static func _data_path(path: String) -> bool:
+## A segment names a data folder cut at its first ":" (an NTFS stream) and without the dots and spaces Windows drops
+## from a name's end. A drive's letter comes off first: C:.cluewren is .cluewren in that drive's current folder. Which
+## 8.3 name the folder got is not asked: any of the shape Windows could give it counts.
+static func _names_data_folder(text: String) -> bool:
+	var p := text.replace("\\", "/")
+	if p.length() >= 2 and p[1] == ":" and (p.unicode_at(0) | 0x20) >= 0x61 and (p.unicode_at(0) | 0x20) <= 0x7a:
+		p = p.substr(2)
+	for part in p.split("/", false):
+		var name := part.get_slice(":", 0).rstrip(". ").to_lower()
+		if name in DATA_FOLDERS or (name.length() <= 8 and _short_shape.search(name) != null):
+			return true
+	return false
+
+
+## The one spelling rc compares a path by, made from its text alone: a uid:// path as its file's, a relative one under
+## res://, globalized, simplified, lowercase.
+static func resolved(path: String) -> String:
+	if _spelled.has(path):
+		return _spelled[path]
+	if _spelled.size() > KEPT:
+		_spelled.clear()
 	var p := path.strip_edges().replace("\\", "/")
 	if p.begins_with("uid://"):
 		var id := ResourceUID.text_to_id(p)
 		if ResourceUID.has_id(id):
 			p = ResourceUID.get_id_path(id)
-	var root := ProjectSettings.globalize_path("res://").simplify_path().to_lower().trim_suffix("/")
-	var full := ProjectSettings.globalize_path(ProjectSettings.localize_path(p)).simplify_path().to_lower()
-	var rest := full.substr(root.length()) if full.begins_with(root + "/") else full
-	# A Windows 8.3 short name (GODOT~1 for .godot) names the same folder under another spelling.
-	if _short == null:
-		_short = RegEx.create_from_string("^[^~]{1,6}~[0-9]+")
-	for part in rest.split("/", false):
-		if part == ".godot" or _short.search(part) != null:
-			return true
-	return false
+	if p.is_relative_path():
+		p = "res://" + p
+	var full := ProjectSettings.globalize_path(p).simplify_path().to_lower()
+	if path.length() <= KEPT:
+		_spelled[path] = full
+	return full
 
 
-## A scene by res:// path, or by its file's name ("level" or "level.tscn"), searched in the project.
+static func refused_scene(path: String) -> String:
+	return "%s is refused: nothing under res://.godot/ or res://.cluewren/ is opened as a scene" % path if data_path(path) else ""
+
+
+## A scene by res:// path, or by its file's name ("level" or "level.tscn"), searched in the project. A map comes from
+## harness code: any other path (a drive's, a share's, a device's, one with "." or ".." in it, which Godot keeps at the
+## start of a res:// path) is no scene, and nothing is asked about it.
 static func find_scene(name: String) -> String:
+	var res := name
+	if name.begins_with("uid://"):
+		var id := ResourceUID.text_to_id(name)
+		res = ResourceUID.get_id_path(id) if ResourceUID.has_id(id) else ""
 	if name.begins_with("res://") or name.begins_with("uid://"):
-		return name if not data_path(name) and ResourceLoader.exists(name) else ""
-	var want := name.get_file()
+		return res if _plain_res(res) and not data_path(res) and ResourceLoader.exists(res) else ""
+	if "/" in name or "\\" in name or ":" in name:
+		return ""
+	var want := name
 	if not want.ends_with(".tscn") and not want.ends_with(".scn"):
 		want += ".tscn"
 	for path in scenes():
@@ -91,19 +135,33 @@ static func find_scene(name: String) -> String:
 	return ""
 
 
-## Write the project summary; returns where ("" when nowhere was writable).
+static func _plain_res(path: String) -> bool:
+	if not path.begins_with("res://"):
+		return false
+	for part in path.substr(6).split("/"):
+		if part == "" or part == "." or part == ".." or "\\" in part or ":" in part:
+			return false
+	return true
+
+
+## Write the project summary; returns why it couldn't be written, or "".
 static func write_summary() -> String:
 	var text := summary_text()
-	for dir in ["res://.godot/cluewren_codex", "user://cluewren_codex"]:
-		if DirAccess.make_dir_recursive_absolute(dir) != OK and not DirAccess.dir_exists_absolute(dir):
-			continue
-		var path: String = dir + "/summary.txt"
-		var f := FileAccess.open(path, FileAccess.WRITE)
-		if f == null:
-			continue
-		f.store_string(text)
-		f.close()
-		return path
+	var made := not DirAccess.dir_exists_absolute(HOME)
+	var dir := SUMMARY.get_base_dir()
+	if DirAccess.make_dir_recursive_absolute(dir) != OK and not DirAccess.dir_exists_absolute(dir):
+		return "The project's export wasn't written: %s can't be made" % dir
+	# Whoever makes .cluewren keeps it out of the user's repository; one the brain made has its .gitignore already.
+	if made:
+		var ignore := FileAccess.open(HOME + "/.gitignore", FileAccess.WRITE)
+		if ignore != null:
+			ignore.store_string("*\n")
+			ignore.close()
+	var f := FileAccess.open(SUMMARY, FileAccess.WRITE)
+	if f == null:
+		return "The project's export wasn't written: %s can't be written (error %d)" % [SUMMARY, FileAccess.get_open_error()]
+	f.store_string(text)
+	f.close()
 	return ""
 
 
