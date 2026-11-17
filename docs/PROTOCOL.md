@@ -103,10 +103,11 @@ an invite passes validation, because the flag is the user's own request:
 - Godot game: sets up its log capture and UI tracking, sizes a headless viewport and caps the frame rate, writes the
   advert, changes to the map flag's scene. Godot acts on --cluewren-map only together with --cluewren-connect.
 - Unreal: writes the advert, attaches its log capture, opens the map flag's level once the first world plays.
-None opens a socket or makes input devices before a verified welcome; each exits with code 1 when no welcome comes
-within the connect timeout (default 120 s). What waits for a verified welcome keeps waiting for it. After a refusal the
-plugin does not connect again until the invite file changes. After a normal end of a run the brain deletes the invite
-and the plugin returns to looking. The editor's Connect/Disconnect control switches whether it wants a connection.
+Each opens its socket only after its invite has passed its checks, and makes no input devices before a verified welcome;
+each exits with code 1 when no welcome comes within the connect timeout (default 120 s). What waits for a verified
+welcome keeps waiting for it. After a refusal the plugin does not connect again until the invite file changes. After a
+normal end of a run the brain deletes the invite and the plugin returns to looking. The editor's Connect/Disconnect
+control switches whether it wants a connection.
 
 ### Brain advert polling
 
