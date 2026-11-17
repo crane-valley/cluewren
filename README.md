@@ -81,7 +81,7 @@ This requires the .NET 10 SDK. The binary is `src/Cluewren/bin/Release/net10.0/c
 
 ## Engine plugins
 
-The `cluewren` command and the engine plugin must be of the same release (0.2.0 with 0.2.0). A plugin of another release is refused: the run fails with a message saying to install the plugin and the cluewren command of the same release, and the plugin shows "The cluewren command and this plugin are of different releases: install the same release of both".
+The `cluewren` command and the engine plugin must be of the same release (0.2.0 with 0.2.0). An editor whose plugin is of another release and that the command can see is refused: the run fails with a message saying to install the plugin and the cluewren command of the same release, and the plugin shows "The cluewren command and this plugin are of different releases: install the same release of both". A 0.1.x plugin writes no advert, so the 0.2.0 cluewren command does not see that editor at all: `start_run` (and `cluewren run`) say "No editor with the Cluewren plugin is open", or, when other editors are open, "No open editor has that project. Open: ...". Right after an upgrade, that means the project still has the 0.1.x plugin, so install the 0.2.0 plugin there. A 0.2.0 plugin is never invited by a 0.1.x cluewren command and does not connect.
 
 - Unity 6000.0+: `cluewren-unity-0.2.0.zip` (package `com.cranevalley.cluewren` 0.2.0); source `plugin/unity/com.cranevalley.cluewren` - [install](https://docs.cluewren.dev/engines/unity/)
 - Godot 4 (tested with 4.7.2): `cluewren-godot-0.2.0.zip` (unzips to `addons/cluewren` in the project root); source `plugin/godot/addons/cluewren` - [install](https://docs.cluewren.dev/engines/godot/)
@@ -153,7 +153,7 @@ To upgrade from 0.1.x:
      ```
      (d) Add your own settings again.
 
-3. Godot's autoload is `addons/cluewren/game.gd` (the addon of 0.2.0 replaces the old one; replace the whole `addons/cluewren` folder).
+3. In each Godot project, replace the whole `addons/cluewren` folder, then in Project > Project Settings > Plugins turn Cluewren off and on again, so that the autoload Cluewren is `res://addons/cluewren/game.gd` (it can be checked under the Globals > Autoload tab).
 
 4. Harness code uses the kit names Decision, DecisionRequest, YesNo and IDecider (see [docs/KIT.md](docs/KIT.md)). 0.2.0 does not read or move what 0.1.x kept in the project: to keep the agent's notes.md and lib.cs, copy them from the old run-memory folder into `.cluewren\memory` by hand, and change the old kit names in lib.cs.
 
