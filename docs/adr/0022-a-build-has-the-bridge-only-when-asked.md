@@ -33,7 +33,8 @@ testers shipped the bridge without having asked for it.
   for an invite; otherwise it writes no advert, opens no socket and connects nowhere (Runtime/Bootstrap.cs,
   UPlaytestSubsystem::Initialize in Source/Cluewren/Private/PlaytestSubsystem.cpp, game.gd).
 - The connect flag is the user's own request, so with it a process prepares itself before an invite is validated;
-  it opens no socket and makes no input devices before a verified welcome. See docs/PROTOCOL.md for the per-engine list.
+  it opens its socket only after its invite has passed its checks, and makes no input devices before a verified
+  welcome. See docs/PROTOCOL.md for the per-engine list.
 - Batch and unattended processes are treated the same way: a Unity batch-mode editor advertises only with
   -CluewrenConnect or when started through -executeMethod Cluewren.Editor.Headless.Run (Editor/EditorHost.cs); an
   unattended Unreal editor only with -CluewrenConnect, and a commandlet never.
