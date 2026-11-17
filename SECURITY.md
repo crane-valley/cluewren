@@ -53,7 +53,7 @@ Each open editor with the plugin writes a small advert file `%LOCALAPPDATA%\Clue
 - Unity sets up its virtual input devices only after the brain has proved itself; the Godot editor attaches to its running game only while connected.
 - At most 8 handshakes are in progress at a time and a handshake not finished within 10 s is dropped. Another user's process on the same machine can hold those 8 handshakes and delay an editor's connection (it cannot authenticate, learn the run's folder, or make the brain open a file).
 - Processes of the same Windows user are trusted: they can write adverts and read invites.
-- Godot: the addon starts `powershell.exe -NoProfile -NonInteractive` once per invite file (only when that file changes) to check that the invite and its folder are owned by the current user, are not links, and that the inviting process is running.
+- Godot: the addon starts `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>` once per invite file (only when that file changes) to check that the invite and its folder are owned by the current user, are not links, and that the inviting process is running.
 
 ### Harness child input handling and resource limits
 
@@ -92,7 +92,7 @@ Each open editor with the plugin writes a small advert file `%LOCALAPPDATA%\Clue
 
 ### Agent setup and `cluewren connect`
 
-- `cluewren connect` registers no automatic approval. `cluewren connect codex --approve-tools` writes `default_tools_approval_mode = "approve"` (Codex then calls Cluewren's tools without asking). A plain re-run removes the line 0.1.0 wrote and leaves an approval line the user wrote.
+- `cluewren connect` registers no automatic approval. `cluewren connect codex --approve-tools` writes `default_tools_approval_mode = "approve"` (Codex then calls Cluewren's tools without asking). A run without `--approve-tools` removes an approval line connect wrote, by 0.1.0 or by `--approve-tools`, and leaves one the user wrote; pass `--approve-tools` again to keep it.
 - One ownership rule: an entry is Cluewren's only when it is a stdio server that runs a file named `cluewren` or `cluewren.exe` with the single argument `mcp` (in Codex's `config.toml` also `dotnet` with `Cluewren.dll` and `mcp`). connect never removes or rewrites anything else, never reads an entry's environment for reuse, and never prints another entry's command, arguments or environment values.
 - `cluewren connect claude` registers Cluewren with Claude Code (user scope) only when Claude Code has no server named cluewren. If that entry already runs this Cluewren, nothing changes. Any other entry named cluewren is left as it is, and connect says what to do by hand. connect never moves or copies the settings of an existing entry. If connect cannot tell what is registered (an error, a timeout, an answer it does not recognise), it changes nothing. For `connect claude`, ownership is judged from what `claude mcp get` displays, and that display drops trailing white space. So an entry that runs a file named cluewren or cluewren.exe with arguments that differ from `mcp` only by invisible trailing white-space arguments cannot be told apart from Cluewren's own and is treated as Cluewren's.
 - `cluewren connect codex` changes only the command and args of a cluewren table that already runs Cluewren; every other line and sub-table stays byte for byte (env such as `CLUEWREN_SANDBOX = "required"`, cwd, tool lists). A table that runs something else, an HTTP server, or a config.toml that connect cannot read exactly is left unchanged, and connect prints the lines to set by hand. `connect codex --remove`, and an add followed by a remove, leave every byte outside Cluewren's own table as it was (line endings included).
@@ -152,10 +152,11 @@ Additional residual risks:
 - An invited editor of a matching project connects by itself, without asking the user.
 - A link into the .cluewren folder made from outside it (a junction, symbolic link, subst drive or hard link) is not followed: harness code can write only inside the folder, and links made by the user, the game's code or another process of the user are trusted.
 - Built games and the bridge:
-  - Unity: the plugin's runtime is compiled into a player build only when the project sets the scripting define `CLUEWREN_PLAYTEST` (Development build or not); a build without it has none of the runtime.
+  - Unity: the plugin's runtime is compiled into a player build only when the project sets the scripting define `CLUEWREN_PLAYTEST` (Development build or not); a build without it has none of the runtime. A player build of a project with `CLUEWREN_PLAYTEST` has a hidden object added to its first scene holding the project's productGUID and the project's local folder path (the built game advertises that path so the brain can match it to a run's project).
   - Unreal: Shipping builds do not contain the plugin's runtime; Development and Test builds contain it.
   - Godot: exports, debug or release, carry the addon; in a release export it does nothing.
   - A built game that has the bridge does nothing with it unless started with `-CluewrenConnect` (Unity, Unreal) or `-- --cluewren-connect` (Godot): without the flag it writes no advert, opens no socket and connects nowhere.
+- Unity: when Unity compiles the game's own assemblies in the editor, or in a player build of a project that defines `CLUEWREN_PLAYTEST`, the plugin rewrites their calls to the legacy Input Manager (UnityEngine.Input key, button, axis and mouse reads) so that they go through the plugin, which answers as UnityEngine.Input would plus the keys a run holds. Unity's own assemblies and the plugin's are not rewritten. The scripting define `CLUEWREN_NO_LEGACY_INPUT` turns this rewriting off. If the rewrite fails, the assembly is left as the compiler made it, with a warning.
 - Godot starts `powershell.exe` once per invite file to check ownership.
 
 ## Verifying a download
@@ -181,7 +182,7 @@ For deployments in managed environments:
 
 - Set `CLUEWREN_SANDBOX=required` in the user or machine environment to prevent harness code from running without an AppContainer.
 - Restrict outbound network access for `cluewren.exe` to `api.typesafe.ai:443`, or to the address set in `TYPESAFE_BASE_URL`. The bridge requires loopback access only.
-- Allow the Godot addon to run `powershell.exe -NoProfile -NonInteractive` once per invite file, which verifies that the invite file and its folder are owned by the current user, are not links, and that the inviting process is running.
+- Allow the Godot addon to run `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>` once per invite file, which verifies that the invite file and its folder are owned by the current user, are not links, and that the inviting process is running.
 - Store the TypeSafe API key in the environment or in `%LOCALAPPDATA%\Cluewren\keys.env` (protected by folder ACLs set to the current user only). Never store keys in the project or paste them into agent conversations.
 - Start the agent in the game's folder or pass `project` to `start_run` (or `--project` to `cluewren run`) for an exact match.
 - Do not pass `--approve-tools` to `cluewren connect codex` if Codex should ask before it calls Cluewren's tools; with it, Codex calls them without asking.

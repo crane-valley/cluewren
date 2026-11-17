@@ -1,5 +1,7 @@
 # The kit: pointing, legacy input, moving without keys
 
+`pointer` is Unity and Unreal only.
+
 - Unity: code that reads the legacy Input Manager (`UnityEngine.Input.GetKey`, `GetAxis`, `GetButton`, `GetMouseButton`,
   `mousePosition`...) sees the same keys too: the plugin routes those reads through itself when the game compiles.
   Axes follow the project's Input Manager settings: `GetAxis("Horizontal")` from `D` rises toward 1 over a few frames
