@@ -86,8 +86,8 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
         ("frames",
             "For a describer subagent only (not the agent working on the request): up to 12 of an episode's frames, as images, spread over "
             + "game times start-end. episode: its number (default: the latest); start, end: game times in it, in seconds (default: all of "
-            + "it); count: how many (default 8).",
-            """{"type":"object","properties":{"episode":{"type":"integer"},"start":{"type":"number"},"end":{"type":"number"},"count":{"type":"integer"}}}"""),
+            + "it); count: how many (default 8). Pass frame_run from this run's INSTRUCTIONS.md to select its frames.",
+            """{"type":"object","properties":{"frame_run":{"type":"string"},"episode":{"type":"integer"},"start":{"type":"number"},"end":{"type":"number"},"count":{"type":"integer"}}}"""),
         ("report",
             "The final answer to the request. outcome: for a goal 'achieved' or 'not_achieved'; for a claim 'CONFIRMED', 'DENIED' or "
             + "'INCONCLUSIVE'; for an exploration 'explored'. summary: what happened, in a few sentences. evidence: the observations from "
@@ -329,8 +329,16 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             if (tool == "start_run")
                 return await StartAsync(args).ConfigureAwait(false);
             if (_run is not { } run)
-                return tool == "frames" && await FramesRelay.AskAsync(WorkingFolder, args, _stopping.Token).ConfigureAwait(false) is { } relayed
-                    ? relayed : NoRun();
+            {
+                if (tool != "frames")
+                    return NoRun();
+                if (FramesRelay.RequestedRun(args) is null)
+                    return ToolResult.Say("Pass frame_run from the run's INSTRUCTIONS.md to request its frames.", true);
+                return await FramesRelay.AskAsync(WorkingFolder, args, _stopping.Token).ConfigureAwait(false)
+                    ?? ToolResult.Say("No run with that frame_run is serving frames in this working folder.", true);
+            }
+            if (tool == "frames" && args.ContainsKey("frame_run") && FramesRelay.RequestedRun(args) != run.FrameRun)
+                return ToolResult.Say("The requested frame_run does not match this run.", true);
             var endedBefore = run.Ended is not null;
             var result = await run.CallAsync(tool, args, _stopping.Token).ConfigureAwait(false);
             if (run.Ended is not null)
@@ -417,7 +425,7 @@ public sealed class McpServer(TextWriter output, double waitSeconds = 40, double
             _run = await PlaytestRun.OpenAsync(link, new RunRequest(request, kind, args["minutes"]?.GetValue<double>(),
                 args["time_limit_minutes"]?.GetValue<double>(), args["level"]?.GetValue<string>()), _jev, _client, Sandbox, _stopping.Token).ConfigureAwait(false);
             _watch = CloseWhenEndedAsync(_run);
-            _relay = FramesRelay.Serve(WorkingFolder, frames => CallAsync("frames", frames));
+            _relay = FramesRelay.Serve(WorkingFolder, _run.FrameRun, frames => CallAsync("frames", frames));
             return ToolResult.Say(_run.Opening);
         }
         catch (RendezvousException e)

@@ -202,7 +202,7 @@ public sealed class RendezvousTests : IDisposable
         Assert.Contains("(unknown version) speaks protocol 3-4",
             Rendezvous.Choose(scope, [Editor(4, foo, min: 3, max: 4)], _folder, Protocol).Problem);
 
-        var spoken = Rendezvous.Choose(scope, [Editor(4, foo, min: 1, max: 1), Editor(8, foo, min: 1, max: 3)], _folder, Protocol);
+        var spoken = Rendezvous.Choose(scope, [Editor(4, foo, min: 1, max: 1), Editor(8, foo, min: 1, max: 3, pluginVersion: "other-build")], _folder, Protocol);
         using var folder = spoken.Chosen!.Folder;
         Assert.Equal(8, spoken.Chosen.Editor.Pid);
     }

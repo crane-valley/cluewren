@@ -322,7 +322,7 @@ rc         (harness)  {verb: call|property|describe, body}
 context    (harness)  {} -> {world, character, controller, engine, engine_version, project_dir, session_running,
                       paused, game_time, controls[], ...}
 session    (harness: restart only)
-                      {action: status|start|stop|restart, map?} -> {running, ...}
+                      {action: status|start|stop|restart, map?} -> {running, export_state?, ...}
 levels     (harness)  {} -> {levels[], open, playing}
 pause      (harness)  {paused} -> {paused}
 timestep              {fixed?, fps?} -> {}
@@ -339,13 +339,20 @@ pose       (harness)  {} -> the player's position, eye, rotation, velocity, on-g
 movement   (harness)  {} -> the character's movement numbers (walk speed, jump height, gravity, capsule, ...)
 ```
 
+A successful session start with an explicit map means that map is playing. A host that is already playing a
+different map may refuse the start; the caller can stop and start again with the requested map.
+
+Unreal reports `export_state` on session start and status. The brain polls while the state is `pending`. It uses the
+export when the editor reports `ready` and the summary exists. On `unavailable` or timeout it proceeds without the
+export. A standalone Unreal game reports `unavailable`.
+
 Failure statuses:
 
 ```text
 400  unknown op
 403  a refusal (rc's refusal categories, a map or path under .cluewren), error text "<what> is refused: <why>"
 404  something that is not there
-409  no picture to record or capture
+409  no picture to record or capture, or a conflicting play session
 500  a failure inside the plugin
 ```
 

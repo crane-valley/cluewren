@@ -8,6 +8,22 @@ namespace Cluewren.Tests
     public class BuildHookTests
     {
         [Test]
+        public void TheBuildUsesTheFirstSceneFromItsOwnOptions()
+        {
+            var settings = EditorBuildSettings.scenes;
+            try
+            {
+                EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene("Assets/Default.unity", true) };
+                BuildOptionsNote.Note(new BuildPlayerOptions { scenes = new[] { "Assets/Custom.unity", "Assets/Default.unity" } });
+                Assert.AreEqual("Assets/Custom.unity", BuildOptionsNote.FirstScene);
+            }
+            finally
+            {
+                EditorBuildSettings.scenes = settings;
+            }
+        }
+
+        [Test]
         public void ADedicatedServerBuildIsJudgedByItsOwnDefines()
         {
             const int server = (int)StandaloneBuildSubtarget.Server;

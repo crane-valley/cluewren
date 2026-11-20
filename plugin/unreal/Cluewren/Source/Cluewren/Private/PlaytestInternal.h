@@ -31,8 +31,9 @@ namespace PlaytestOps
  *  its own because it loads every asset. Game thread. */
 namespace PlaytestExport
 {
-	/** A run starts: exports when there is none, or when the game's assets were saved since the last. Never waits for it. */
+	/** A run starts: check the saved assets and refresh the export as needed. Never waits for it. */
 	void Refresh();
+	const TCHAR* State();
 	void Tick();
 	/** Ends an export still running (the bridge is going away). */
 	void Shutdown();

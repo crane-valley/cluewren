@@ -133,6 +133,7 @@ func _run() -> void:
 	c9_data_folder()
 	the_addon_itself()
 	the_export()
+	load("res://tests/scenes_test.gd").run(self)
 	still_reachable()
 	census()
 	Binding.run(self)

@@ -203,7 +203,49 @@ namespace Cluewren
 
         public bool Session(PlaytestClient client, long id, string action, Dictionary<string, object> args)
         {
-            return false;
+            if (action != "start") return false;
+            var active = SceneManager.GetActiveScene();
+            var map = Json.Str(args, "map");
+            if (!string.IsNullOrEmpty(map))
+            {
+                if (Ops.RefusesScene(client, id, map)) return true;
+                if (Ops.MapOutsideProject(map))
+                {
+                    Ops.NoScene(client, id, map);
+                    return true;
+                }
+                var path = PlayerScenePath(map, active.path);
+                if (path == null)
+                {
+                    Ops.NoScene(client, id, map);
+                    return true;
+                }
+                if (path != active.path)
+                {
+                    client.RespondError(id, "The game is already running in another scene. Restart the session with the requested scene, or launch the game with -CluewrenMap.", 409);
+                    return true;
+                }
+            }
+            client.Respond(id, new Dictionary<string, object> { ["running"] = true, ["scene"] = active.path });
+            return true;
+        }
+
+        static string PlayerScenePath(string map, string active)
+        {
+            var count = SceneManager.sceneCountInBuildSettings;
+            if (int.TryParse(map, out var index))
+                return index >= 0 && index < count ? SceneUtility.GetScenePathByBuildIndex(index) : null;
+            map = map.Replace('\\', '/');
+            if (!map.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)) map += ".unity";
+            var byPath = map.IndexOf('/') >= 0;
+            bool Matches(string path) => !string.IsNullOrEmpty(path)
+                && string.Equals(map, byPath ? path : Path.GetFileName(path), StringComparison.OrdinalIgnoreCase);
+            for (var i = 0; i < count; ++i)
+            {
+                var path = SceneUtility.GetScenePathByBuildIndex(i);
+                if (Matches(path)) return path;
+            }
+            return Matches(active) ? active : null;
         }
 
         public void Exit(int code)

@@ -37,8 +37,8 @@ namespace Cluewren.Editor
         public static bool Included(BuildReport report)
         {
             var summary = report.summary;
-            // (the defines a script gave this one build, BuildOptionsNote: only a player build has them)
-            var extra = summary.buildType == BuildType.Player && BuildOptionsNote.Platform == summary.platform ? BuildOptionsNote.ExtraDefines : null;
+            if (summary.buildType != BuildType.Player) return false;
+            var extra = BuildOptionsNote.Platform == summary.platform ? BuildOptionsNote.ExtraDefines : null;
             var standalone = BuildPipeline.GetBuildTargetGroup(summary.platform) == BuildTargetGroup.Standalone;
             var subtarget = standalone ? (int)summary.GetSubtarget<StandaloneBuildSubtarget>() : 0;
             return Defined(PlayerSettings.GetScriptingDefineSymbols(NamedTarget(summary.platform, subtarget)), extra);
@@ -47,8 +47,7 @@ namespace Cluewren.Editor
         public void OnProcessScene(Scene scene, BuildReport report)
         {
             if (report == null || !Included(report)) return;  // (play mode in the editor, or a build without the bridge)
-            var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
-            if (first == null || first.path != scene.path) return;
+            if (BuildOptionsNote.Platform != report.summary.platform || BuildOptionsNote.FirstScene != scene.path) return;
             var go = new GameObject("CluewrenBuildInfo") { hideFlags = HideFlags.HideInHierarchy };
             var info = go.AddComponent<PlaytestBuildInfo>();
             info.productGuid = PlayerSettings.productGUID.ToString();
@@ -64,12 +63,16 @@ namespace Cluewren.Editor
     {
         public static BuildTarget Platform { get; private set; }
         public static string[] ExtraDefines { get; private set; }
+        public static string FirstScene { get; private set; }
 
         public override void PrepareForBuild(BuildPlayerContext buildPlayerContext)
+            => Note(buildPlayerContext.BuildPlayerOptions);
+
+        internal static void Note(BuildPlayerOptions options)
         {
-            var options = buildPlayerContext.BuildPlayerOptions;
             Platform = options.target;
             ExtraDefines = options.extraScriptingDefines;
+            FirstScene = options.scenes?.FirstOrDefault() ?? SceneManager.GetActiveScene().path;
         }
     }
 }

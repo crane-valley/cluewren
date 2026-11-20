@@ -25,7 +25,11 @@ static class Hold
             Mode = SandboxMode.Contained, Say = _ => { }, ProbeSeconds = 120,
         });
         var pid = Path.Combine(folder, "work", "pid.txt").Replace("\\", "\\\\");
-        await host.ProbeAsync($$"""File.WriteAllText("{{pid}}", Environment.ProcessId.ToString()); await Task.Delay(100000);""");
+        await host.ProbeAsync($$"""
+            File.WriteAllText("{{pid}}.tmp", Environment.ProcessId.ToString());
+            File.Move("{{pid}}.tmp", "{{pid}}");
+            await Task.Delay(100000);
+            """);
         return 0;
     }
 }

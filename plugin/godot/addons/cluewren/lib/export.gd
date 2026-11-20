@@ -2,12 +2,13 @@
 # manifest and read paths are removed, the agent reading the project with its own tools; nothing under res://.godot/ or
 # res://.cluewren/ is found as a scene.
 ## The addon's export of the project for the agent: a summary (main scene, autoloads, input actions, global classes, each
-## scene's nodes) written to res://.cluewren/export/summary.txt. The project's files are its .gd .cs .tscn .tres
+## text scene's nodes) written to res://.cluewren/export/summary.txt. The project's files are its .gd .cs .tscn .scn .tres
 ## .gdshader files, skipping directories whose name starts with "." (.godot, .cluewren, .git, .import...), node_modules,
 ## addons/cluewren and any directory holding a .gdignore.
 extends RefCounted
 
-const EXTENSIONS := ["gd", "cs", "tscn", "tres", "gdshader"]
+const EXTENSIONS := ["gd", "cs", "tscn", "scn", "tres", "gdshader"]
+const SCENE_EXTENSIONS := ["tscn", "scn"]
 const HOME := "res://.cluewren"
 const SUMMARY := HOME + "/export/summary.txt"
 const Keys = preload("keys.gd")
@@ -51,7 +52,7 @@ static func scenes() -> Array:
 	var out := []
 	for f in found:
 		var path := "res://" + str(f)
-		if path.get_extension().to_lower() in ["tscn", "scn"]:
+		if path.get_extension().to_lower() in SCENE_EXTENSIONS:
 			out.append(path)
 	out.sort()
 	return out
@@ -114,7 +115,7 @@ static func refused_scene(path: String) -> String:
 	return "%s is refused: nothing under res://.godot/ or res://.cluewren/ is opened as a scene" % path if data_path(path) else ""
 
 
-## A scene by res:// path, or by its file's name ("level" or "level.tscn"), searched in the project. A map comes from
+## A scene by res:// path or by its file name, with or without .tscn or .scn. A map comes from
 ## harness code: any other path (a drive's, a share's, a device's, one with "." or ".." in it, which Godot keeps at the
 ## start of a res:// path) is no scene, and nothing is asked about it.
 static func find_scene(name: String) -> String:
@@ -126,13 +127,17 @@ static func find_scene(name: String) -> String:
 		return res if _plain_res(res) and not data_path(res) and ResourceLoader.exists(res) else ""
 	if "/" in name or "\\" in name or ":" in name:
 		return ""
-	var want := name
-	if not want.ends_with(".tscn") and not want.ends_with(".scn"):
-		want += ".tscn"
+	var want := name.to_lower()
+	var has_extension := want.get_extension() in SCENE_EXTENSIONS
+	var preferred := want if has_extension else want + ".tscn"
+	var binary := ""
 	for path in scenes():
-		if str(path).get_file().to_lower() == want.to_lower():
+		var file := str(path).get_file().to_lower()
+		if file == preferred:
 			return path
-	return ""
+		if not has_extension and binary == "" and file == want + ".scn":
+			binary = path
+	return binary
 
 
 static func _plain_res(path: String) -> bool:
@@ -201,7 +206,7 @@ static func summary_text() -> String:
 	var scenes := []
 	walk("res://", "", scenes)
 	for s in scenes:
-		if s.get_extension() != "tscn":
+		if s.get_extension().to_lower() != "tscn":
 			continue
 		lines.append("  res://%s" % s)
 		lines.append_array(_scene_outline("res://" + s))

@@ -16,6 +16,7 @@ sealed class FakeEditor : IAsyncDisposable
     readonly BridgeServer? _server;
     readonly FakePlugin _plugin;
     readonly BridgeLink? _link;
+    readonly Func<string?, string?>? _exportState;
     readonly CancellationTokenSource _closing = new();
     readonly ConcurrentDictionary<string, TaskCompletionSource> _seen = new();
     readonly Task _answering;
@@ -31,9 +32,10 @@ sealed class FakeEditor : IAsyncDisposable
 
     public BridgeLink Link => _link ?? throw new InvalidOperationException("the brain this editor connected to is not the test's");
 
-    FakeEditor(BridgeServer? server, FakePlugin plugin, BridgeLink? link, string project)
+    FakeEditor(BridgeServer? server, FakePlugin plugin, BridgeLink? link, string project, Func<string?, string?>? exportState = null)
     {
         (_server, _plugin, _link, Project) = (server, plugin, link, project);
+        _exportState = exportState;
         _answering = AnswerAsync();
     }
 
@@ -48,16 +50,17 @@ sealed class FakeEditor : IAsyncDisposable
         File.WriteAllText(Path.Combine(PlaytestRun.ExportFolder(project), "summary.txt"), "");
     }
 
-    public static async Task<FakeEditor> StartAsync(Action<string>? prepare = null, bool exported = true)
+    public static async Task<FakeEditor> StartAsync(Action<string>? prepare = null, bool exported = true, string engine = "unity",
+        Func<string?, string?>? exportState = null)
     {
         var project = Directory.CreateTempSubdirectory("cluewren-project").FullName;
         if (exported)
             Export(project);
         prepare?.Invoke(project);
         var server = await BridgeServer.StartAsync(Secret, ProjectScope.Related(project));
-        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, project);
+        var plugin = await FakePlugin.ConnectAsync(server.Url, Secret, project, engine: engine);
         var link = await server.NextLinkAsync();
-        return new FakeEditor(server, plugin, link, project);
+        return new FakeEditor(server, plugin, link, project, exportState);
     }
 
     // The advert's pid is the test process's: the brain takes only an advert whose process is running.
@@ -96,11 +99,16 @@ sealed class FakeEditor : IAsyncDisposable
                 var result = op == "context"
                     ? new JsonObject { ["project_dir"] = Project, ["world"] = "Main", ["character"] = "" }
                     : new JsonObject();
+                var action = op == "session" ? frame["args"]?["action"]?.GetValue<string>() : null;
+                if (action is not null && _exportState?.Invoke(action) is { } state)
+                    result["export_state"] = state;
                 await _plugin.SendAsync(new JsonObject
                 {
                     ["type"] = "response", ["id"] = frame["id"]!.GetValue<long>(), ["ok"] = true, ["result"] = result, ["t"] = 1.0,
                 });
                 _seen.GetOrAdd(op, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
+                if (action is not null)
+                    _seen.GetOrAdd($"{op}:{action}", _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
             }
         }
         catch (Exception e) when (e is OperationCanceledException or WebSocketException)
@@ -142,6 +150,8 @@ public class PlaytestRunTests
             Assert.True(File.Exists(Path.Combine(run.RunFolder, file)), file);
         Assert.Equal("Open the gate", await File.ReadAllTextAsync(Path.Combine(run.RunFolder, "prompt.txt")));
         Assert.Contains(Path.Combine(run.RunFolder, "INSTRUCTIONS.md"), run.Opening);
+        Assert.True(Guid.TryParseExact(run.FrameRun, "N", out _));
+        Assert.Contains($"frame_run=\"{run.FrameRun}\"", await File.ReadAllTextAsync(Path.Combine(run.RunFolder, "INSTRUCTIONS.md")));
         Assert.Null(run.Ended);
     }
 
@@ -181,6 +191,64 @@ public class PlaytestRunTests
         await File.WriteAllTextAsync(Path.Combine(editor.Project, ".cluewren", "export", "summary.txt"), "");
         // Well inside the 90 s the run goes on waiting for an export that never comes.
         await using var run = await opening.WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
+    [Fact]
+    public async Task Unreal_waits_for_the_current_export_even_with_an_existing_summary()
+    {
+        var complete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var editor = await FakeEditor.StartAsync(engine: "unreal",
+            exportState: action => action == "status" && complete.Task.IsCompleted ? "ready" : "pending");
+        var opening = OpenAsync(editor, new RunRequest("Open the gate", "goal"));
+        await editor.Saw("session:status").WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(opening.IsCompleted);
+        var folder = PlaytestRun.ExportFolder(editor.Project);
+        await File.WriteAllTextAsync(Path.Combine(folder, "summary.txt"), "gate");
+        complete.SetResult();
+        await using var run = await opening.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains(".cluewren/export/summary.txt", run.Opening);
+        Assert.Contains(folder, await File.ReadAllTextAsync(Path.Combine(run.RunFolder, "INSTRUCTIONS.md")));
+    }
+
+    [Theory]
+    [InlineData("unavailable", true)]
+    [InlineData("ready", false)]
+    public async Task Unreal_omits_an_unusable_export_from_instructions_and_search(string state, bool summaryExists)
+    {
+        await using var editor = await FakeEditor.StartAsync(project =>
+        {
+            var export = Directory.CreateDirectory(PlaytestRun.ExportFolder(project));
+            File.WriteAllText(Path.Combine(export.FullName, "StaleGate.txt"), "gate");
+            var source = Directory.CreateDirectory(Path.Combine(project, "Source"));
+            File.WriteAllText(Path.Combine(source.FullName, "LiveGate.cpp"), "gate");
+        }, exported: summaryExists, engine: "unreal", exportState: action => action == "status" ? state : "pending");
+        await using var run = await OpenAsync(editor, new RunRequest("Open the gate", "goal")).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains("Source/LiveGate.cpp", run.Opening);
+        Assert.DoesNotContain("StaleGate.txt", run.Opening);
+        Assert.DoesNotContain(PlaytestRun.ExportFolder(editor.Project),
+            await File.ReadAllTextAsync(Path.Combine(run.RunFolder, "INSTRUCTIONS.md")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Older_Unreal_plugins_need_a_new_summary_write_to_supply_an_export(bool rewrite)
+    {
+        var old = DateTime.UtcNow.AddDays(-1);
+        string summary = "";
+        await using var editor = await FakeEditor.StartAsync(project =>
+        {
+            summary = Path.Combine(PlaytestRun.ExportFolder(project), "summary.txt");
+            File.WriteAllText(summary, "gate");
+            File.SetLastWriteTimeUtc(summary, old);
+        }, engine: "unreal", exportState: action =>
+        {
+            if (action == "start" && rewrite)
+                File.WriteAllText(summary, "gate");
+            return null;
+        });
+        await using var run = await OpenAsync(editor, new RunRequest("Open the gate", "goal")).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(rewrite, run.Opening.Contains(".cluewren/export/summary.txt", StringComparison.Ordinal));
     }
 
     [Fact]

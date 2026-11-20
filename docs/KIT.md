@@ -71,7 +71,7 @@ Inputs (the player's hands; the only way to act in play):
   (with the research helpers: Teleport, FightTrial, CallAny); in an episode only to set up a verification (e.g. take away
   what only gets in the way of testing). Every write is reported, an episode's apart from research's.
 - `await game.Restart(map: null)`: start the run's level over (the briefing's), or open a map (named as the engine's section
-  says). For a game that boots into a main menu, set the harness's `StartMap` to its gameplay level (from the export),
+  says). For a game that boots into a main menu, set the harness's `StartMap` to its gameplay level (from the level list in the briefing),
   or click through the menu in Setup (`game.Ui()`, `game.UiAct`).
 
 ## Controllers (the Control class): async methods, `await` them inside executors

@@ -108,7 +108,7 @@ MCP tool annotations say what the tools do: only `wait` and `frames` are read-on
 
 The `stop` tool ends the episode, check or probe still going where it is: the keys are let go and the game is paused; then call `wait` for what it gave until then. It and a client's cancellation (`notifications/cancelled`) act only on a call that plays: `probe`, `check_harness`, `run_harness`. For another call still going (`start_run`, for example), `stop` answers "<tool> is still going and can't be stopped: call wait."; for one that has already ended, "<tool> has ended: call wait for its result." A cancellation of the `wait` request stops the play it waits for. A stop that arrives while the call is still compiling or starting its child is kept, and the call answers "Stopped before it began."
 
-When an agent's subagent starts its own `cluewren mcp` in the same working folder (as Codex does for the frame describer), its `frames` call is answered by the process that has the run, through a named pipe only the current user can open, named after the folder's identity on disk (so two spellings of one folder reach the same run). Only `frames` goes this way; frames are never written to disk. If two agent sessions in the same folder each have a run, the second run's pipe name is taken, and its frames are reachable only inside its own process.
+When a subagent starts its own `cluewren mcp` in the same working folder, it passes the `frame_run` identifier from the generated `INSTRUCTIONS.md` example to `frames` along with the episode and game times. Each run has its own named pipe, which only the current user can open. The identifier selects the intended run, including when multiple runs share a folder; an absent or incorrect identifier cannot retrieve another run. Only `frames` uses this route; frames are never written to disk.
 
 ### Linux and macOS platform status
 
@@ -145,7 +145,6 @@ Additional residual risks:
 
 - Link limits (see "What is not guaranteed" above).
 - A local peer can delay an editor's connection (see "Which editor a run takes and how it is decided" above).
-- If two agent sessions in the same folder each have a run, the second run's frames are reachable only inside its own process (see "MCP tool annotations" above).
 - `connect claude` judges ownership from what `claude mcp get` displays (see "Agent setup and `cluewren connect`" above).
 - `connect codex` writes `config.toml` in place, not atomically, with no copy (see the same section above).
 - On systems other than Windows (unsupported) there is no container for harness code and no CPU or memory limit (see "Linux and macOS platform status" above).

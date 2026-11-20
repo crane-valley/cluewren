@@ -9,7 +9,7 @@ namespace Cluewren.Mcp;
 
 // Codex starts a `cluewren mcp` of its own for a subagent, and the frame describer is one: its `frames` call reaches a
 // process with no run. The process that has the run answers it over a pipe only this user can open, named after the
-// folder both were started in. Frames still never touch the disk.
+// folder both were started in and the run named in the describer's instructions.
 public sealed class FramesRelay : IAsyncDisposable
 {
     const int MaxRequestBytes = 64 * 1024;
@@ -19,21 +19,22 @@ public sealed class FramesRelay : IAsyncDisposable
     readonly CancellationTokenSource _closing = new();
     readonly Task _serving;
 
-    FramesRelay(string name, Func<JsonObject, Task<ToolResult>> frames) => _serving = ServeAsync(name, frames, _closing.Token);
+    FramesRelay(string workingFolder, string frameRun, Func<JsonObject, Task<ToolResult>> frames) =>
+        _serving = ServeAsync(NameFor(workingFolder, frameRun), frameRun, frames, _closing.Token);
 
     // By what the folder is, not how it is spelled: two processes may spell one folder differently, and two folders
     // may differ only in case.
-    public static string NameFor(string workingFolder)
+    public static string NameFor(string workingFolder, string frameRun)
     {
         var folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingFolder));
         var named = ProjectScope.KeyOf(folder) ?? folder.ToLowerInvariant();
-        return "cluewren-frames-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(named)))[..32];
+        return "cluewren-frames-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(named + "\n" + frameRun)))[..32];
     }
 
-    public static FramesRelay Serve(string workingFolder, Func<JsonObject, Task<ToolResult>> frames) =>
-        new(NameFor(workingFolder), frames);
+    public static FramesRelay Serve(string workingFolder, string frameRun, Func<JsonObject, Task<ToolResult>> frames) =>
+        new(workingFolder, frameRun, frames);
 
-    static async Task ServeAsync(string name, Func<JsonObject, Task<ToolResult>> frames, CancellationToken ct)
+    static async Task ServeAsync(string name, string frameRun, Func<JsonObject, Task<ToolResult>> frames, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
@@ -47,7 +48,8 @@ public sealed class FramesRelay : IAsyncDisposable
                 var line = await ReadLineAsync(pipe, MaxRequestBytes, limit.Token).ConfigureAwait(false);
                 var args = line is null ? null : JsonNode.Parse(line) as JsonObject;
                 // The run may be closing while this waits for it, and closing waits for this loop: the wait ends with it.
-                var result = args is null ? ToolResult.Say("Not a frames request.", true)
+                var result = args is null || RequestedRun(args) != frameRun
+                    ? ToolResult.Say("The requested frame_run does not match this run.", true)
                     : await frames(args).WaitAsync(limit.Token).ConfigureAwait(false);
                 var answer = new JsonObject
                 {
@@ -61,7 +63,6 @@ public sealed class FramesRelay : IAsyncDisposable
             {
                 return;
             }
-            // Another session's run in the same folder holds the name: this run's frames stay reachable in its own process.
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 try
@@ -79,11 +80,16 @@ public sealed class FramesRelay : IAsyncDisposable
         }
     }
 
+    public static string? RequestedRun(JsonObject args) =>
+        args["frame_run"] is JsonValue value && value.TryGetValue<string>(out var run) && Guid.TryParseExact(run, "N", out _) ? run : null;
+
     public static async Task<ToolResult?> AskAsync(string workingFolder, JsonObject args, CancellationToken ct)
     {
+        if (RequestedRun(args) is not { } frameRun)
+            return null;
         try
         {
-            await using var pipe = new NamedPipeClientStream(".", NameFor(workingFolder), PipeDirection.InOut,
+            await using var pipe = new NamedPipeClientStream(".", NameFor(workingFolder, frameRun), PipeDirection.InOut,
                 PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
             await pipe.ConnectAsync(ConnectPatience, ct).ConfigureAwait(false);
             using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
