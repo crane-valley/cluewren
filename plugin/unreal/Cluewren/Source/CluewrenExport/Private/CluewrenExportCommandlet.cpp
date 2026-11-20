@@ -137,7 +137,7 @@ int32 UCluewrenExportCommandlet::Main(const FString& Params)
 	{
 		IFileManager::Get().DeleteDirectory(*FPaths::Combine(OutDir, Sub), false, true);
 	}
-	for (const TCHAR* File : { TEXT("assets.txt"), TEXT("maps.txt"), TEXT("summary.txt") })
+	for (const TCHAR* File : { TEXT("assets.txt"), TEXT("maps.txt"), TEXT("summary.txt"), TEXT(".asset-fingerprint") })
 	{
 		IFileManager::Get().Delete(*FPaths::Combine(OutDir, File), false, true, true);
 	}

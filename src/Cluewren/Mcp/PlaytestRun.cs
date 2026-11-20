@@ -78,6 +78,8 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     public string RunId { get; }
 
+    public string FrameRun { get; } = Guid.NewGuid().ToString("N");
+
     public string RunFolder { get; }
 
     public string? Ended { get; private set; }
@@ -107,7 +109,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     public static async Task<PlaytestRun> OpenAsync(BridgeLink link, RunRequest request, IDecisionRelay jev, string client,
         SandboxMode sandbox, CancellationToken ct = default)
     {
-        var project = await StartGameAsync(link, request.Level, ct).ConfigureAwait(false);
+        var (project, exportState, previousSummary) = await StartSessionAsync(link, request.Level, ct).ConfigureAwait(false);
         MakeHome(project);
         var memory = MemoryFolder(project);
         var id = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
@@ -125,7 +127,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         var run = new PlaytestRun(link, request, host, recorder, project, memory, runFolder, id, client);
         try
         {
-            await run.PrepareAsync(ct).ConfigureAwait(false);
+            await run.PrepareAsync(exportState, previousSummary, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -138,19 +140,26 @@ public sealed partial class PlaytestRun : IAsyncDisposable
 
     // Godot answers context from the editor until its game runs, so the project is asked again once the game is up.
     // Nothing is written, filmed or announced before both answers name the folder the editor connected for.
-    public static async Task<string> StartGameAsync(BridgeLink link, string? level, CancellationToken ct)
+    public static async Task<string> StartGameAsync(BridgeLink link, string? level, CancellationToken ct) =>
+        (await StartSessionAsync(link, level, ct).ConfigureAwait(false)).Project;
+
+    static async Task<(string Project, string? ExportState, DateTime? PreviousSummary)> StartSessionAsync(
+        BridgeLink link, string? level, CancellationToken ct)
     {
         var project = link.Project ?? throw new InvalidOperationException("the editor connected without a verified project");
         var game = new Game(link);
         await ConfirmProjectAsync(game, project, ct).ConfigureAwait(false);
-        await game.Request("session", json =>
+        // Older Unreal plugins can leave an existing summary in place while checking or replacing the export.
+        var summary = Path.Combine(ExportFolder(project.Path), "summary.txt");
+        var previousSummary = link.Engine == Unreal.Id && File.Exists(summary) ? File.GetLastWriteTimeUtc(summary) : (DateTime?)null;
+        var start = await game.Request("session", json =>
         {
             json.WriteString("action", "start");
             if (!string.IsNullOrEmpty(level))
                 json.WriteString("map", level);
         }, 120, ct).ConfigureAwait(false);
         await ConfirmProjectAsync(game, project, ct).ConfigureAwait(false);
-        return project.Path;
+        return (project.Path, start["export_state"].Text, previousSummary);
     }
 
     static async Task ConfirmProjectAsync(Game game, VerifiedFolder project, CancellationToken ct)
@@ -163,21 +172,21 @@ public sealed partial class PlaytestRun : IAsyncDisposable
             throw new InvalidOperationException($"{project.Path} is no longer the folder the editor connected for");
     }
 
-    async Task PrepareAsync(CancellationToken ct)
+    async Task PrepareAsync(string? exportState, DateTime? previousSummary, CancellationToken ct)
     {
-        await WaitForExportAsync(ExportFolder(_project), ExportPatience, ct).ConfigureAwait(false);
+        var exportReady = await WaitForRunExportAsync(exportState, previousSummary, ct).ConfigureAwait(false);
         _link.Send(json => json.WriteString("type", "run_started"));
         await _recorder.FilmAsync(ct: ct).ConfigureAwait(false);
         var opening = await _host.OpeningAsync(ct).ConfigureAwait(false);
         var levels = await LevelBriefingAsync(ct).ConfigureAwait(false);
-        File.WriteAllText(Path.Combine(RunFolder, "INSTRUCTIONS.md"), InstructionsText(_link.Engine), Utf8);
+        File.WriteAllText(Path.Combine(RunFolder, "INSTRUCTIONS.md"), InstructionsText(_link.Engine, exportReady), Utf8);
         // Every run reads INSTRUCTIONS.md whole and pays for it again on each turn, so what only some requests need stays
         // out of it.
         foreach (var part in (string[])["KIT-PLAN.md", "KIT-FIGHT.md", "KIT-POINTER.md"])
             File.WriteAllText(Path.Combine(RunFolder, part), Resource(part), Utf8);
         File.WriteAllText(Path.Combine(RunFolder, "prompt.txt"), _request.Request, Utf8);
         var message = $"Request: {_request.Request}\n\nThe game: {_project}. This run's folder: {RunFolder}. Write "
-            + $"{Path.Combine(RunFolder, "harness.cs")}, run it, revise, then report.\n\n{Briefing(levels, opening)}\n\n{LookingNote()}";
+            + $"{Path.Combine(RunFolder, "harness.cs")}, run it, revise, then report.\n\n{Briefing(levels, opening, exportReady)}\n\n{LookingNote()}";
         File.WriteAllText(Path.Combine(RunFolder, "REQUEST.md"), message, Utf8);
         Opening = $"""
             Playtest run {RunId} started on {_project}: the game is open in the user's editor and paused between your calls.
@@ -188,18 +197,60 @@ public sealed partial class PlaytestRun : IAsyncDisposable
             """;
     }
 
-    // Unreal exports in a process of its own that starts as the editor connects, and a model that finds no export works
-    // blind from probes for the whole run. summary.txt is written last. Past the patience the run goes on without it:
-    // the export may be unable to start at all.
-    public static async Task WaitForExportAsync(string folder, TimeSpan patience, CancellationToken ct)
+    async Task<bool> WaitForRunExportAsync(string? state, DateTime? previousSummary, CancellationToken ct)
     {
-        var summary = Path.Combine(folder, "summary.txt");
-        var deadline = DateTimeOffset.UtcNow + patience;
-        while (!File.Exists(summary) && DateTimeOffset.UtcNow < deadline)
-            await Task.Delay(250, ct).ConfigureAwait(false);
+        var summary = Path.Combine(ExportFolder(_project), "summary.txt");
+        if (state is null)
+        {
+            if (previousSummary is { } timestamp && File.Exists(summary))
+                return File.GetLastWriteTimeUtc(summary) > timestamp;
+            return await WaitForSummaryAsync(summary, previousSummary, ExportPatience, ct).ConfigureAwait(false);
+        }
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ExportPatience);
+        try
+        {
+            while (state == "pending")
+            {
+                await Task.Delay(ExportPoll, deadline.Token).ConfigureAwait(false);
+                var status = await _host.Game.Request("session", json => json.WriteString("action", "status"),
+                    ExportPatience.TotalSeconds, deadline.Token).ConfigureAwait(false);
+                state = status["export_state"].Text;
+            }
+            ct.ThrowIfCancellationRequested();
+            return !deadline.IsCancellationRequested && state == "ready" && File.Exists(summary);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (GameException)
+        {
+            return false;
+        }
+    }
+
+    public static async Task WaitForExportAsync(string folder, TimeSpan patience, CancellationToken ct) =>
+        await WaitForSummaryAsync(Path.Combine(folder, "summary.txt"), null, patience, ct).ConfigureAwait(false);
+
+    static async Task<bool> WaitForSummaryAsync(string summary, DateTime? previousSummary, TimeSpan patience, CancellationToken ct)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (File.Exists(summary) && (previousSummary is null || File.GetLastWriteTimeUtc(summary) > previousSummary.Value))
+                return true;
+            var remaining = patience - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero)
+                return false;
+            await Task.Delay(remaining < ExportPoll ? remaining : ExportPoll, ct).ConfigureAwait(false);
+        }
     }
 
     static readonly TimeSpan ExportPatience = TimeSpan.FromSeconds(90);
+    static readonly TimeSpan ExportPoll = TimeSpan.FromMilliseconds(250);
 
     static readonly UTF8Encoding Utf8 = new(false);
 
@@ -219,17 +270,17 @@ public sealed partial class PlaytestRun : IAsyncDisposable
             "the project as text: summary.txt first, then scenes/, prefabs/, data/, scripts.txt, build_scenes.txt", "KIT-UNITY.md"),
         [Godot.Id] = ("scripts, scenes (.tscn) and resources (.tres) are text files in it",
             "summary.txt: the main scene, autoloads, input actions, classes and each scene's nodes", "KIT-GODOT.md"),
-        [Unreal.Id] = ("C++ is under Source/ and settings under Config/; Blueprints are binary, so read them in the export",
+        [Unreal.Id] = ("C++ is under Source/ and settings under Config/",
             "the project as text: summary.txt first, then blueprints/, input/, data/, assets.txt, maps.txt", "KIT-UNREAL.md"),
     };
 
-    string InstructionsText(string engine) => Resource("Instructions.md")
+    string InstructionsText(string engine, bool exportReady) => Resource("Instructions.md")
         .Replace("{engine}", CultureInfo.InvariantCulture.TextInfo.ToTitleCase(engine))
         .Replace("{code_folders}", EngineTexts[engine].Code)
-        .Replace("{export}", ExportFolder(_project))
-        .Replace("{export_contents}", EngineTexts[engine].Contents)
+        .Replace("{export_section}", exportReady ? $"  {ExportFolder(_project)}/\n                {EngineTexts[engine].Contents}\n" : "")
         .Replace("{project}", _project).Replace("{memory}", _memory).Replace("{runs}", RunsFolder(_project))
         .Replace("{run}", RunFolder)
+        .Replace("{frame_run}", FrameRun)
         .Replace("{probe_seconds}", ProbeSeconds.ToString(CultureInfo.InvariantCulture))
         .Replace("{research_minutes}", (ResearchSeconds / 60).ToString(CultureInfo.InvariantCulture))
         .Replace("{min_decisions}", MinDecisions.ToString(CultureInfo.InvariantCulture))
@@ -287,7 +338,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
     // What lib.cs and a reused harness were written against: without the commit a build carries after the plus.
     public static string KitVersion { get; } = BridgeServer.Version.Split('+')[0];
 
-    string Briefing(string? levels, string opening)
+    string Briefing(string? levels, string opening, bool exportReady)
     {
         var parts = new List<string>();
         if (levels is not null)
@@ -307,7 +358,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (runs.Count > 0)
             parts.Add("## Earlier runs (each folder keeps its harness versions, traces and report; use_harness copies one's harness here)\n"
                 + string.Join("\n", runs.TakeLast(BriefRuns)));
-        var hits = WordHits(_project, _link.Engine, _request.Request);
+        var hits = WordHits(_project, _link.Engine, _request.Request, exportReady);
         if (hits is not null)
             parts.Add("## Where the request's words appear in the project (files, with how often)\n" + string.Join("\n", hits));
         parts.Add($"## The live game now (looked at just before you started; it is paused)\n{opening}");
@@ -376,12 +427,13 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         return count;
     }
 
-    public static IEnumerable<string> SearchedFiles(string project, string engine) =>
-        engine == Godot.Id ? GodotFiles(project) : engine == Unreal.Id ? UnrealFiles(project) : UnityFiles(project);
+    public static IEnumerable<string> SearchedFiles(string project, string engine, bool includeExport = true) =>
+        engine == Godot.Id ? GodotFiles(project) : engine == Unreal.Id ? UnrealFiles(project, includeExport) : UnityFiles(project, includeExport);
 
-    static IEnumerable<string> UnrealFiles(string project)
+    static IEnumerable<string> UnrealFiles(string project, bool includeExport)
     {
-        foreach (var folder in new[] { Path.Combine(project, "Source"), ExportFolder(project) }.Where(Directory.Exists))
+        var folders = new[] { Path.Combine(project, "Source") };
+        foreach (var folder in (includeExport ? folders.Append(ExportFolder(project)) : folders).Where(Directory.Exists))
             foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
                 if (UnrealText.Contains(Path.GetExtension(file)))
                     yield return file;
@@ -398,17 +450,17 @@ public sealed partial class PlaytestRun : IAsyncDisposable
                     yield return file;
     }
 
-    static IEnumerable<string> UnityFiles(string project)
+    static IEnumerable<string> UnityFiles(string project, bool includeExport)
     {
-        var folders = new[] { Path.Combine(project, "Assets") }
-            .Concat(SearchedExport.Select(name => Path.Combine(ExportFolder(project), name)));
-        foreach (var folder in folders.Where(Directory.Exists))
+        var folders = new[] { Path.Combine(project, "Assets") };
+        var export = SearchedExport.Select(name => Path.Combine(ExportFolder(project), name));
+        foreach (var folder in (includeExport ? folders.Concat(export) : folders).Where(Directory.Exists))
             foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
                 if (file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
                     yield return file;
     }
 
-    public static List<string>? WordHits(string project, string engine, string prompt)
+    public static List<string>? WordHits(string project, string engine, string prompt, bool includeExport = true)
     {
         var words = new List<string>();
         foreach (Match match in Words().Matches(prompt))
@@ -422,7 +474,7 @@ public sealed partial class PlaytestRun : IAsyncDisposable
         if (words.Count == 0)
             return null;
         var files = new List<(string Rel, Dictionary<string, int> Hits, string Name)>();
-        foreach (var file in SearchedFiles(project, engine))
+        foreach (var file in SearchedFiles(project, engine, includeExport))
         {
             try
             {

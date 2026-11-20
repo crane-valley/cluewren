@@ -536,9 +536,6 @@ void UPlaytestSubsystem::HandleWelcome(const TSharedPtr<FJsonObject>& Message)
 		bRunActive = false;
 		PendingOps.Reset();
 		Detectors->Reset();
-#if WITH_EDITOR
-		PlaytestExport::Refresh();
-#endif
 	}
 	bConnected = true;
 	LastHeartbeat = 0;

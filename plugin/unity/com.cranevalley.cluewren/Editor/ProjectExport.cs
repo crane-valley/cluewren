@@ -35,6 +35,9 @@ namespace Cluewren.Editor
         const int MaxFileChars = 2 * 1024 * 1024;
         const int MaxArray = 32;
         const int MaxDepth = 4;
+        const string AssetInventory = ".assets";
+        const string EditInventory = "edit\n";
+        const string PlayInventory = "play\n";
 
         /// <summary>-executeMethod Cluewren.Editor.ProjectExport.Run</summary>
         public static void Run()
@@ -54,13 +57,22 @@ namespace Cluewren.Editor
         /// <summary>Why the export should run ("missing", "stale"), or null when it is up to date.</summary>
         public static string Needed(string project)
         {
-            var summary = Path.Combine(Folder(project), "summary.txt");
-            if (!File.Exists(summary)) return "missing";
-            return Newer(Path.Combine(project, "Assets"), File.GetLastWriteTimeUtc(summary)) ? "stale" : null;
+            var folder = Folder(project);
+            if (!File.Exists(Path.Combine(folder, "summary.txt"))) return "missing";
+            var inventory = Path.Combine(folder, AssetInventory);
+            if (!File.Exists(inventory)) return "stale";
+            var saved = File.ReadAllText(inventory);
+            var current = CurrentAssets(project);
+            if (saved == EditInventory + current) return null;
+            // A live export skips unloaded scenes. Refresh them once edit mode can read their assets.
+            return EditorApplication.isPlayingOrWillChangePlaymode && saved == PlayInventory + current ? null : "stale";
         }
 
         const string OwnPackage = "com.cranevalley.cluewren";
-        static readonly string[] AssetExtensions = { ".unity", ".prefab", ".asset", ".inputactions", ".controller", ".overrideController", ".mat", ".uxml", ".uss" };
+        static readonly HashSet<string> AssetExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".unity", ".prefab", ".asset", ".inputactions", ".controller", ".overrideController", ".mat", ".uxml", ".uss", ".cs"
+        };
 
         static bool SkippedDir(string name)
         {
@@ -71,25 +83,21 @@ namespace Cluewren.Editor
                    || name.EndsWith("~", StringComparison.Ordinal) || name.Equals(OwnPackage, StringComparison.OrdinalIgnoreCase);
         }
 
-        static bool Newer(string dir, DateTime than)
+        static IEnumerable<string> AssetFiles(string dir)
         {
-            try
-            {
-                foreach (var f in Directory.GetFiles(dir))
-                {
-                    var ext = Path.GetExtension(f);
-                    if (AssetExtensions.Any(e => e.Equals(ext, StringComparison.OrdinalIgnoreCase)) && File.GetLastWriteTimeUtc(f) > than)
-                        return true;
-                }
-                foreach (var d in Directory.GetDirectories(dir))
-                    if (!SkippedDir(Path.GetFileName(d)) && Newer(d, than))
-                        return true;
-            }
-            catch
-            {
-                // (unreadable: not newer)
-            }
-            return false;
+            foreach (var file in Directory.EnumerateFiles(dir))
+                if (AssetExtensions.Contains(Path.GetExtension(file))) yield return file;
+            foreach (var child in Directory.EnumerateDirectories(dir))
+                if (!SkippedDir(Path.GetFileName(child)))
+                    foreach (var file in AssetFiles(child)) yield return file;
+        }
+
+        static string CurrentAssets(string project)
+        {
+            var root = Path.Combine(project, "Assets");
+            if (!Directory.Exists(root)) return "";
+            return string.Join("\n", AssetFiles(root).OrderBy(path => path, StringComparer.Ordinal)
+                .Select(path => path.Substring(root.Length + 1) + "\t" + File.GetLastWriteTimeUtc(path).Ticks));
         }
 
         public static string Folder(string project) => Path.Combine(project, Paths.DataFolder, "export");
@@ -115,6 +123,7 @@ namespace Cluewren.Editor
             var dir = MakeFolder(project);
             var summaryPath = Path.Combine(dir, "summary.txt");
             if (File.Exists(summaryPath)) File.Delete(summaryPath);
+            var inventory = CurrentAssets(project);
             var counts = new Dictionary<string, int>();
             var playing = EditorApplication.isPlayingOrWillChangePlaymode;
 
@@ -122,6 +131,12 @@ namespace Cluewren.Editor
             var scenesDir = Path.Combine(dir, "scenes");
             if (!playing && Directory.Exists(scenesDir)) Directory.Delete(scenesDir, true);
             var scenePaths = AssetDatabase.FindAssets("t:Scene", new[] { "Assets" }).Select(AssetDatabase.GUIDToAssetPath).OrderBy(p => p, StringComparer.Ordinal).ToList();
+            if (playing && Directory.Exists(scenesDir))
+            {
+                var sceneExports = new HashSet<string>(scenePaths.Select(path => Strip(path) + ".txt"), StringComparer.Ordinal);
+                foreach (var file in Directory.EnumerateFiles(scenesDir, "*.txt", SearchOption.AllDirectories))
+                    if (!sceneExports.Contains(file.Substring(scenesDir.Length + 1).Replace('\\', '/'))) File.Delete(file);
+            }
             var n = 0;
             foreach (var path in scenePaths)
             {
@@ -132,7 +147,7 @@ namespace Cluewren.Editor
                     if (playing) continue;
                     try
                     {
-                        scene = EditorSceneManager.OpenScene(path, OpenSceneMode.Additive);
+                        scene = EditorSceneManager.OpenPreviewScene(path);
                         opened = true;
                     }
                     catch (Exception e)
@@ -156,7 +171,7 @@ namespace Cluewren.Editor
                 }
                 finally
                 {
-                    if (opened) EditorSceneManager.CloseScene(scene, true);
+                    if (opened) EditorSceneManager.ClosePreviewScene(scene);
                 }
             }
             counts["scenes"] = n;
@@ -246,6 +261,7 @@ namespace Cluewren.Editor
             summary.AppendLine("components as <object path>|<Type>. Values in Unity's frame: x right, y up, z forward, metres;");
             summary.AppendLine("eulerAngles in degrees (y turns right, x tilts down).");
             summary.AppendLine($"exported: {DateTime.Now:yyyy-MM-dd HH:mm:ss} in {(DateTime.Now - started).TotalSeconds:0.0} s{(playing ? " (in play mode: scenes not loaded kept from the last export)" : "")}");
+            File.WriteAllText(Path.Combine(dir, AssetInventory), (playing ? PlayInventory : EditInventory) + inventory, new UTF8Encoding(false));
             File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(false));
         }
 

@@ -12,16 +12,15 @@
 // -CluewrenConnect on a batch-mode editor does the same.
 
 using System.Collections.Generic;
-using System.Linq;
 using UnityEditor;
-using UnityEditor.SceneManagement;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace Cluewren.Editor
 {
     public static class Headless
     {
+        internal const string SceneKey = "Cluewren.HeadlessScene";
+
         public static void Run()
         {
             Start();
@@ -52,17 +51,9 @@ namespace Cluewren.Editor
             {
                 Debug.LogWarning("[Cluewren] The project index export failed: " + e.Message);
             }
-            if (!string.IsNullOrEmpty(map))
-            {
-                var path = EditorHost.ScenePath(map);
-                if (path != null) EditorSceneManager.OpenScene(path, OpenSceneMode.Single);
-                else Debug.LogWarning($"[Cluewren] No scene {map}");
-            }
-            else if (string.IsNullOrEmpty(SceneManager.GetActiveScene().path))
-            {
-                var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
-                if (first != null) EditorSceneManager.OpenScene(first.path, OpenSceneMode.Single);
-            }
+            var path = EditorHost.ScenePath(map);
+            if (!string.IsNullOrEmpty(map) && path == null) Debug.LogWarning($"[Cluewren] No scene {map}");
+            if (path != null) SessionState.SetString(SceneKey, path);
             if (PlaytestClient.Flag("CluewrenEditMode"))
             {
                 // Connect now, in edit mode, as an editor with its window does: the brain enters play mode (session start)
@@ -70,6 +61,12 @@ namespace Cluewren.Editor
                 client.ExitOnFailure = true;
                 client.ConnectTimeout = PlaytestClient.CommandLineConnectTimeout();
                 client.Connect();
+                return;
+            }
+            if (!EditorHost.PrepareStartScene(path))
+            {
+                Debug.LogError($"[Cluewren] Couldn't start Play mode in {path}");
+                EditorHost.Instance.Exit(1);
                 return;
             }
             // The client connects after the scripts reload for play mode (EditorHost.Restore); the wait for the brain's

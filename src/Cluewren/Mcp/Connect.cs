@@ -14,10 +14,10 @@ public sealed partial class Connect(Action<string> say, Func<string[], (int? Cod
     const string ClaudeDescriber = "frame-describer";
     const string CodexDescriber = "frame_describer";
     const string DescriberAbout = "Describes frames of a Cluewren episode (the cluewren `frames` tool) for an agent checking how "
-        + "something in a game looks. Give it only the episode, the game times and open questions: never the claim, the request or what you "
+        + "something in a game looks. Give it only the frame_run, episode, game times and open questions: never the claim, the request or what you "
         + "expect to see.";
-    const string DescriberHow = "You are given an episode, game times and open questions. Call the cluewren `frames` tool with that "
-        + "episode, start, end and count, then describe the frames you get, answering each question by its number from the frames alone. If "
+    const string DescriberHow = "You are given a frame_run, an episode, game times and open questions. Call the cluewren `frames` tool with that "
+        + "frame_run, episode, start, end and count, then describe the frames you get, answering each question by its number from the frames alone. If "
         + "`frames` gives no pictures, say what it said instead and stop.";
     const string DescriberSystem = """
         You describe frames of a video game for someone who can't see them. You are not told what they are

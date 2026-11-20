@@ -485,18 +485,37 @@ func context() -> Dictionary:
 
 func session(id, args: Dictionary):
 	var action := str(args.get("action", "status"))
-	if action != "restart":
+	var map := str(args.get("map", ""))
+	if action != "restart" and (action != "start" or map == ""):
 		return [true, {"running": get_tree().current_scene != null}]
 	var target := ""
-	var refused := Export.refused_scene(str(args.get("map", "")))
+	var refused := Export.refused_scene(map)
 	if refused != "":
 		return [false, refused, 403]
-	if str(args.get("map", "")) != "":
-		target = Export.find_scene(str(args.map))
+	if map != "":
+		target = Export.find_scene(map)
 		if target == "":
-			return [false, "No scene %s" % args.map, 404]
+			return [false, "No scene %s" % map, 404]
 	else:
 		target = _launch_scene if _launch_scene != "" else _scene_path()
+	if action == "start":
+		var started := _now()
+		_pending.append({"id": id, "op": "session", "tick": func(now: float) -> bool:
+			if get_tree().current_scene != null:
+				var current := _scene_path()
+				if current != "" and Export.resolved(current) == Export.resolved(target):
+					respond(id, {"running": true})
+				else:
+					var playing := current if current != "" else "a scene without a file"
+					var message := "The game is running %s." % playing
+					message += " Stop the game and retry start_run with level %s, or launch the standalone game in that scene." % target
+					respond_error(id, message, 409)
+				return true
+			if now - started > 30.0:
+				respond_error(id, "Timed out waiting for the game to open %s" % target, 500)
+				return true
+			return false})
+		return null
 	if target == "":
 		return [false, "No scene to restart"]
 	refused = Export.refused_scene(target)

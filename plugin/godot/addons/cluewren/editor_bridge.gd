@@ -336,6 +336,10 @@ func _play(scene: String) -> void:
 		EditorInterface.play_custom_scene(scene)
 
 
+func _is_playing_scene() -> bool:
+	return EditorInterface.is_playing_scene()
+
+
 func _write_summary() -> void:
 	if _summary_written():
 		_summary_task = WorkerThreadPool.add_task(_export, false, "Cluewren export")
@@ -373,13 +377,10 @@ func _session(id, args: Dictionary, text: String) -> void:
 	match action:
 		"start":
 			_write_summary()
-			if _game_ready:
-				_wait_ready(id)
-				return
-			if not EditorInterface.is_playing_scene():
+			if not _game_ready and not _is_playing_scene():
 				_play(scene)
 				_last_played = scene  # (what a restart without a map plays again)
-			_wait_ready(id)
+			_wait_ready(id, scene, text)
 		"stop":
 			if not EditorInterface.is_playing_scene():
 				_respond(id, {"running": false})
@@ -437,14 +438,19 @@ func _session(id, args: Dictionary, text: String) -> void:
 			_respond(id, {"running": _game_ready})
 
 
-func _wait_ready(id) -> void:
+func _wait_ready(id, scene: String, text: String) -> void:
 	var started := _now()
 	_pending.append({"tick": func(now: float) -> bool:
 		if _game_ready and _summary_written():
-			_respond(id, {"running": true})
-			return true
+			if scene == "":
+				_respond(id, {"running": true})
+				return true
+			# The game may have changed scenes after launch; only it can confirm what is running.
+			if _forward(id, text):
+				return true
 		if now - started > SESSION_TIMEOUT:
-			_respond_error(id, "Timed out waiting for the play session", 500)
+			var waiting_for := "the play session" if scene == "" else "%s to open in the play session" % scene
+			_respond_error(id, "Timed out waiting for %s" % waiting_for, 500)
 			return true
 		return false})
 

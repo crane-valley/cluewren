@@ -12,9 +12,7 @@ and from what you see it do.
 The folders:
   {project}
                 the game's project: {code_folders}, and it is read-only for you
-  {export}/
-                {export_contents}
-  {memory}/notes.md
+{export_section}  {memory}/notes.md
                 what earlier requests on this game learned (verified facts, controls, pitfalls), if any
   {memory}/lib.cs
                 harness code earlier requests found reusable for this game, compiled with every harness, if any
@@ -152,7 +150,7 @@ A describer subagent of yours looks: hand it the moment, it looks at the episode
 your open questions. Don't call `frames` yourself: reading frames while you know what you hope to see colours what you see.
 Brief it with this, filled in, and nothing else (never the request, the claim, the harness or what you expect):
 
-    Call the cluewren tool `frames` with episode=<n>, start=<game time>, end=<game time>, count=<up to {max_frames}>.
+    Call the cluewren tool `frames` with frame_run="{frame_run}", episode=<n>, start=<game time>, end=<game time>, count=<up to {max_frames}>.
     Then describe the frames.
     Questions:
     1. <an open question: what moves and how, what is at a spot, what the text says; never yes/no>

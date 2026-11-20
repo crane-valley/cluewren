@@ -4,6 +4,7 @@
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "Engine/World.h"
+#include "Misc/AutomationTest.h"
 #include "Modules/ModuleManager.h"
 #include "PlayInEditorDataTypes.h"
 #include "PlaytestLevels.h"
@@ -18,12 +19,17 @@ namespace
 		return GEditor && GEditor->PlayWorld != nullptr;
 	}
 
+	const UWorld* PlayedWorld()
+	{
+		const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
+		return Bridge ? Bridge->GetGameWorld() : nullptr;
+	}
+
 	/** Play In Editor is up with a world to play in: the player's (a client of a dedicated server joins it after the
 	 *  server's world has begun play). */
 	bool PieReady()
 	{
-		const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
-		const UWorld* World = Bridge ? Bridge->GetGameWorld() : nullptr;
+		const UWorld* World = PlayedWorld();
 		return GEditor && GEditor->PlayWorld && World && World->HasBegunPlay();
 	}
 
@@ -62,6 +68,12 @@ namespace
 		}));
 	}
 
+	FString LevelMismatch(const FString& Requested, const FString& Playing)
+	{
+		return Requested.IsEmpty() || Requested.Equals(Playing, ESearchCase::IgnoreCase) ? FString()
+			: FString::Printf(TEXT("Play In Editor is running %s. Stop it and start a new run in %s"), *Playing, *Requested);
+	}
+
 	/** Play In Editor, in the level Map when given (else the one open in the editor). Another level plays through
 	 *  the play session's map override, as Movie Render Queue's PIE renders do: the editor keeps its own level open,
 	 *  unsaved changes and all. */
@@ -69,17 +81,22 @@ namespace
 	{
 		if (PieReady())
 		{
-			Done(true, FString());
+			Done(true, LevelMismatch(Map, PlaytestLevels::PackageOf(PlayedWorld())));
 			return;
 		}
-		FString Package, Error;
-		if (!Map.IsEmpty() && !PlaytestLevels::Resolve(Map, Package, Error))
-		{
-			Done(PieRunning(), Error);
-			return;
-		}
+		FString Package = Map;
 		if (!PieRunning() && !GEditor->IsPlaySessionRequestQueued())
 		{
+			const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
+			if (Package.IsEmpty() && Bridge && !Bridge->GetStartMap().IsEmpty())
+			{
+				FString Error;
+				if (!PlaytestLevels::Resolve(Bridge->GetStartMap(), Package, Error))
+				{
+					Done(false, Error);
+					return;
+				}
+			}
 			FRequestPlaySessionParams Params;
 			if (!Package.IsEmpty() && Package != PlaytestLevels::EditorLevel())  // (the open one plays as it is, unsaved)
 			{
@@ -87,7 +104,10 @@ namespace
 			}
 			GEditor->RequestPlaySession(Params);
 		}
-		WaitFor(&PieReady, [Done](const FString& Error) { Done(PieRunning(), Error); });
+		WaitFor(&PieReady, [Done, Package](const FString& Error)
+		{
+			Done(PieRunning(), Error.IsEmpty() ? LevelMismatch(Package, PlaytestLevels::PackageOf(PlayedWorld())) : Error);
+		});
 	}
 
 	void StopPie(TFunction<void(bool, const FString&)> Done)
@@ -140,6 +160,22 @@ namespace
 		}
 	}
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCluewrenRunningLevelTest, "Cluewren.Session.RunningLevel",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCluewrenRunningLevelTest::RunTest(const FString& Parameters)
+{
+	const FString Playing = TEXT("/Game/Maps/Current");
+	TestTrue(TEXT("A start without a level can use the running level"), LevelMismatch(FString(), Playing).IsEmpty());
+	TestTrue(TEXT("The running level is matched by package name"), LevelMismatch(TEXT("/game/maps/current"), Playing).IsEmpty());
+	const FString Requested = TEXT("/Game/Other/Current");
+	const FString Error = LevelMismatch(Requested, Playing);
+	TestTrue(TEXT("A different package with the same level name is refused"), Error.Contains(Requested) && Error.Contains(Playing));
+	return true;
+}
+#endif
 
 class FCluewrenEditorModule : public IModuleInterface
 {

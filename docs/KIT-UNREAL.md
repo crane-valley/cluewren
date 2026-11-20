@@ -20,21 +20,16 @@ collection: its `bActorIsBeingDestroyed` says it is gone.
 The player. `await game.Pawn()` is the possessed pawn and `await game.Controller()` its controller.
 `(await game.Pose()).At` is the pawn's location, the eye the camera manager's. `Movement(game)` reads CharacterMovement and
 the capsule: `MaxWalkSpeed`, `JumpZVelocity`, `MaxStepHeight`, `AirControl`, the gravity, the half height. A pawn without
-them gives nulls: read its Blueprint in the export.
+them gives nulls. Use `game.Describe` to inspect the pawn.
 
 Input. FKey names (`W`, `SpaceBar`, `E`, `LeftShift`, `Escape`, `One`, `LeftMouseButton`, `MouseX`...) or an Enhanced Input
 action path (`game.Press("/Game/Input/IA_Jump.IA_Jump")`, a value optional). `(await game.Context())["controls"]` lists the
-actions mapped for the player now, with their keys; the export's `input/` has the mapping contexts. Pointing and clicking
+actions mapped for the player now, with their keys. Pointing and clicking
 is in KIT-POINTER.md: `pointer` puts the mouse there and a key click reaches the game; widgets under it take `game.UiAct`.
 `pointer` needs a rendered window.
 
 Sessions. In the editor the session is Play In Editor. `game.Restart()` starts the run's level over, and
 `game.Restart(map: "/Game/Maps/Level")` opens a map. A game that boots into a main menu: set the harness's `StartMap` to
-its gameplay level (from the export's maps.txt), or click through the menu in Setup with `game.Ui()` and `game.UiAct`.
+its gameplay level from the briefing, or click through the menu in Setup with `game.Ui()` and `game.UiAct`.
 
 UI. `game.Screen()` keys texts `<UserWidget>.<TextBlock>` (UMG). `game.Ui()` lists its buttons, sliders and the like.
-
-The export. `.cluewren/export` holds the project as text: `summary.txt`, `blueprints/` as pseudo-code (variables,
-components, defaults, graphs), `input/`, `data/` (data tables, data assets, enums, structs), `assets.txt` and `maps.txt`.
-C++ is under `Source/`, settings under `Config/`. It is made in the background when a session starts, so it can arrive
-after the run does.

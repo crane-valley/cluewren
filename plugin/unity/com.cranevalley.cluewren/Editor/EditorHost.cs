@@ -27,9 +27,7 @@ namespace Cluewren.Editor
     {
         const string StateKey = "Cluewren.Client";
         const string PendingKey = "Cluewren.PendingSessions";
-        // Play mode started in a scene of the brain's (playModeStartScene): set back once play mode ends, so the
-        // editor's own Play plays the open scene again. And the scene open in the editor while it plays
-        const string StartSceneKey = "Cluewren.StartSceneSet";
+        const string StartSceneKey = "Cluewren.PreviousStartScene";
         const string EditSceneKey = "Cluewren.EditScene";
         public const string HeadlessKey = "Cluewren.Headless";
         const string DisconnectedKey = "Cluewren.Disconnected";
@@ -46,6 +44,7 @@ namespace Cluewren.Editor
         {
             public long Id;
             public string Action;  // start | stop | fresh
+            public string Map;
             public int Stage;
             public double Since;
         }
@@ -60,6 +59,7 @@ namespace Cluewren.Editor
             EditorApplication.playModeStateChanged += OnPlayMode;
             EditorApplication.quitting += () =>
             {
+                RestoreStartScene();
                 Discovery.Withdraw();
                 Client?.Shutdown();
             };
@@ -177,6 +177,7 @@ namespace Cluewren.Editor
                             {
                                 Id = (long)Json.Num(w, "id", 0),
                                 Action = Json.Str(w, "action"),
+                                Map = Json.Str(w, "map"),
                                 Stage = (int)Json.Num(w, "stage", 0),
                                 Since = Json.Num(w, "since", EditorApplication.timeSinceStartup),
                             });
@@ -208,7 +209,7 @@ namespace Cluewren.Editor
                 SessionState.SetString(StateKey, Json.Write(state));
                 SessionState.SetString(PendingKey, Json.Write(waits.Select(w => (object)new Dictionary<string, object>
                 {
-                    ["id"] = w.Id, ["action"] = w.Action, ["stage"] = w.Stage, ["since"] = w.Since,
+                    ["id"] = w.Id, ["action"] = w.Action, ["map"] = w.Map, ["stage"] = w.Stage, ["since"] = w.Since,
                 }).ToList()));
             }
             Client.CloseForReload();
@@ -217,15 +218,11 @@ namespace Cluewren.Editor
         static void OnPlayMode(PlayModeStateChange change)
         {
             if (change == PlayModeStateChange.EnteredPlayMode || change == PlayModeStateChange.ExitingEditMode) playFrames = 0;
-            if (change == PlayModeStateChange.ExitingEditMode) SessionState.SetString(EditSceneKey, OpenScene());
+            if (change == PlayModeStateChange.ExitingEditMode) SessionState.SetString(EditSceneKey, SceneManager.GetActiveScene().path ?? "");
             if (change == PlayModeStateChange.EnteredEditMode)
             {
                 Ops.ResetSession();
-                if (SessionState.GetBool(StartSceneKey, false))
-                {
-                    EditorSceneManager.playModeStartScene = null;
-                    SessionState.EraseBool(StartSceneKey);
-                }
+                RestoreStartScene();
             }
             // (a project that doesn't reload scripts for play mode: no reload restores the waiting connection)
             if (change == PlayModeStateChange.EnteredPlayMode && Client == null && !string.IsNullOrEmpty(SessionState.GetString(StateKey, "")))
@@ -267,13 +264,13 @@ namespace Cluewren.Editor
             foreach (var w in waits.ToList())
             {
                 var done = false;
-                var playing = EditorApplication.isPlaying && !EditorApplication.isCompiling;
+                var playing = EditorApplication.isPlaying && EditorApplication.isPlayingOrWillChangePlaymode && !EditorApplication.isCompiling;
                 switch (w.Action)
                 {
                     case "start":
                         if (playing && playFrames >= 3 && SceneManager.GetActiveScene().isLoaded)
                         {
-                            client.Respond(w.Id, new Dictionary<string, object> { ["running"] = true, ["scene"] = SceneManager.GetActiveScene().path });
+                            RespondStarted(client, w.Id, w.Map);
                             done = true;
                         }
                         break;
@@ -288,17 +285,18 @@ namespace Cluewren.Editor
                         if (w.Stage == 0 && !EditorApplication.isPlayingOrWillChangePlaymode)
                         {
                             w.Stage = 1;
-                            EditorApplication.EnterPlaymode();
+                            done = !EnterPlayMode(client, w.Id, w.Map);
                         }
-                        else if (w.Stage == 1 && playing && playFrames >= 3)
+                        else if (w.Stage == 1 && playing && playFrames >= 3 && SceneManager.GetActiveScene().isLoaded)
                         {
-                            client.Respond(w.Id, new Dictionary<string, object> { ["running"] = true, ["scene"] = SceneManager.GetActiveScene().path });
+                            RespondStarted(client, w.Id, w.Map);
                             done = true;
                         }
                         break;
                 }
                 if (!done && now - w.Since > 90)
                 {
+                    if (!EditorApplication.isPlayingOrWillChangePlaymode) RestoreStartScene();
                     client.RespondError(w.Id, $"Timed out: session {w.Action}", 500);
                     done = true;
                 }
@@ -321,28 +319,32 @@ namespace Cluewren.Editor
         public bool Session(PlaytestClient client, long id, string action, Dictionary<string, object> args)
         {
             var map = Json.Str(args, "map");
+            string path = null;
             if (!string.IsNullOrEmpty(map) && action != "stop")
             {
                 // Before anything changes, and before the 404: what is in .cluewren is not told apart from what isn't.
                 if (Ops.RefusesScene(client, id, map)) return true;
-                var scene = MapScene(map);
-                if (scene == null)
+                path = MapScene(map);
+                if (path == null)
                 {
                     Ops.NoScene(client, id, map);
                     return true;
                 }
-                if (Ops.RefusesScene(client, id, scene)) return true;
+                if (Ops.RefusesScene(client, id, path)) return true;
             }
             switch (action)
             {
                 case "start":
                     if (EditorApplication.isPlaying)
                     {
-                        client.Respond(id, new Dictionary<string, object> { ["running"] = true });
+                        if (EditorApplication.isPlayingOrWillChangePlaymode)
+                            RespondStarted(client, id, path, refreshExport: true);
+                        else
+                            client.RespondError(id, "Wait for Unity to return to Edit mode, then start the session again.", 409);
                         return true;
                     }
-                    EnterPlayMode(client, map);
-                    waits.Add(new SessionWait { Id = id, Action = "start", Since = EditorApplication.timeSinceStartup });
+                    if (EnterPlayMode(client, id, path))
+                        waits.Add(new SessionWait { Id = id, Action = "start", Map = path, Since = EditorApplication.timeSinceStartup });
                     return true;
                 case "stop":
                     if (!EditorApplication.isPlaying)
@@ -357,17 +359,16 @@ namespace Cluewren.Editor
                 case "restart":
                     if (!EditorApplication.isPlaying)
                     {
-                        EnterPlayMode(client, map);
-                        waits.Add(new SessionWait { Id = id, Action = "start", Since = EditorApplication.timeSinceStartup });
+                        if (EnterPlayMode(client, id, path))
+                            waits.Add(new SessionWait { Id = id, Action = "start", Map = path, Since = EditorApplication.timeSinceStartup });
                         return true;
                     }
                     if (Json.Bool(args, "fresh", false))
                     {
                         // Out of play mode and in again: everything starts over (static state too, when scripts reload)
                         Hands.ReleaseAll();
-                        if (!string.IsNullOrEmpty(map)) SetStartScene(map);
                         EditorApplication.ExitPlaymode();
-                        waits.Add(new SessionWait { Id = id, Action = "fresh", Since = EditorApplication.timeSinceStartup });
+                        waits.Add(new SessionWait { Id = id, Action = "fresh", Map = path, Since = EditorApplication.timeSinceStartup });
                         return true;
                     }
                     Ops.Restart(client, id, map);
@@ -376,9 +377,20 @@ namespace Cluewren.Editor
             return false;
         }
 
-        static void EnterPlayMode(PlaytestClient client, string map)
+        static void RespondStarted(PlaytestClient client, long id, string path, bool refreshExport = false)
         {
-            // The project as text for the agent, while scenes can still be opened (edit mode)
+            var active = SceneManager.GetActiveScene().path;
+            if (!string.IsNullOrEmpty(path) && path != active)
+            {
+                client.RespondError(id, "Unity is in Play mode in another scene. Restart the session with the requested scene, or stop the session and start it again.", 409);
+                return;
+            }
+            if (refreshExport) RefreshExport(client);
+            client.Respond(id, new Dictionary<string, object> { ["running"] = true, ["scene"] = active });
+        }
+
+        static void RefreshExport(PlaytestClient client)
+        {
             try
             {
                 if (ProjectExport.Needed(Instance.ProjectDir) != null)
@@ -391,41 +403,56 @@ namespace Cluewren.Editor
             {
                 Debug.LogWarning("[Cluewren] The project index export failed: " + e.Message);
             }
-            if (!string.IsNullOrEmpty(map)) SetStartScene(map);
-            else
+        }
+
+        static bool EnterPlayMode(PlaytestClient client, long id, string path)
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
             {
-                EditorSceneManager.playModeStartScene = null;
-                var active = SceneManager.GetActiveScene();
-                if (string.IsNullOrEmpty(active.path))
-                {
-                    // An untitled scene (the editor in batch mode): the build's first scene
-                    var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
-                    if (first != null) EditorSceneManager.OpenScene(first.path, OpenSceneMode.Single);
-                }
+                client.RespondError(id, "Wait for Unity to enter Play mode, then start the session again.", 409);
+                return false;
+            }
+            RefreshExport(client);
+            if (string.IsNullOrEmpty(path) && SessionState.GetBool(HeadlessKey, false))
+                path = SessionState.GetString(Headless.SceneKey, "");
+            if (!PrepareStartScene(path))
+            {
+                Ops.NoScene(client, id, path);
+                return false;
             }
             client.Status("Entering play mode");
             EditorApplication.EnterPlaymode();
+            return true;
         }
 
-        /// <summary>Play mode starts in this scene (a path, or a scene's name in the build list or the project); the
-        /// scenes open in the editor stay as they are, and the editor's own Play plays them again once play mode ends.</summary>
-        public static bool SetStartScene(string map)
+        internal static bool PrepareStartScene(string path)
         {
-            var path = MapScene(map);
-            var asset = string.IsNullOrEmpty(path) ? null : AssetDatabase.LoadAssetAtPath<SceneAsset>(path);
+            var previous = EditorSceneManager.playModeStartScene;
+            if (string.IsNullOrEmpty(path))
+            {
+                var active = SceneManager.GetActiveScene();
+                if (previous != null || SceneManager.sceneCount != 1 || !string.IsNullOrEmpty(active.path) || active.isDirty)
+                    return true;
+                path = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled)?.path;
+                if (string.IsNullOrEmpty(path)) return true;
+            }
+            var asset = AssetDatabase.LoadAssetAtPath<SceneAsset>(path);
+            if (asset == null) return false;
+            if (asset == previous) return true;
+
+            // SessionState keeps the original asset's GUID through Play mode and script reloads.
+            if (SessionState.GetString(StartSceneKey, "-") == "-")
+                SessionState.SetString(StartSceneKey, previous != null ? AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(previous)) : "");
             EditorSceneManager.playModeStartScene = asset;
-            if (asset == null) Debug.LogWarning($"[Cluewren] No scene {map}: play mode starts with the open scene");
-            else SessionState.SetBool(StartSceneKey, true);
-            return asset != null;
+            return true;
         }
 
-        /// <summary>What a session start without a map plays: the active scene, or the build's first when it is untitled.</summary>
-        static string OpenScene()
+        internal static void RestoreStartScene()
         {
-            var active = SceneManager.GetActiveScene();
-            if (!string.IsNullOrEmpty(active.path)) return active.path;
-            var first = EditorBuildSettings.scenes.FirstOrDefault(s => s.enabled);
-            return first != null ? first.path : "";
+            var previous = SessionState.GetString(StartSceneKey, "-");
+            if (previous == "-") return;
+            EditorSceneManager.playModeStartScene = previous.Length == 0 ? null : AssetDatabase.LoadAssetAtPath<SceneAsset>(AssetDatabase.GUIDToAssetPath(previous));
+            SessionState.EraseString(StartSceneKey);
         }
 
         /// <summary>`levels` (docs/protocol.md): the project's scenes (under Assets), the one open in the editor and the
@@ -436,7 +463,7 @@ namespace Cluewren.Editor
                 .Where(p => p.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)).Distinct().OrderBy(p => p, StringComparer.Ordinal)
                 .Cast<object>().ToList();
             var playing = EditorApplication.isPlaying ? SceneManager.GetActiveScene().path : "";
-            var open = EditorApplication.isPlaying ? SessionState.GetString(EditSceneKey, "") : OpenScene();
+            var open = EditorApplication.isPlaying ? SessionState.GetString(EditSceneKey, "") : SceneManager.GetActiveScene().path ?? "";
             return new Dictionary<string, object> { ["levels"] = levels, ["open"] = open, ["playing"] = playing ?? "" };
         }
 
@@ -449,14 +476,23 @@ namespace Cluewren.Editor
             return true;
         }
 
-        // A session's map: ScenePath itself also takes what the user's command line names, a scene file anywhere.
+        // The command line can use an absolute asset path. A session is limited to project-relative paths and names.
         static string MapScene(string map) => string.IsNullOrEmpty(map) || Ops.MapOutsideProject(map) ? null : ScenePath(map);
 
         public static string ScenePath(string map)
         {
             if (string.IsNullOrEmpty(map)) return null;
-            if (map.EndsWith(".unity", StringComparison.OrdinalIgnoreCase) && File.Exists(map)) return map.Replace('\\', '/');
-            var name = Path.GetFileNameWithoutExtension(map);
+            if (int.TryParse(map, out var index))
+                return index >= 0 ? EditorBuildSettings.scenes.Where(s => s.enabled).ElementAtOrDefault(index)?.path : null;
+            var path = map.Replace('\\', '/');
+            if (path.IndexOf('/') >= 0)
+            {
+                if (Path.IsPathRooted(path)) path = Path.GetRelativePath(Instance.ProjectDir, path).Replace('\\', '/');
+                if (!path.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)) path += ".unity";
+                var asset = AssetDatabase.LoadAssetAtPath<SceneAsset>(path);
+                return asset != null ? AssetDatabase.GetAssetPath(asset) : null;
+            }
+            var name = map.EndsWith(".unity", StringComparison.OrdinalIgnoreCase) ? Path.GetFileNameWithoutExtension(map) : map;
             var inBuild = EditorBuildSettings.scenes.FirstOrDefault(s => Path.GetFileNameWithoutExtension(s.path) == name);
             if (inBuild != null) return inBuild.path;
             var guid = AssetDatabase.FindAssets("t:Scene " + name).FirstOrDefault(g => Path.GetFileNameWithoutExtension(AssetDatabase.GUIDToAssetPath(g)) == name);

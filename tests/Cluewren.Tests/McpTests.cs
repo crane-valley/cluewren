@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading.Channels;
+using System.Text.RegularExpressions;
 using Cluewren.Bridge;
 using Cluewren.Decisions;
 using Cluewren.Mcp;
@@ -818,24 +819,36 @@ public sealed class McpRunTests : IDisposable
             await using var editor = await FakeEditor.InvitedAsync(_rendezvous, _project);
             Assert.False((await starting).Error);
 
+            var folder = Assert.Single(Directory.GetDirectories(PlaytestRun.RunsFolder(_project)));
+            var instructions = await File.ReadAllTextAsync(Path.Combine(folder, "INSTRUCTIONS.md"));
+            var id = Regex.Match(instructions, "frame_run=\"([a-f0-9]{32})\"").Groups[1].Value;
+            Assert.NotEmpty(id);
+            var requested = Episode(3);
+            requested["frame_run"] = id;
+            var unbound = await second.CallAsync("frames", Episode(3));
+            Assert.True(unbound.Error);
+            Assert.Empty(unbound.Images);
+            var wrong = Episode(3);
+            wrong["frame_run"] = Guid.NewGuid().ToString("N");
+            Assert.True((await first.CallAsync("frames", wrong)).Error);
             var own = await first.CallAsync("frames", Episode(3));
             Assert.StartsWith("No episode 3 has been played in this run.", own.Text);
-            var relayed = await second.CallAsync("frames", Episode(3));
+            var relayed = await second.CallAsync("frames", requested);
             Assert.Equal((BeforeTheClock(own), own.Error), (BeforeTheClock(relayed), relayed.Error));
             Assert.Contains("\n[time:", relayed.Text);
 
             var other = await second.CallAsync("snapshot", []);
             Assert.True(other.Error);
             Assert.Equal("No run has started: call start_run first.", other.Text);
-            var crossed = await third.CallAsync("frames", Episode(3));
+            var crossed = await third.CallAsync("frames", requested);
             Assert.True(crossed.Error);
-            Assert.Equal("No run has started: call start_run first.", crossed.Text);
+            Assert.Empty(crossed.Images);
 
             closed = true;
             await first.DisposeAsync();
-            var after = await second.CallAsync("frames", Episode(3));
+            var after = await second.CallAsync("frames", requested);
             Assert.True(after.Error);
-            Assert.Equal("No run has started: call start_run first.", after.Text);
+            Assert.Empty(after.Images);
         }
         finally
         {
@@ -973,7 +986,28 @@ public class FramesRelayTests
 
     static string Folder() => Path.Combine(Path.GetTempPath(), "cluewren-relay-" + Guid.NewGuid().ToString("N"));
 
-    static Task<ToolResult?> Ask(string folder, JsonObject args) => FramesRelay.AskAsync(folder, args, default).WaitAsync(Patience);
+    const string FrameRun = "123456789abcdef0123456789abcdef0";
+
+    static string Name(string folder) => FramesRelay.NameFor(folder, FrameRun);
+
+    static Task<ToolResult?> Ask(string folder, JsonObject args, string frameRun = FrameRun)
+    {
+        args["frame_run"] = frameRun;
+        return FramesRelay.AskAsync(folder, args, default).WaitAsync(Patience);
+    }
+
+    [Fact]
+    public async Task Two_runs_in_one_working_folder_return_only_the_images_named_by_the_caller()
+    {
+        var folder = Folder();
+        var other = Guid.NewGuid().ToString("N");
+        await using var first = FramesRelay.Serve(folder, FrameRun, _ => Task.FromResult(new ToolResult("first", [new byte[] { 1 }])));
+        await using var second = FramesRelay.Serve(folder, other, _ => Task.FromResult(new ToolResult("second", [new byte[] { 2 }])));
+        var answers = await Task.WhenAll(Ask(folder, [], other), Ask(folder, [], FrameRun));
+        Assert.Equal(new byte[] { 2 }, Assert.Single(answers[0]!.Images));
+        Assert.Equal(new byte[] { 1 }, Assert.Single(answers[1]!.Images));
+        Assert.Null(await FramesRelay.AskAsync(folder, new JsonObject(), default));
+    }
 
     [Fact]
     public async Task What_serves_a_folder_answers_its_frames_calls_with_the_text_and_every_image()
@@ -982,10 +1016,10 @@ public class FramesRelayTests
         var large = new byte[3_000_000];
         Random.Shared.NextBytes(large);
         byte[][] jpegs = [[0xFF, 0xD8, 0xFF], large, []];
-        var asked = new List<string>();
-        await using var relay = FramesRelay.Serve(folder, args =>
+        var asked = new List<JsonObject>();
+        await using var relay = FramesRelay.Serve(folder, FrameRun, args =>
         {
-            asked.Add(args.ToJsonString());
+            asked.Add(args);
             return Task.FromResult(asked.Count == 1
                 ? new ToolResult("3 frames of episode 2", jpegs)
                 : ToolResult.Say("No episode 7: the latest is 2.", true));
@@ -998,7 +1032,10 @@ public class FramesRelayTests
         var none = await Ask(folder.ToUpperInvariant() + Path.DirectorySeparatorChar, new JsonObject { ["episode"] = 7 });
         Assert.Equal(("No episode 7: the latest is 2.", true), (none!.Text, none.Error));
         Assert.Empty(none.Images);
-        Assert.Equal(["""{"episode":2,"start":1.5}""", """{"episode":7}"""], asked);
+        Assert.Equal(2, asked.Count);
+        Assert.All(asked, args => Assert.Equal(FrameRun, args["frame_run"]!.GetValue<string>()));
+        Assert.Equal((2, 1.5), (asked[0]["episode"]!.GetValue<int>(), asked[0]["start"]!.GetValue<double>()));
+        Assert.Equal(7, asked[1]["episode"]!.GetValue<int>());
     }
 
     [Fact]
@@ -1006,7 +1043,7 @@ public class FramesRelayTests
     {
         var folder = Folder();
         var calls = 0;
-        await using var relay = FramesRelay.Serve(folder, _ => Interlocked.Increment(ref calls) == 1
+        await using var relay = FramesRelay.Serve(folder, FrameRun, _ => Interlocked.Increment(ref calls) == 1
             ? throw new InvalidOperationException("the run is closing")
             : Task.FromResult(ToolResult.Say("served")));
         Assert.Null(await Ask(folder, []));
@@ -1017,9 +1054,9 @@ public class FramesRelayTests
     public async Task Nothing_is_answered_for_a_folder_that_nobody_serves_or_no_longer_serves()
     {
         var (served, other) = (Folder(), Folder());
-        Assert.NotEqual(FramesRelay.NameFor(served), FramesRelay.NameFor(other));
+        Assert.NotEqual(Name(served), Name(other));
         Assert.Null(await Ask(other, []));
-        var relay = FramesRelay.Serve(served, _ => Task.FromResult(ToolResult.Say("served")));
+        var relay = FramesRelay.Serve(served, FrameRun, _ => Task.FromResult(ToolResult.Say("served")));
         try
         {
             Assert.Null(await Ask(other, []));
@@ -1043,15 +1080,15 @@ public class FramesRelayTests
         {
             var folder = Directory.CreateDirectory(Path.Combine(root, "Project")).FullName;
             var other = Directory.CreateDirectory(Path.Combine(root, "Other")).FullName;
-            Assert.Equal(FramesRelay.NameFor(folder), FramesRelay.NameFor(folder.ToUpperInvariant() + Path.DirectorySeparatorChar));
-            Assert.NotEqual(FramesRelay.NameFor(folder), FramesRelay.NameFor(other));
+            Assert.Equal(Name(folder), Name(folder.ToUpperInvariant() + Path.DirectorySeparatorChar));
+            Assert.NotEqual(Name(folder), Name(other));
             if (!OperatingSystem.IsWindows())
                 return;
             var link = Path.Combine(root, "Link");
             Assert.Equal(0, await ProjectBindingTests.RunAsync("cmd.exe", "/c", "mklink", "/J", link, folder));
             try
             {
-                Assert.Equal(FramesRelay.NameFor(folder), FramesRelay.NameFor(link));
+                Assert.Equal(Name(folder), Name(link));
             }
             finally
             {
@@ -1062,7 +1099,7 @@ public class FramesRelayTests
                 return;
             var upper = Directory.CreateDirectory(Path.Combine(sensitive, "Foo")).FullName;
             var lower = Directory.CreateDirectory(Path.Combine(sensitive, "foo")).FullName;
-            Assert.NotEqual(FramesRelay.NameFor(upper), FramesRelay.NameFor(lower));
+            Assert.NotEqual(Name(upper), Name(lower));
         }
         finally
         {
@@ -1075,7 +1112,7 @@ public class FramesRelayTests
     {
         var folder = Folder();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var relay = FramesRelay.Serve(folder, _ =>
+        var relay = FramesRelay.Serve(folder, FrameRun, _ =>
         {
             entered.SetResult();
             return new TaskCompletionSource<ToolResult>().Task;

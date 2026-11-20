@@ -4,6 +4,7 @@
 
 #include "PlaytestOps.h"
 #include "PlaytestBrain.h"
+#include "PlaytestInternal.h"
 #include "PlaytestRefusal.h"
 #include "Misc/EngineVersionComparison.h"
 
@@ -207,10 +208,25 @@ namespace
 
 namespace
 {
-	TSharedPtr<FJsonValue> Running(bool bRunning)
+	const TCHAR* ExportState(const UPlaytestSubsystem& Bridge)
+	{
+#if WITH_EDITOR
+		if (Bridge.SessionHandler)
+		{
+			return PlaytestExport::State();
+		}
+#endif
+		return TEXT("unavailable");
+	}
+
+	TSharedPtr<FJsonValue> Running(bool bRunning, const TCHAR* Export = nullptr)
 	{
 		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 		Result->SetBoolField(TEXT("running"), bRunning);
+		if (Export)
+		{
+			Result->SetStringField(TEXT("export_state"), Export);
+		}
 		return Obj(Result);
 	}
 
@@ -275,11 +291,12 @@ namespace
 			Status->SetBoolField(TEXT("running"), World != nullptr);
 			Status->SetBoolField(TEXT("loading"), (World && !World->HasBegunPlay())
 				|| (Bridge.SessionRequested && Bridge.SessionRequested()));
+			Status->SetStringField(TEXT("export_state"), ExportState(Bridge));
 			Bridge.Respond(Id, Obj(Status));
 			return;
 		}
 		FString Map = StringField(Args, TEXT("map"));
-		if (Map.IsEmpty() && Bridge.SessionHandler)
+		if (Map.IsEmpty() && Bridge.SessionHandler && Action == TEXT("restart"))
 		{
 			Map = Bridge.GetStartMap();  // (a game opened it when it started: UPlaytestSubsystem::NoteLaunchMap)
 		}
@@ -300,18 +317,25 @@ namespace
 			}
 			Map = Package;
 		}
+		const bool bStart = Action == TEXT("start");
 		if (Bridge.SessionHandler)
 		{
 			TWeakObjectPtr<UPlaytestSubsystem> Weak(&Bridge);
 			const int32 Serial = Bridge.GetSessionSerial();
-			Bridge.SessionHandler(Action, Map, [Weak, Id, Serial](bool bRunning, const FString& Error)
+			Bridge.SessionHandler(Action, Map, [Weak, Id, Serial, bStart](bool bRunning, const FString& Error)
 			{
 				UPlaytestSubsystem* B = Weak.Get();
 				if (B && B->GetSessionSerial() == Serial)
 				{
 					if (Error.IsEmpty())
 					{
-						B->Respond(Id, Running(bRunning));
+#if WITH_EDITOR
+						if (bStart)
+						{
+							PlaytestExport::Refresh();
+						}
+#endif
+						B->Respond(Id, Running(bRunning, bStart ? ExportState(*B) : nullptr));
 					}
 					else
 					{
@@ -321,12 +345,24 @@ namespace
 			});
 			return;
 		}
+		if (bStart && !Map.IsEmpty())
+		{
+			const FString Playing = PlaytestLevels::PackageOf(World);
+			if (!Map.Equals(Playing, ESearchCase::IgnoreCase))
+			{
+				const FString Problem = Playing.IsEmpty()
+					? FString::Printf(TEXT("Start the game in %s and try again"), *Map)
+					: FString::Printf(TEXT("The game is running %s. Start it in %s and try again"), *Playing, *Map);
+				Bridge.RespondError(Id, Problem, 409);
+				return;
+			}
+		}
 		// A game build: there is always a session; restarting reopens the map the game was launched with (or the one
 		// asked for: "map"), never the one it travelled to since (a match that ended moves the server on to the next
 		// map), with what the game put on the viewport taken off first (see RemoveGameWidgets)
 		if (Action != TEXT("restart") || !World)
 		{
-			Bridge.Respond(Id, Running(World != nullptr));
+			Bridge.Respond(Id, Running(World != nullptr, bStart ? ExportState(Bridge) : nullptr));
 			return;
 		}
 		if (Map.IsEmpty())
